@@ -128,14 +128,20 @@ fn calculate_cursor_geometry(
 
     let rect = editor.get_rect_at_line_column(line, col);
 
-    // Godot's get_rect_at_line_column has an off-by-one issue where columns 0 and 1
-    // return the same X position. Detection: compare rects for columns 0 and 1.
-    // When the bug is present, add one character width to compensate. When the first
-    // character is a tab and col == 1, the offset equals the tab width instead.
+    // Godot returns (-1,-1) when the character is outside line_drawing_cache — happens
+    // when VALUE_CHANGED fires before the next DRAW rebuilds the cache during h-scroll.
+    // Skip here; DRAW will correct it next frame.
+    if rect.position.x == -1 && rect.position.y == -1 {
+        return None;
+    }
+
+    // Godot off-by-one: get_rect_at_line_column(col N) returns char N-1's position.
+    // Detected by col 0 and col 1 returning the same x. Add char_width to compensate.
+    // Col 1 on a tab-indented line uses tab_width instead.
     let target_x = if col >= 1 {
         let rect_0 = editor.get_rect_at_line_column(line, 0);
         let rect_1 = editor.get_rect_at_line_column(line, 1);
-        if rect_0.position.x == rect_1.position.x && rect_0.position.x > 0 {
+        if rect_0.position.x == rect_1.position.x {
             let line_text = editor.get_line(line).to_string();
             let first_char = line_text.chars().next();
 
