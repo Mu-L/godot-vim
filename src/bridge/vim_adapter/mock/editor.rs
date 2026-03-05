@@ -129,7 +129,7 @@ impl MockEditor {
             // Simple single-line insert
             if let Some(current_line) = self.lines.get_mut(line) {
                 current_line.insert_str(col, text);
-                self.cursor.col += text.len();
+                self.cursor.col = self.cursor.col.saturating_add_bytes(text.len());
             }
         } else {
             // Multi-line insert

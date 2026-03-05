@@ -23,7 +23,7 @@ pub trait MarksHandler {
 impl MarksHandler for VimController {
     fn handle_set_mark(&mut self, c: char) {
         if let Some(editor) = self.get_editor() {
-            let pos = column_codec::caret_to_core_position(&editor);
+            let pos = column_codec::read_caret_core_position(&editor);
             self.engine.set_mark(c, pos);
             log::debug!("Mark set name='{c}' line={} col={}", pos.line, pos.col);
         }
@@ -61,13 +61,7 @@ impl MarksHandler for VimController {
                 }
 
                 self.engine.move_cursor_tracked(pos, CursorMoveType::Jump);
-                editor
-                    .set_caret_line_ex(usize_to_i32(pos.line))
-                    .can_be_hidden(false)
-                    .done();
-                let editor_col =
-                    column_codec::byte_to_editor_col_in_editor(&editor, pos.line, usize::from(pos.col));
-                editor.set_caret_column(usize_to_i32(editor_col));
+                column_codec::apply_core_position_to_editor(&mut editor, pos);
                 log::debug!("Jumped to mark '{name}'");
             } else {
                 log::debug!("Mark '{name}' not set");
@@ -81,13 +75,7 @@ impl MarksHandler for VimController {
             // themselves, so the cursor moves without pushing a new entry.
             self.engine
                 .move_cursor_tracked(pos, CursorMoveType::JumpRestoration);
-            editor
-                .set_caret_line_ex(usize_to_i32(pos.line))
-                .can_be_hidden(false)
-                .done();
-            let editor_col =
-                column_codec::byte_to_editor_col_in_editor(&editor, pos.line, usize::from(pos.col));
-            editor.set_caret_column(usize_to_i32(editor_col));
+            column_codec::apply_core_position_to_editor(&mut editor, pos);
         }
     }
 }

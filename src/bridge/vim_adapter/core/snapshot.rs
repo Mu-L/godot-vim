@@ -63,60 +63,7 @@ impl GodotSnapshot {
 
         // O(1) metadata capture
         let line_count = i32_to_usize(editor_clone.get_line_count());
-        let cursor_line = i32_to_usize(editor_clone.get_caret_line());
-        let cursor_editor_col = i32_to_usize(editor_clone.get_caret_column());
-        let cursor_col =
-            column_codec::editor_col_to_byte_in_editor(&editor_clone, cursor_line, cursor_editor_col);
-
-        // Capture the visual selection if present.
-        // Godot's selection end is exclusive (points past the last selected character).
-        // `update_visual_selection` adds +1 to the cursor column for display purposes,
-        // so 1 is subtracted from the "to" column here to recover the logical cursor position.
-        // The pure core adds +1 back via is_inclusive() when computing operation ranges.
-        let (anchor, head) = if editor_clone.has_selection() {
-            let sel_from_line = i32_to_usize(editor_clone.get_selection_from_line());
-            let sel_from_editor_col = i32_to_usize(editor_clone.get_selection_from_column());
-            let sel_to_line = i32_to_usize(editor_clone.get_selection_to_line());
-            let sel_to_editor_col = i32_to_usize(editor_clone.get_selection_to_column());
-
-            let sel_from_col = column_codec::editor_col_to_byte_in_editor(
-                &editor_clone,
-                sel_from_line,
-                sel_from_editor_col,
-            );
-
-            // Convert from Godot display format (exclusive end) to Vim logical format
-            // by subtracting 1 from the end column (saturating to prevent underflow)
-            let logical_to_col = if sel_to_editor_col > 0 {
-                column_codec::editor_col_to_byte_in_editor(
-                    &editor_clone,
-                    sel_to_line,
-                    sel_to_editor_col - 1,
-                )
-            } else {
-                0
-            };
-
-            // Determine which end is anchor vs head based on cursor position
-            if (cursor_line, cursor_editor_col) == (sel_to_line, sel_to_editor_col) {
-                // Cursor at end = forward selection
-                (
-                    Position::from_byte(sel_from_line, sel_from_col),
-                    Position::from_byte(sel_to_line, logical_to_col),
-                )
-            } else {
-                // Cursor at start = backward selection
-                // For a backward selection, the "from" position is numerically higher.
-                (
-                    Position::from_byte(sel_to_line, logical_to_col),
-                    Position::from_byte(sel_from_line, sel_from_col),
-                )
-            }
-        } else {
-            // No selection = cursor only
-            let pos = Position::from_byte(cursor_line, cursor_col);
-            (pos, pos)
-        };
+        let selection = column_codec::read_selection_core(&editor_clone);
 
         // Use compile-time verified constant (no runtime expect needed)
         let cache_capacity = LINE_CACHE_CAP;
@@ -124,7 +71,7 @@ impl GodotSnapshot {
         Self {
             editor: editor_clone,
             line_count,
-            selection: Selection::new(anchor, head),
+            selection,
             line_cache: RefCell::new(LruCache::new(cache_capacity)),
         }
     }
@@ -422,7 +369,7 @@ mod tests {
     #[test]
     fn test_eager_snapshot_line_len() {
         let snap = EagerSnapshot::new(vec!["Hello".to_string()], Selection::cursor(0, 0));
-        assert_eq!(snap.line_len(0), 5);
+        assert_eq!(snap.line_len_bytes(0), 5);
     }
 
     #[test]

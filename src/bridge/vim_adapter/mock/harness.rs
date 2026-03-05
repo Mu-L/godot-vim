@@ -88,7 +88,9 @@ impl TestHarness {
     pub fn move_right(&mut self, count: usize) {
         let current = self.editor.cursor();
         let line_len = self.editor.line_len(current.line);
-        let new_col = (current.col + count).min(line_len.saturating_sub(1));
+        let new_col = usize::from(current.col)
+            .saturating_add(count)
+            .min(line_len.saturating_sub(1));
         self.editor.set_cursor(current.line, new_col);
     }
 

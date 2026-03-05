@@ -4,7 +4,6 @@
 //! `editor.search()` API. Extracted from the main dispatch module
 //! to keep each file focused on a single concern.
 
-use crate::bridge::godot::code_edit_ext::CodeEditExt;
 use crate::bridge::vim_adapter::core::cast::{i32_to_usize, usize_to_i32};
 use crate::bridge::vim_adapter::core::column_codec;
 use crate::bridge::vim_wrapper::VimController;
@@ -33,17 +32,15 @@ impl VimController {
 
         let result = editor.search(&GString::from(&pattern), flags, line, cursor);
         if result.x >= 0 {
-            editor.set_caret_unfold(result.y, result.x);
             let result_line = i32_to_usize(result.y);
             let result_col = column_codec::editor_col_to_byte_in_editor(
                 &editor,
                 result_line,
                 i32_to_usize(result.x),
             );
-            self.engine.sync_cursor(Position::from_byte(
-                result_line,
-                result_col,
-            ));
+            let target = Position::from_byte(result_line, result_col);
+            column_codec::apply_core_position_to_editor(&mut editor, target);
+            self.engine.sync_cursor(target);
         } else {
             log::debug!("Search pattern not found: {}", pattern);
         }

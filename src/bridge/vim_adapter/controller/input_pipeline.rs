@@ -15,7 +15,6 @@ use crate::bridge::types::command::EditorCommand;
 use crate::bridge::types::cursor::CursorPos;
 use crate::bridge::vim_adapter::contracts::{ExecutionContext, InputPolicy};
 use crate::bridge::vim_adapter::convert::key_event_to_vim_key;
-use crate::bridge::vim_adapter::core::cast::i32_to_usize;
 use crate::bridge::vim_adapter::core::column_codec;
 use crate::bridge::vim_adapter::core::snapshot::LazyGodotSnapshot;
 use crate::bridge::vim_adapter::handlers::cmdline::IncsearchHandler;
@@ -206,10 +205,8 @@ impl VimController {
         };
 
         let doc = LazyGodotSnapshot::new(&editor);
-        let line = i32_to_usize(editor.get_caret_line());
-        let editor_col = i32_to_usize(editor.get_caret_column());
-        let byte_col = column_codec::editor_col_to_byte_in_editor(&editor, line, editor_col);
-        let cursor = CursorPos::new(line, byte_col);
+        let core_caret = column_codec::read_caret_core_position(&editor);
+        let cursor = CursorPos::new(core_caret.line, usize::from(core_caret.col));
         let context = ExecutionContext::from_snapshot(cursor, &doc);
 
         let Some(output) = self

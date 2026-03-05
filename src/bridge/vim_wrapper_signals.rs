@@ -4,7 +4,7 @@
 //! The `#[func]` stubs remain in `vim_wrapper.rs` and delegate here.
 
 use crate::bridge::vim_adapter::controller::SignalHandlersTrait;
-use crate::bridge::vim_adapter::core::cast::i32_to_usize;
+use crate::bridge::vim_adapter::core::column_codec;
 use crate::bridge::vim_wrapper::VimController;
 
 use godot::classes::InputEvent;
@@ -62,7 +62,8 @@ impl VimController {
         crate::bridge::safety::guard(
             || {
                 if let Some(editor) = self.get_editor() {
-                    let line = i32_to_usize(editor.get_caret_line());
+                    let caret = column_codec::read_caret_core_position(&editor);
+                    let line = caret.line;
 
                     // Snapshot the line on first visit to support undo-line (U).
                     let should_snapshot = match self.engine.current_line_snapshot() {
@@ -78,11 +79,10 @@ impl VimController {
                     }
 
                     // Synchronize vim-state cursor when caret moves via mouse click.
-                    let col = i32_to_usize(editor.get_caret_column());
                     let cur = self.engine.cursor_pos();
-                    if cur.line != line || cur.col != col {
-                        self.engine.set_cursor(line, col);
-                        self.engine.set_preferred_column(col);
+                    if cur != caret {
+                        self.engine.sync_cursor(caret);
+                        self.engine.set_preferred_column(caret.col);
                     }
                 }
             },

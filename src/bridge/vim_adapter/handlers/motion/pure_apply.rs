@@ -1,5 +1,4 @@
-use crate::bridge::vim_adapter::core::cast::{i32_to_usize, usize_to_i32};
-use crate::bridge::vim_adapter::core::column_codec;
+use crate::bridge::vim_adapter::core::cast::i32_to_usize;
 use crate::bridge::vim_adapter::core::snapshot::GodotSnapshot;
 use crate::bridge::vim_adapter::handlers::visual;
 use crate::bridge::vim_wrapper::VimController;
@@ -67,7 +66,7 @@ fn compute_motion_result(
     count: usize,
     config: &Config,
     selection: Selection,
-) -> (Selection, Option<usize>) {
+) -> (Selection, Option<vim_core::domain::column::ByteCol>) {
     let snapshot = GodotSnapshot::from_editor_with_selection(editor, selection);
     let extend = vim_state.mode().is_visual();
     let ctx = MotionContext::new(&snapshot, vim_state, count, config, None, Some(&snapshot));
@@ -92,7 +91,7 @@ fn apply_result_to_editor_and_state(
     vim_state: &mut VimState,
     motion: Motion,
     new_sel: Selection,
-    new_preferred: Option<usize>,
+    new_preferred: Option<vim_core::domain::column::ByteCol>,
 ) {
     vim_state.set_preferred_column(new_preferred);
 
@@ -107,13 +106,6 @@ fn apply_result_to_editor_and_state(
 
     if vim_state.mode().is_visual() {
         visual::render_visual_selection(editor, &vim_state.mode(), new_sel.head);
-    } else {
-        let editor_col = column_codec::byte_to_editor_col_in_editor(
-            editor,
-            new_sel.head.line,
-            usize::from(new_sel.head.col),
-        );
-        editor.set_caret_column(usize_to_i32(editor_col));
     }
 
     if let Mode::Visual(VisualKind::Block { start, .. }) = vim_state.mode() {

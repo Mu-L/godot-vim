@@ -64,7 +64,7 @@ impl VimEngine {
     #[inline]
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) fn preferred_column(&self) -> Option<usize> {
+    pub(crate) fn preferred_column(&self) -> Option<vim_core::domain::column::ByteCol> {
         self.state.cursor_state.preferred_column
     }
 

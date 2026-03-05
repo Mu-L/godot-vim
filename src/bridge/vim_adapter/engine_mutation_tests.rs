@@ -56,7 +56,7 @@ mod tests {
     fn move_cursor_tracked_jump_updates_position() {
         use crate::bridge::vim_adapter::core::cursor::CursorMoveType;
         let mut engine = VimEngine::new();
-        engine.set_cursor(0, 0);
+        engine.sync_cursor(Position::from_byte(0, 0));
         engine.move_cursor_tracked(Position::from_byte(10, 5), CursorMoveType::Jump);
         assert_eq!(engine.cursor_pos(), Position::from_byte(10, 5));
     }
@@ -65,7 +65,7 @@ mod tests {
     fn move_cursor_tracked_jump_records_jump() {
         use crate::bridge::vim_adapter::core::cursor::CursorMoveType;
         let mut engine = VimEngine::new();
-        engine.set_cursor(3, 7);
+        engine.sync_cursor(Position::from_byte(3, 7));
         engine.move_cursor_tracked(Position::from_byte(10, 0), CursorMoveType::Jump);
         // The old position (3,7) should be in the jump list → accessible via last_jump_pos
         assert_eq!(engine.last_jump_pos(), Some(Position::from_byte(3, 7)));
@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn init_quantum_buffer_resets_cursor() {
         let mut engine = VimEngine::new();
-        engine.set_cursor(5, 5);
+        engine.sync_cursor(Position::from_byte(5, 5));
         engine.init_quantum_buffer(Position::from_byte(2, 3));
         assert_eq!(engine.cursor_pos(), Position::from_byte(2, 3));
     }

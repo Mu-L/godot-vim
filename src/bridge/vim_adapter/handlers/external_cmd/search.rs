@@ -28,13 +28,7 @@ impl VimController {
 
         if let Some(pos) = perform_search_and_locate(editor, &pattern, forward) {
             self.engine.move_cursor_tracked(pos, CursorMoveType::Jump);
-            editor
-                .set_caret_line_ex(usize_to_i32(pos.line))
-                .can_be_hidden(false)
-                .done();
-            let editor_col =
-                column_codec::byte_to_editor_col_in_editor(editor, pos.line, usize::from(pos.col));
-            editor.set_caret_column(usize_to_i32(editor_col));
+            column_codec::apply_core_position_to_editor(editor, pos);
             log::debug!("Search found pattern={} forward={}", pattern, forward);
         } else {
             log::debug!("Pattern '{}' not found", pattern);
@@ -60,13 +54,7 @@ impl VimController {
 
         if let Some(pos) = perform_search_and_locate(editor, &word, forward) {
             self.engine.move_cursor_tracked(pos, CursorMoveType::Jump);
-            editor
-                .set_caret_line_ex(usize_to_i32(pos.line))
-                .can_be_hidden(false)
-                .done();
-            let editor_col =
-                column_codec::byte_to_editor_col_in_editor(editor, pos.line, usize::from(pos.col));
-            editor.set_caret_column(usize_to_i32(editor_col));
+            column_codec::apply_core_position_to_editor(editor, pos);
             log::debug!("Word search found word={} forward={}", word, forward);
         } else {
             log::debug!("Word search: '{}' not found", word);

@@ -1,5 +1,6 @@
 use godot::classes::CodeEdit;
 use godot::prelude::Gd;
+use vim_core::domain::column::ByteCol;
 use vim_core::domain::position::Position;
 use vim_core::inputs::{KeyCode, VimKey, VimModifiers};
 use vim_core::state::mode::Mode;
@@ -10,11 +11,6 @@ use crate::bridge::vim_adapter::core::cursor::CursorMoveType;
 use super::VimEngine;
 
 impl VimEngine {
-    #[inline]
-    pub(crate) fn set_cursor(&mut self, line: usize, col: usize) {
-        self.state.set_cursor_pos(Position::from_byte(line, col));
-    }
-
     #[inline]
     pub(crate) fn set_mode(&mut self, mode: Mode) {
         self.state.set_mode(mode);
@@ -62,7 +58,7 @@ impl VimEngine {
     }
 
     #[inline]
-    pub(crate) fn set_preferred_column(&mut self, col: usize) {
+    pub(crate) fn set_preferred_column(&mut self, col: ByteCol) {
         self.state.cursor_state.preferred_column = Some(col);
     }
 

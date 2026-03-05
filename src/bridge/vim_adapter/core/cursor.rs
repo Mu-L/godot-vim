@@ -4,7 +4,6 @@ use strum::Display;
 use vim_core::domain::position::Position;
 use vim_core::state::VimState;
 
-use crate::bridge::vim_adapter::core::cast::usize_to_i32;
 use crate::bridge::vim_adapter::core::column_codec;
 
 #[derive(Display)]
@@ -47,13 +46,7 @@ pub fn move_cursor_with_tracking(
         }
     }
 
-    // Use set_caret_line_ex with can_be_hidden(false) to unfold/reveal the target line.
-    editor
-        .set_caret_line_ex(usize_to_i32(target.line))
-        .can_be_hidden(false)
-        .done();
-    let editor_col = column_codec::byte_to_editor_col_in_editor(editor, target.line, usize::from(target.col));
-    editor.set_caret_column(usize_to_i32(editor_col));
+    column_codec::apply_core_position_to_editor(editor, target);
 
     state.set_cursor_pos(target);
 }

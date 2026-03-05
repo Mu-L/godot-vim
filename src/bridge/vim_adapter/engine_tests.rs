@@ -6,6 +6,8 @@
 #[cfg(test)]
 mod tests {
     use crate::bridge::vim_adapter::engine::VimEngine;
+    use vim_core::domain::column::ByteCol;
+    use vim_core::domain::position::Position;
     use vim_core::state::mode::Mode;
 
     // ═══════════════════════════════════════════════════════════════════
@@ -69,10 +71,10 @@ mod tests {
     #[test]
     fn set_cursor_updates_position() {
         let mut engine = VimEngine::new();
-        engine.set_cursor(5, 10);
+        engine.sync_cursor(Position::from_byte(5, 10));
         let pos = engine.cursor_pos();
         assert_eq!(pos.line, 5);
-        assert_eq!(pos.col, 10);
+        assert_eq!(pos.col, ByteCol::new(10));
     }
 
     #[test]
@@ -84,8 +86,8 @@ mod tests {
     #[test]
     fn set_preferred_column_roundtrip() {
         let mut engine = VimEngine::new();
-        engine.set_preferred_column(42);
-        assert_eq!(engine.preferred_column(), Some(42));
+        engine.set_preferred_column(ByteCol::new(42));
+        assert_eq!(engine.preferred_column(), Some(ByteCol::new(42)));
     }
 
     // ═══════════════════════════════════════════════════════════════════

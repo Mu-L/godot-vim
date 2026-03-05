@@ -100,10 +100,7 @@ fn apply_text_ops_batch(editor: &mut Gd<CodeEdit>, ops: &[TextOperation]) {
 
 /// Insert text at a position.
 fn apply_insert(editor: &mut Gd<CodeEdit>, pos: (usize, usize), text: &str) {
-    // Move cursor to position
-    editor.set_caret_line(usize_to_i32(pos.0));
-    let editor_col = column_codec::byte_to_editor_col_in_editor(editor, pos.0, pos.1);
-    editor.set_caret_column(usize_to_i32(editor_col));
+    column_codec::apply_core_position_to_editor(editor, vim_core::domain::position::Position::from_byte(pos.0, pos.1));
 
     // Insert text
     editor.insert_text_at_caret(text);

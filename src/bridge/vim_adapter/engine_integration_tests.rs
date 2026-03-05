@@ -7,6 +7,7 @@
 mod tests {
     use crate::bridge::vim_adapter::engine::VimEngine;
     use crate::bridge::vim_adapter::mock::TestHarness;
+    use vim_core::domain::column::ByteCol;
     use vim_core::domain::position::Position;
     use vim_core::state::mode::{InsertMode, Mode, VisualKind};
 
@@ -58,14 +59,14 @@ mod tests {
     #[test]
     fn facade_cursor_movement_preserves_state() {
         let mut engine = VimEngine::new();
-        engine.set_cursor(0, 0);
+        engine.sync_cursor(Position::from_byte(0, 0));
         assert_eq!(engine.cursor_pos(), Position::from_byte(0, 0));
 
-        engine.set_cursor(5, 10);
+        engine.sync_cursor(Position::from_byte(5, 10));
         assert_eq!(engine.cursor_pos(), Position::from_byte(5, 10));
 
-        engine.set_preferred_column(10);
-        assert_eq!(engine.preferred_column(), Some(10));
+        engine.set_preferred_column(ByteCol::new(10));
+        assert_eq!(engine.preferred_column(), Some(ByteCol::new(10)));
 
         // sync_cursor should also update
         engine.sync_cursor(Position::from_byte(3, 7));
@@ -78,7 +79,7 @@ mod tests {
         let mut engine = VimEngine::new();
 
         // Start at (0,0) → jump to (10,0) → jump to (20,0)
-        engine.set_cursor(0, 0);
+        engine.sync_cursor(Position::from_byte(0, 0));
         engine.move_cursor_tracked(Position::from_byte(10, 0), CursorMoveType::Jump);
         assert_eq!(engine.last_jump_pos(), Some(Position::from_byte(0, 0)));
 
