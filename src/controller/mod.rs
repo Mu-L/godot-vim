@@ -102,7 +102,7 @@ impl VimController {
             security_policy: SecurityPolicy {
                 shell_execution: ShellExecution::Disabled,
                 file_access_scope: FileAccessScope::ProjectOnly,
-                sandbox_sourced_configs: true,
+                project_vimrc: crate::settings::ProjectVimrc::Sandbox,
             },
             perf: perf::PerfTracker::new(PERF_RING_CAPACITY, PERF_BUDGET_US),
             vimdebug: vimdebug::VimdebugState::default(),
@@ -133,8 +133,7 @@ impl VimController {
         self.set_security_policy(crate::host::SecurityPolicy {
             shell_execution: snapshot.shell_execution,
             file_access_scope: snapshot.file_access_scope,
-            sandbox_sourced_configs: snapshot.project_vimrc
-                == crate::settings::ProjectVimrc::Sandbox,
+            project_vimrc: snapshot.project_vimrc,
         });
         self.set_highlight_yank_duration(snapshot.highlight_yank_duration);
     }
@@ -500,7 +499,7 @@ impl VimController {
             let mut cx = self.as_process_context();
             let line_index_hint = Some(doc.into_line_index());
             // Auto-brace ineligible: entering Visual, not Insert.
-            cx.apply_effects(effects, editor, false, &text, line_index_hint);
+            cx.apply_effects(effects, editor, crate::effects::dispatch::AutoBraceMode::Ineligible, &text, line_index_hint);
 
             if !host_requests.is_empty() {
                 cx.handle_host_requests(host_requests, editor, 0);

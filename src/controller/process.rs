@@ -151,7 +151,11 @@ impl ProcessContext<'_> {
             } else {
                 // Auto-brace is safe: dot-repeat completes within process() and
                 // returns to Normal, so is_insert() is false during replay.
-                let auto_brace_eligible = self.engine.mode().is_insert();
+                let auto_brace = if self.engine.mode().is_insert() {
+                    crate::effects::dispatch::AutoBraceMode::Eligible
+                } else {
+                    crate::effects::dispatch::AutoBraceMode::Ineligible
+                };
 
                 // Reuse the pre-built line index when no text mutations will
                 // invalidate it; otherwise let dispatch rebuild after mutations.
@@ -160,7 +164,7 @@ impl ProcessContext<'_> {
                 } else {
                     Some(doc.into_line_index())
                 };
-                self.apply_effects(effects, editor, auto_brace_eligible, &text, line_index_hint)
+                self.apply_effects(effects, editor, auto_brace, &text, line_index_hint)
             };
 
         let host_requests = response.take_host_requests();
@@ -171,11 +175,11 @@ impl ProcessContext<'_> {
 
         let total_elapsed = total_start.elapsed();
         self.perf.record(perf::FrameMetrics {
-            context_build_us: perf::Microseconds(ctx_elapsed.as_micros().min(u64::MAX as u128) as u64),
-            engine_process_us: perf::Microseconds(eng_elapsed.as_micros().min(u64::MAX as u128) as u64),
-            effects_dispatch_us: perf::Microseconds(fx_elapsed.as_micros().min(u64::MAX as u128) as u64),
+            context_build_us: perf::Microseconds(u64::try_from(ctx_elapsed.as_micros()).unwrap_or(u64::MAX)),
+            engine_process_us: perf::Microseconds(u64::try_from(eng_elapsed.as_micros()).unwrap_or(u64::MAX)),
+            effects_dispatch_us: perf::Microseconds(u64::try_from(fx_elapsed.as_micros()).unwrap_or(u64::MAX)),
             ui_update_us: perf::Microseconds(0),
-            total_us: perf::Microseconds(total_elapsed.as_micros().min(u64::MAX as u128) as u64),
+            total_us: perf::Microseconds(u64::try_from(total_elapsed.as_micros()).unwrap_or(u64::MAX)),
         });
 
         // Compound actions and host requests can mutate text outside the
@@ -283,7 +287,11 @@ impl ProcessContext<'_> {
         let (pass1, pass2) = crate::effects::dispatch::split_effects_by_pass(effects);
 
         let pass1_had_compounds = if !pass1.is_empty() {
-            let auto_brace = self.engine.mode().is_insert();
+            let auto_brace = if self.engine.mode().is_insert() {
+                crate::effects::dispatch::AutoBraceMode::Eligible
+            } else {
+                crate::effects::dispatch::AutoBraceMode::Ineligible
+            };
             let result = self.apply_effects(pass1, editor, auto_brace, text_ref, None);
             *self.persistent_text = None;
             result
@@ -438,7 +446,7 @@ impl ProcessContext<'_> {
         &mut self,
         effects: Vec<vim_core::effects::Effect>,
         editor: &mut Gd<CodeEdit>,
-        auto_brace_eligible: bool,
+        auto_brace: crate::effects::dispatch::AutoBraceMode,
         text_ref: &str,
         line_index_hint: Option<crate::bridge::codec::LineIndex>,
     ) -> bool {
@@ -470,11 +478,7 @@ impl ProcessContext<'_> {
         }
 
         let editor_id = editor.instance_id();
-        let auto_brace = if auto_brace_eligible {
-            crate::effects::dispatch::AutoBraceMode::Eligible
-        } else {
-            crate::effects::dispatch::AutoBraceMode::Ineligible
-        };
+        let auto_brace_eligible = matches!(auto_brace, crate::effects::dispatch::AutoBraceMode::Eligible);
         let auto_brace_snapshot = if auto_brace_eligible {
             bridge::AutoBraceSnapshot::from_editor(editor)
         } else {

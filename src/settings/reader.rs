@@ -27,7 +27,7 @@ pub(crate) fn read_all(settings: &EditorSettings) -> SettingsSnapshot {
         smartcase: read_bool(settings, keys::SMARTCASE, defaults::SMARTCASE),
         line_number_mode: read_line_number_mode(settings),
         inccommand: read_inccommand(settings),
-        highlight_yank_duration: read_int(settings, keys::HIGHLIGHT_YANK_DURATION, defaults::HIGHLIGHT_YANK_DURATION).max(0) as u32,
+        highlight_yank_duration: read_int(settings, keys::HIGHLIGHT_YANK_DURATION, defaults::HIGHLIGHT_YANK_DURATION).max(0).min(u32::MAX as i64) as u32,
         cursor: CursorSettings {
             normal: read_color(settings, keys::CURSOR_NORMAL, defaults::cursor_normal()),
             insert: read_color(settings, keys::CURSOR_INSERT, defaults::cursor_insert()),

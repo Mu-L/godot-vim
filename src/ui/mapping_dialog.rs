@@ -304,7 +304,7 @@ impl MappingDialog {
     fn on_timeout_changed(&mut self, value: f64) {
         panic_guard(
             || {
-                let ms = value.round() as u32;
+                let ms = value.round().max(0.0).min(u32::MAX as f64) as u32;
                 if let Some(svc) = &mut self.service {
                     svc.set_timeoutlen(ms);
                     self.save_and_reload();
@@ -574,7 +574,7 @@ impl MappingDialog {
     fn read_doc_indices(item: &Gd<godot::classes::TreeItem>) -> Vec<usize> {
         let metadata = item.get_metadata(0);
         if let Ok(arr) = metadata.try_to::<PackedInt64Array>() {
-            (0..arr.len()).map(|i| arr[i].max(0) as usize).collect()
+            (0..arr.len()).map(|i| usize::try_from(arr[i].max(0)).unwrap_or(0)).collect()
         } else if let Ok(single) = metadata.try_to::<i64>() {
             if single >= 0 { vec![single as usize] } else { Vec::new() }
         } else {
@@ -622,7 +622,7 @@ impl MappingDialog {
     /// to prevent a feedback loop (set_value would trigger on_timeout_changed).
     fn update_timeout_spinbox(&mut self, svc: &MappingService) {
         let Some(spinbox) = &mut self.timeout_spinbox else { return };
-        let ms = svc.timeoutlen().unwrap_or(crate::settings::defaults::TIMEOUTLEN as u32);
+        let ms = svc.timeoutlen().unwrap_or(u32::try_from(crate::settings::defaults::TIMEOUTLEN).unwrap_or(1000));
 
         spinbox.set_block_signals(true);
         spinbox.set_value(ms as f64);
