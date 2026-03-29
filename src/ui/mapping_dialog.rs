@@ -34,6 +34,7 @@ use godot::builtin::PackedInt64Array;
 use crate::config::mapping_service::{
     MappingGroupId, MappingService, PresetId, UserMappingRow, row_passes_mode_filter,
 };
+use crate::config::types::ModeSet;
 use crate::config::writer;
 use crate::safety::panic_guard;
 use vim_core::keymap::MappingKind;
@@ -237,14 +238,13 @@ impl MappingDialog {
                         svc.edit_rhs(&id, &new_text);
                     }
                     COL_N | COL_I | COL_V | COL_O | COL_C => {
-                        svc.update_modes(
-                            &id,
-                            item.is_checked(COL_N),
-                            item.is_checked(COL_I),
-                            item.is_checked(COL_V),
-                            item.is_checked(COL_O),
-                            item.is_checked(COL_C),
-                        );
+                        let mut modes = ModeSet::empty();
+                        if item.is_checked(COL_N) { modes |= ModeSet::NORMAL; }
+                        if item.is_checked(COL_I) { modes |= ModeSet::INSERT; }
+                        if item.is_checked(COL_V) { modes |= ModeSet::VISUAL; }
+                        if item.is_checked(COL_O) { modes |= ModeSet::OPERATOR; }
+                        if item.is_checked(COL_C) { modes |= ModeSet::COMMAND; }
+                        svc.update_modes(&id, modes);
                     }
                     _ => return,
                 }
@@ -684,11 +684,11 @@ impl MappingDialog {
         item.set_editable(COL_RHS, true);
 
         for (col, checked) in [
-            (COL_N, row.normal),
-            (COL_I, row.insert),
-            (COL_V, row.visual),
-            (COL_O, row.operator),
-            (COL_C, row.command),
+            (COL_N, row.modes.contains(ModeSet::NORMAL)),
+            (COL_I, row.modes.contains(ModeSet::INSERT)),
+            (COL_V, row.modes.contains(ModeSet::VISUAL)),
+            (COL_O, row.modes.contains(ModeSet::OPERATOR)),
+            (COL_C, row.modes.contains(ModeSet::COMMAND)),
         ] {
             item.set_cell_mode(col, godot::classes::tree_item::TreeCellMode::CHECK);
             item.set_checked(col, checked);

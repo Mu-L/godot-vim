@@ -253,6 +253,7 @@ dependencies = [
 name = "godot-vim"
 version = "1.0.0"
 dependencies = [
+ "bitflags",
  "compact_str",
  "godot",
  "log",
