@@ -13,6 +13,8 @@ use godot::prelude::*;
 use vim_core::execution::{HostRequestId, HostResult};
 use vim_core::primitives::Range;
 
+use crate::bridge::code_edit_ext::CodeEditExt;
+
 use super::host_failure;
 
 static FILTER_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -206,7 +208,7 @@ pub(super) fn handle_reindent(
     let start_line = crate::bridge::codec::usize_to_i32(full_text[..start_byte].matches('\n').count());
 
     let use_spaces = editor.is_indent_using_spaces();
-    let indent_size = crate::bridge::codec::i32_to_usize(editor.get_indent_size().max(1));
+    let indent_size = editor.safe_indent_size();
     let one_indent = if use_spaces {
         " ".repeat(indent_size)
     } else {
