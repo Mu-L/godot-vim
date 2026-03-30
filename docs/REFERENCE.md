@@ -359,17 +359,15 @@ All settings are in **Editor > Editor Settings > Plugins > GodotVim**.
 |---------|------|---------|-------------|
 | Enabled | `bool` | `true` | Custom cursor overlay (disable for native caret). |
 | Lerp Speed | `float` | `25.0` | Smooth movement speed (higher = snappier). |
-| Blink Speed | `float` | `4.0` | Blinks per second (0 = no blink). |
-| Beam Width | `float` | `2.0` | Insert-mode beam width in pixels. |
 | Underline Height | `float` | `4.0` | Replace-mode underline height in pixels. |
-| Line Highlight | `bool` | `false` | Highlight the cursor line. |
 | Normal Color | `Color` | `#FFFFFF` | Cursor color in Normal mode. |
 | Insert Color | `Color` | `#55FF7F` | Cursor color in Insert mode. |
 | Visual Color | `Color` | `#FFB855` | Cursor color in Visual mode. |
 | Replace Color | `Color` | `#FF333399` | Cursor color in Replace mode. |
 | Operator Mode Color | `Color` | `#FFB855` | Cursor color in Operator-pending mode. |
 | Command Mode Color | `Color` | `#FFFFFF` | Cursor color in Command-line mode. |
-| Line Highlight Color | `Color` | `#FFFFFF0F` | Color of the cursor line highlight (very low alpha). |
+
+> **Note:** Line highlighting, cursor blink, and beam width are controlled by Godot's native settings under `text_editor/appearance/caret/`.
 
 ### Key Mapping
 
