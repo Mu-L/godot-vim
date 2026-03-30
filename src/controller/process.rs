@@ -20,6 +20,7 @@ use compact_str::CompactString;
 use godot::classes::CodeEdit;
 use godot::prelude::*;
 use vim_core::document::Providers;
+use vim_core::execution::MacroOutput;
 use vim_core::keymap::KeyEvent;
 use vim_core::primitives::SelectionRange;
 
@@ -419,16 +420,16 @@ impl ProcessContext<'_> {
 
     pub(super) fn drain_pending(&mut self, editor: &mut Gd<CodeEdit>) {
         let mut iterations: u32 = 0;
-        while let Some(key) = self.engine.drain_next_key() {
+        while let Some(output) = self.engine.drain_next_key() {
             iterations += 1;
             if iterations > MAX_DRAIN_ITERATIONS || *self.operations_this_cycle > MAX_DRAIN_ITERATIONS {
                 log::error!(
-                    "Drain exceeded {} iterations (local={}, cycle={}, last_key={}) — \
+                    "Drain exceeded {} iterations (local={}, cycle={}, last_output={:?}) — \
                      aborting replay to break potential infinite loop",
                     MAX_DRAIN_ITERATIONS,
                     iterations,
                     *self.operations_this_cycle,
-                    key,
+                    output,
                 );
                 self.state.globals_mut().set_error(
                     "E223: Mapping/macro replay exceeded iteration limit — aborted",
@@ -436,8 +437,56 @@ impl ProcessContext<'_> {
                 self.engine.abort_replay();
                 return;
             }
-            self.process_single_key(key, editor);
+            match output {
+                MacroOutput::Key(key) => {
+                    self.process_single_key(key, editor);
+                }
+                MacroOutput::TextBlock { text, cursor_offset } => {
+                    self.apply_text_block(&text, cursor_offset, editor);
+                }
+            }
         }
+    }
+
+    /// Insert a text block directly at the cursor, bypassing insert dispatch.
+    /// Used for completion text, paste, and IME input during macro replay.
+    fn apply_text_block(&mut self, text: &str, cursor_offset: usize, editor: &mut Gd<CodeEdit>) {
+        let line = editor.get_caret_line();
+        let col = editor.get_caret_column();
+
+        // Insert the text at the caret. Godot's insert_text_at_caret moves the
+        // caret to the end of the inserted text after the call.
+        editor.insert_text_at_caret(&GString::from(text));
+
+        // Position cursor at the correct offset within the inserted text.
+        // cursor_offset is a byte offset relative to the insertion start.
+        //
+        // After insertion, the buffer contains the new text. We rebuild the
+        // line index on the post-insertion text and compute the target position:
+        //   target_byte = (caret_byte_after_insert - text.len()) + cursor_offset
+        // because the caret is at the END of the inserted text.
+        let full_text = editor.get_text().to_string();
+        let line_index = crate::bridge::codec::LineIndex::new(&full_text);
+
+        let caret_after = line_index.line_col_to_byte(
+            &full_text,
+            editor.get_caret_line(),
+            editor.get_caret_column(),
+        );
+        let target_byte = caret_after.saturating_sub(text.len()) + cursor_offset;
+        let target_pos = line_index.byte_to_line_col(&full_text, target_byte);
+
+        editor.set_caret_line(target_pos.line);
+        editor.set_caret_column(target_pos.col);
+
+        // Invalidate the text cache since we mutated text.
+        *self.persistent_text = None;
+        *self.operations_this_cycle = self.operations_this_cycle.saturating_add(1);
+
+        log::debug!(
+            "apply_text_block: inserted {}b at ({},{}) cursor_offset={} -> ({},{})",
+            text.len(), line, col, cursor_offset, target_pos.line, target_pos.col
+        );
     }
 
     /// Returns `true` if compound actions were generated, which means text
