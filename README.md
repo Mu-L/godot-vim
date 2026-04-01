@@ -12,8 +12,8 @@
   <a href="https://godotengine.org/asset-library/asset/4666">
     <img src="https://img.shields.io/badge/Godot%20Asset%20Lib-4.5%2B-478cbf?logo=godot-engine&logoColor=white" alt="Godot Asset Library">
   </a>
-  <a href="https://github.com/hmdfrds/godot-vim/actions/workflows/scan.yml">
-    <img src="https://github.com/hmdfrds/godot-vim/actions/workflows/scan.yml/badge.svg" alt="VirusTotal Scan">
+  <a href="https://github.com/hmdfrds/godot-vim/actions/workflows/release.yml">
+    <img src="https://github.com/hmdfrds/godot-vim/actions/workflows/release.yml/badge.svg" alt="Release">
   </a>
   <img src="https://img.shields.io/github/license/hmdfrds/godot-vim" alt="License">
 </p>
