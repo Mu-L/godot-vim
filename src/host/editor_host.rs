@@ -58,7 +58,7 @@ mod godot_impl {
 
     use super::EditorHost;
     use crate::host::error::HostError;
-    use crate::scene_tree::{find_descendant_by, MAX_DISCOVERY_DEPTH};
+    use crate::scene_tree::{find_descendant, MAX_DISCOVERY_DEPTH};
 
     /// Production `EditorHost` wrapping a live `Gd<CodeEdit>`.
     pub(crate) struct GodotEditorHost<'a>(pub(crate) &'a mut Gd<CodeEdit>);
@@ -94,6 +94,11 @@ mod godot_impl {
     /// child CodeEdit. If we emitted immediately, the CodeEdit would be freed
     /// while our `process_cycle` still holds a reference to it, causing a
     /// use-after-free panic on the subsequent `ui_snapshot()` / `ui.update()`.
+    ///
+    /// Discovery is language-independent: the File menu is found structurally
+    /// (first `MenuButton` descendant of ScriptEditor), and the Close item is
+    /// identified by its keyboard accelerator (`Ctrl+W` / `Cmd+W`), not by
+    /// its display text which varies with the UI language.
     fn trigger_script_editor_close() {
         let editor_iface = EditorInterface::singleton();
         let Some(script_editor) = editor_iface.get_script_editor() else {
@@ -101,41 +106,53 @@ mod godot_impl {
             return;
         };
 
-        // Find the "File" MenuButton among ScriptEditor's descendants.
-        // Tree: ScriptEditor → VBoxContainer → HBoxContainer (menu_hb) → MenuButton("File")
-        let file_menu: Option<Gd<MenuButton>> = find_descendant_by(
+        // The File menu is the first MenuButton descendant of ScriptEditor.
+        // Tree: ScriptEditor → VBoxContainer → HBoxContainer (menu_hb) → MenuButton
+        let file_menu: Option<Gd<MenuButton>> = find_descendant::<MenuButton>(
             &script_editor.clone().upcast(),
             MAX_DISCOVERY_DEPTH,
-            &|node| {
-                let mb = node.clone().try_cast::<MenuButton>().ok()?;
-                (mb.get_text().to_string() == "File").then_some(mb)
-            },
         );
 
         let Some(file_menu) = file_menu else {
-            // Fallback: scan all MenuButton descendants for a popup containing
-            // the "Close" item (handles translated UIs).
-            if let Some((popup, close_id)) = find_close_item_in_any_menu(&script_editor) {
-                defer_emit_id_pressed(popup, close_id);
-                return;
-            }
-            log::warn!("close_tab: could not find File menu in ScriptEditor");
+            log::warn!("close_tab: no MenuButton found in ScriptEditor");
             return;
         };
 
         let popup: Gd<PopupMenu> = file_menu.get_popup().expect("MenuButton always has a popup");
 
-        // Find the "Close" item by scanning for text "Close" (first exact match).
-        let count = popup.get_item_count();
-        for i in 0..count {
-            if popup.get_item_text(i).to_string() == "Close" {
-                let id = popup.get_item_id(i);
-                defer_emit_id_pressed(popup, id);
-                return;
-            }
+        // Find the Close item by its accelerator key (Ctrl+W / Cmd+W).
+        // This is language-independent — the accelerator doesn't change with
+        // Godot's UI translation, unlike the item text ("Close" / "Cerrar" / etc).
+        if let Some(id) = find_close_item_by_accelerator(&popup) {
+            defer_emit_id_pressed(popup, id);
+            return;
         }
 
-        log::warn!("close_tab: 'Close' item not found in File menu");
+        log::warn!("close_tab: no Ctrl+W accelerator item found in File menu");
+    }
+
+    /// Find the Close menu item by matching its keyboard accelerator.
+    ///
+    /// Godot's Close shortcut is `Ctrl+W` (or `Cmd+W` on macOS), registered
+    /// via `ED_SHORTCUT("script_editor/close_file", ...)`. The accelerator
+    /// key is stored as a `Key` bitfield combining modifier flags and the
+    /// key code. We match on `W` with either Ctrl or Meta modifier.
+    fn find_close_item_by_accelerator(popup: &Gd<PopupMenu>) -> Option<i32> {
+        let count = popup.get_item_count();
+        for i in 0..count {
+            let accel = popup.get_item_accelerator(i);
+            let key_code = accel.ord() as u64;
+            // Key::W = 87. Modifier masks: Ctrl = 1<<28, Meta/Cmd = 1<<27.
+            // Godot uses CMD_OR_CTRL which resolves to Ctrl on Linux/Windows
+            // and Meta on macOS. Check both.
+            let w = godot::global::Key::W.ord() as u64;
+            let ctrl_mask = godot::global::KeyModifierMask::CTRL.ord();
+            let meta_mask = godot::global::KeyModifierMask::META.ord();
+            if key_code == (w | ctrl_mask) || key_code == (w | meta_mask) {
+                return Some(popup.get_item_id(i));
+            }
+        }
+        None
     }
 
     /// Emit `id_pressed` on a PopupMenu at end-of-frame via `call_deferred`.
@@ -144,30 +161,6 @@ mod godot_impl {
             "emit_signal",
             &["id_pressed".to_variant(), id.to_variant()],
         );
-    }
-
-    /// Fallback scanner: find any MenuButton descendant whose popup has a "Close"
-    /// item. Handles non-English Godot UIs where the File menu text is translated.
-    fn find_close_item_in_any_menu(
-        script_editor: &Gd<godot::classes::ScriptEditor>,
-    ) -> Option<(Gd<PopupMenu>, i32)> {
-        find_descendant_by(
-            &script_editor.clone().upcast(),
-            MAX_DISCOVERY_DEPTH,
-            &|node| {
-                let mb = node.clone().try_cast::<MenuButton>().ok()?;
-                let popup = mb.get_popup()?;
-                let count = popup.get_item_count();
-                for i in 0..count {
-                    let text = popup.get_item_text(i).to_string();
-                    if text == "Close" {
-                        let id = popup.get_item_id(i);
-                        return Some((popup.clone(), id));
-                    }
-                }
-                None
-            },
-        )
     }
 
     fn emit_name_changed() {
