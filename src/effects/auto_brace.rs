@@ -35,7 +35,9 @@ pub(super) enum AutoBraceResult {
 ///
 /// Preconditions:
 /// - `editor.is_auto_brace_completion_enabled()` is `true`
-/// - `ch` is the single character being inserted
+/// - `ch` is a printable character (not a control char like `\n` or `\t`).
+///   Godot's `_handle_unicode_input_internal` never receives control characters;
+///   the dispatcher must enforce this before calling.
 /// - `offset` is the byte offset in `text` where the insert should occur
 pub(super) fn handle_insert_with_auto_brace(
     editor: &mut impl TextEditorPort,
@@ -45,6 +47,11 @@ pub(super) fn handle_insert_with_auto_brace(
     auto_brace: &AutoBraceSnapshot,
     syntax: &SyntaxRegion,
 ) -> AutoBraceResult {
+    debug_assert!(
+        !ch.is_control(),
+        "auto-brace received control char U+{:04X} — dispatcher should filter these",
+        ch as u32,
+    );
     let lc = doc.line_index.byte_to_line_col(doc.text, offset);
     let line = lc.line;
     let col = lc.col;

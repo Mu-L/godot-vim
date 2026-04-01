@@ -108,6 +108,19 @@ impl AutoBraceSnapshot {
         }
     }
 
+    /// Remove pairs where both open and close are single characters.
+    ///
+    /// When vim-core's `auto_pairs` is active, it owns all single-char pairs
+    /// (e.g. `()`, `{}`, `""`). This method filters those out so that the
+    /// host-side auto-brace only handles multi-char pairs (e.g. `/* */`),
+    /// preventing the two systems from conflicting on the same pair set.
+    pub(crate) fn filter_engine_owned_pairs(&mut self) {
+        let pairs = Rc::make_mut(&mut self.pairs);
+        pairs.retain(|(open, close)| {
+            open.chars().count() != 1 || close.chars().count() != 1
+        });
+    }
+
     /// Check if `key` is a string delimiter start key (no FFI — answered from snapshot).
     pub(crate) fn has_string_delimiter(&self, key: &str) -> bool {
         self.string_delimiters.iter().any(|d| d == key)

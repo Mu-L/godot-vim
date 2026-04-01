@@ -528,11 +528,17 @@ impl ProcessContext<'_> {
 
         let editor_id = editor.instance_id();
         let auto_brace_eligible = matches!(auto_brace, crate::effects::dispatch::AutoBraceMode::Eligible);
-        let auto_brace_snapshot = if auto_brace_eligible {
+        let mut auto_brace_snapshot = if auto_brace_eligible {
             bridge::AutoBraceSnapshot::from_editor(editor)
         } else {
             bridge::AutoBraceSnapshot::disabled()
         };
+        // When vim-core owns single-char auto-pairs, remove them from the
+        // host-side auto-brace pair list so the two systems operate on
+        // disjoint sets and can never conflict (issue #20).
+        if self.engine.options().auto_pairs().is_some() {
+            auto_brace_snapshot.filter_engine_owned_pairs();
+        }
         let compound_actions = {
             // Cheap Gd clone for the syntax closure; the original `editor` is
             // borrowed mutably by CodeEditPort simultaneously.
