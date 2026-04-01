@@ -118,6 +118,32 @@ jobs:
           cp artifacts/godot_vim.dll/godot_vim.dll addons/godot_vim/bin/
           cp artifacts/libgodot_vim.dylib/libgodot_vim.dylib addons/godot_vim/bin/
 
+      - name: VirusTotal Scan
+        id: vt
+        uses: crazy-max/ghaction-virustotal@v4
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          request_rate: 4
+          files: |
+            addons/godot_vim/bin/libgodot_vim.so
+            addons/godot_vim/bin/godot_vim.dll
+            addons/godot_vim/bin/libgodot_vim.dylib
+
+      - name: Build release body
+        id: body
+        run: |
+          {
+            echo 'RELEASE_BODY<<EOF'
+            echo '## VirusTotal Scan'
+            IFS=',' read -ra ENTRIES <<< "${{ steps.vt.outputs.analysis }}"
+            for entry in "${ENTRIES[@]}"; do
+              filename="${entry%%=*}"
+              url="${entry##*=}"
+              echo "- [\`${filename}\`](${url})"
+            done
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create addon zip
         env:
           VERSION: ${{ inputs.version }}
@@ -128,6 +154,7 @@ jobs:
         with:
           tag_name: ${{ inputs.version }}
           name: GodotVim ${{ inputs.version }}
+          body: ${{ steps.body.outputs.RELEASE_BODY }}
           files: |
             godot-vim-${{ inputs.version }}.zip
             addons/godot_vim/bin/libgodot_vim.so
