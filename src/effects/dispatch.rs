@@ -125,10 +125,14 @@ pub(crate) fn dispatch(
         match effect {
             Effect::Insert { offset, text: content } => {
                 let doc = DocumentView::new(&text, &line_index);
-                // Auto-brace only fires for single-char inserts (typing, not paste).
+                // Auto-brace only fires for single printable characters (typing,
+                // not paste). Control chars are excluded because Godot's
+                // _handle_unicode_input_internal never receives them.
                 let is_single_char = content.chars().count() == 1;
+                let is_control_char = content.starts_with(|c: char| c.is_control());
                 if auto_brace_eligible
                     && is_single_char
+                    && !is_control_char
                     && auto_brace_snapshot.enabled
                 {
                     let Some(ch) = content.chars().next() else {

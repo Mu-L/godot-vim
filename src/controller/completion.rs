@@ -127,12 +127,18 @@ pub(crate) fn try_handle_completion(
     }
 }
 
-/// After the engine processes an insert-mode key, re-trigger CodeEdit's
-/// completion heuristic so the popup can appear, filter, or dismiss.
+/// After the engine processes an insert-mode key, re-trigger or dismiss
+/// CodeEdit's completion popup to match Godot's native behavior.
 ///
-/// Gated on `code_complete_enabled` (the user's EditorSetting for auto-trigger).
-/// When the user disables auto-completion, typing should not pop up the
-/// completion menu; only explicit triggers (Ctrl+Space, Ctrl+N, Ctrl+P) should.
+/// Godot natively calls the private `_filter_code_completion_candidates_impl`
+/// after each typed character, which re-filters candidates and cancels the
+/// popup when the word prefix is empty. We replicate that cancel logic here:
+/// word chars and completion-prefix chars (`.`, etc.) retrigger; everything
+/// else (`;`, `)`, space) cancels. Prefix chars come from CodeEdit's
+/// `code_completion_prefixes` — a per-language set, not a hardcoded list.
+///
+/// Gated on `code_complete_enabled` so typing doesn't auto-trigger the popup
+/// when the user has disabled auto-completion in EditorSettings.
 pub(crate) fn maybe_retrigger_completion(
     engine: &VimEngine,
     key: KeyEvent,
@@ -148,17 +154,29 @@ pub(crate) fn maybe_retrigger_completion(
         return;
     }
 
-    let should_retrigger = match key.key() {
-        // Only printable chars and backspace change the prefix that Godot
-        // uses to filter the completion list.
-        Key::Char(c) if !c.is_control() && key.modifiers() == Modifiers::NONE => true,
-        Key::Backspace => true,
-        _ => false,
-    };
-
-    if should_retrigger {
-        editor.request_code_completion_ex().force(false).done();
+    match key.key() {
+        Key::Char(c) if !c.is_control() && key.modifiers() == Modifiers::NONE => {
+            if c.is_alphanumeric() || c == '_' || is_completion_prefix(editor, c) {
+                editor.request_code_completion_ex().force(false).done();
+            } else {
+                editor.cancel_code_completion();
+            }
+        }
+        Key::Backspace => {
+            editor.request_code_completion_ex().force(false).done();
+        }
+        _ => {}
     }
+}
+
+/// Check if `ch` is in CodeEdit's `code_completion_prefixes` (e.g., `.` for
+/// member access). These are per-language trigger characters configured by
+/// Godot's script language providers.
+fn is_completion_prefix(editor: &Gd<CodeEdit>, ch: char) -> bool {
+    let prefixes = editor.get_code_completion_prefixes();
+    let mut buf = [0u8; 4];
+    let ch_str = ch.encode_utf8(&mut buf);
+    prefixes.iter_shared().any(|p| *p.to_string() == *ch_str)
 }
 
 /// Confirm the selected completion and reconcile the text delta with the
