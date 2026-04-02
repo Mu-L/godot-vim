@@ -320,6 +320,18 @@ impl VimController {
         self.state.clear_substitute_preview();
     }
 
+    /// Reset parser and abort recording — the Tier 1 operations not covered
+    /// by the Tier 2 `force_exit_*` methods.
+    ///
+    /// Called on the normal detach path after all mode exits are complete.
+    /// Separate from `force_cleanup_without_editor` because the other Tier 1
+    /// operations (mode reset, undo drain, replay abort, substitute preview)
+    /// are already handled by the Tier 2 force-exit calls.
+    pub(crate) fn engine_reset_parser_and_recording(&mut self) {
+        self.engine.reset_parser();
+        self.engine.abort_recording();
+    }
+
     /// Notify the engine that the current buffer is being left.
     ///
     /// Saves the cursor position as the `'"` (last-position) mark so that
