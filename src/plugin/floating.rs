@@ -287,6 +287,28 @@ impl GodotVimPlugin {
             }
         }
 
+        if let Some(gui_base_node) = interface.get_base_control() {
+            let gb_class = gui_base_node.get_class().to_string();
+            log::trace!(
+                "enter_tree: gui_base = {} (#{})",
+                gb_class,
+                gui_base_node.instance_id().to_i64()
+            );
+            let was_disconnected =
+                !gui_base_node.is_connected(SIG_CHILD_ENTERED_TREE, &child_callable);
+            connect_immediate(
+                &mut gui_base_node.clone().upcast::<Node>(),
+                SIG_CHILD_ENTERED_TREE,
+                &child_callable,
+            );
+            if was_disconnected {
+                log::trace!(
+                    "enter_tree: connected child_entered_tree on gui_base ({})",
+                    gb_class
+                );
+            }
+        }
+
         if let Some(mut main_screen) = interface.get_editor_main_screen() {
             let ms_class = main_screen.get_class().to_string();
             log::trace!(
@@ -326,6 +348,13 @@ impl GodotVimPlugin {
             if let Some(mut parent) = gui_base.get_parent() {
                 safe_disconnect(&mut parent, SIG_CHILD_ENTERED_TREE, &child_callable);
             }
+        }
+        if let Some(gui_base) = interface.get_base_control() {
+            safe_disconnect(
+                &mut gui_base.clone().upcast::<Node>(),
+                SIG_CHILD_ENTERED_TREE,
+                &child_callable,
+            );
         }
         if let Some(mut main_screen) = interface.get_editor_main_screen() {
             safe_disconnect(&mut main_screen, SIG_CHILD_ENTERED_TREE, &child_callable);
