@@ -560,7 +560,7 @@ impl LineNumberManager {
         if !total_width.is_finite() {
             return;
         }
-        editor.set_gutter_width(self.line_gutter_index, total_width.clamp(0.0, i32::MAX as f32) as i32);
+        editor.set_gutter_width(self.line_gutter_index, crate::bridge::codec::f32_to_i32_sat(total_width.max(0.0)));
     }
 
     /// Disable built-in gutters and create (or reuse) custom STRING + ICON

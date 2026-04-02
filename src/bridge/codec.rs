@@ -409,6 +409,28 @@ pub(crate) fn u32_to_i32_sat(val: u32) -> i32 {
     }
 }
 
+/// `f32` -> `i32` with saturation. Non-finite values return 0; values outside
+/// `[i32::MIN, i32::MAX]` clamp to the nearest bound.
+///
+/// Used where Godot `f32` coordinates or sizes must cross into `i32` APIs
+/// (e.g., mouse warp positions, gutter widths, highlight rectangles).
+#[inline]
+pub(crate) fn f32_to_i32_sat(val: f32) -> i32 {
+    if !val.is_finite() {
+        log::warn!("f32_to_i32_sat: non-finite value {val}, returning 0");
+        return 0;
+    }
+    if val > i32::MAX as f32 {
+        log::warn!("f32_to_i32_sat: overflow {val} clamped to i32::MAX");
+        i32::MAX
+    } else if val < i32::MIN as f32 {
+        log::warn!("f32_to_i32_sat: underflow {val} clamped to i32::MIN");
+        i32::MIN
+    } else {
+        val as i32
+    }
+}
+
 /// Godot char column (Unicode scalars) -> grapheme column (user-perceived characters).
 ///
 /// Godot's `get_caret_column()` counts codepoints, but vim-core's sticky column

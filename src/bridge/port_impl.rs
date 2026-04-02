@@ -364,11 +364,9 @@ impl NavigationCapable for CodeEditPort<'_> {
             return;
         }
 
-        // Clamp before cast: f32->i32 is UB for out-of-range values.
-        let warp_x = pos_global.x.clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+        let warp_x = super::codec::f32_to_i32_sat(pos_global.x);
         // Vertically center the warp point within the line's glyph rectangle.
-        let warp_y = (pos_global.y + rect_local.size.y as f32 / 2.0)
-            .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+        let warp_y = super::codec::f32_to_i32_sat(pos_global.y + rect_local.size.y as f32 / 2.0);
 
         let mut display_server = godot::classes::DisplayServer::singleton();
         display_server.warp_mouse(Vector2i::new(warp_x, warp_y));
