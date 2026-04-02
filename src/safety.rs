@@ -87,8 +87,9 @@ pub(crate) fn install_panic_hook() {
 /// Wrap a closure in `catch_unwind`, returning `default` on panic.
 ///
 /// Every Godot signal handler and virtual override in this plugin should be
-/// wrapped with this guard. The `AssertUnwindSafe` is sound because we do
-/// not resume normal operation after a panic -- we log and return a default.
+/// wrapped with this guard. The `AssertUnwindSafe` is sound because every
+/// engine-mutating callsite performs comprehensive state recovery after a
+/// panic, restoring invariants before the next operation.
 pub(crate) fn panic_guard<F, R>(f: F, default: R) -> R
 where
     F: FnOnce() -> R,

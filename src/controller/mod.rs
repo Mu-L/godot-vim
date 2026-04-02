@@ -468,6 +468,7 @@ impl VimController {
         self.pending_step_effects = None;
         self.pending_ui_action = None;
         self.operations_this_cycle = 0;
+        self.vimdebug.set_mode(vimdebug::VimdebugMode::Off);
         self.state.globals_mut().set_error(
             "Recovered from internal error \u{2014} state reset to Normal mode",
         );

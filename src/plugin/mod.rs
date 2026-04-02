@@ -451,23 +451,33 @@ impl GodotVimPlugin {
     /// the text cache, drain orphaned undo groups, refresh the UI to reflect
     /// the recovered state. Called from every `panic_guard` callsite that
     /// mutates the controller.
+    ///
+    /// The recovery body is itself wrapped in `panic_guard` for defense-in-depth.
+    /// If recovery panics (double-panic), Tier 1 (engine reset) has already
+    /// completed inside `recover_from_panic`, so the engine is in a known-good
+    /// state. Godot state may be slightly messy but no UB occurs.
     fn recover_controller_from_panic(&mut self) {
-        if let (Some(controller), Some(editor)) =
-            (&mut self.controller, &mut self.attached_editor)
-        {
-            if editor.is_instance_valid() {
-                let mut editor = editor.clone();
-                controller.recover_from_panic(&mut editor);
+        panic_guard(
+            || {
+                if let (Some(controller), Some(editor)) =
+                    (&mut self.controller, &mut self.attached_editor)
+                {
+                    if editor.is_instance_valid() {
+                        let mut editor = editor.clone();
+                        controller.recover_from_panic(&mut editor);
 
-                // Refresh UI so the user sees Normal mode + error message
-                // immediately, not stale pre-panic state.
-                let editor_id = editor.instance_id();
-                let snap = controller.ui_snapshot(editor_id);
-                self.ui.update(&snap, &mut editor);
-            }
-        }
-        // Clear stale caret suppression counter so deferred caret_changed
-        // events after recovery are not swallowed.
+                        // Refresh UI so the user sees Normal mode + error message
+                        // immediately, not stale pre-panic state.
+                        let editor_id = editor.instance_id();
+                        let snap = controller.ui_snapshot(editor_id);
+                        self.ui.update(&snap, &mut editor);
+                    }
+                }
+            },
+            (),
+        );
+        // Always reset — trivially infallible (u32 assignment), must happen
+        // regardless of whether recovery itself panicked.
         self.pending_caret_suppressions = 0;
     }
 
