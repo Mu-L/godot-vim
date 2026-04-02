@@ -63,13 +63,23 @@ fn sanitize_path(path: &str) -> &str {
 pub(crate) fn install_panic_hook() {
     static HOOK_INSTALLED: Once = Once::new();
     HOOK_INSTALLED.call_once(|| {
-        std::panic::set_hook(Box::new(|info| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
             let msg = extract_panic_message(info.payload());
             let location = info.location().map_or_else(
                 String::new,
-                |loc| format!(" at {}:{}:{}", sanitize_path(loc.file()), loc.line(), loc.column()),
+                |loc| {
+                    format!(
+                        " at {}:{}:{}",
+                        sanitize_path(loc.file()),
+                        loc.line(),
+                        loc.column(),
+                    )
+                },
             );
             godot_error!("GodotVim panic{location}: {msg}");
+            // Chain to the previous hook (typically gdext's default handler).
+            previous(info);
         }));
     });
 }
