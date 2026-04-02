@@ -25,6 +25,9 @@ compact_str = "0.7"
 [dev-dependencies]
 proptest = "1.4"
 
+[patch."https://github.com/hmdfrds/vim-core.git"]
+vim-core = { path = "../vim-core/vim-core" }
+
 [profile.release]
 opt-level = 2
 lto = "fat"

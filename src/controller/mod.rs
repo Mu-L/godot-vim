@@ -312,12 +312,16 @@ impl VimController {
     /// - Mode → Normal (covers Insert/Replace/Visual/CommandLine)
     /// - Undo depth counter (Godot-side groups died with the editor)
     /// - Pending mapping keys + macro replay (can't resolve without editor)
+    /// - Parser state (clears operator-pending like a stale `d`)
+    /// - Macro recording (can't continue without editor context)
     /// - Substitute preview (prevents stale inccommand on next editor)
     pub(crate) fn force_cleanup_without_editor(&mut self) {
         log::debug!("force_cleanup_without_editor: resetting engine state for dead editor");
         self.engine.set_mode(vim_core::primitives::Mode::Normal);
         self.undo_depth.drain();
         self.engine.abort_replay();
+        self.engine.reset_parser();
+        self.engine.abort_recording();
         self.state.clear_substitute_preview();
     }
 
