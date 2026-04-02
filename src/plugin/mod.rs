@@ -336,9 +336,14 @@ impl GodotVimPlugin {
     /// that bypass the Vim keystroke pipeline's inline cache invalidation.
     #[func]
     fn on_text_changed(&mut self) {
-        if let Some(controller) = &mut self.controller {
-            controller.invalidate_text_cache();
-        }
+        panic_guard(
+            || {
+                if let Some(controller) = &mut self.controller {
+                    controller.invalidate_text_cache();
+                }
+            },
+            (),
+        );
     }
 
     #[func]
