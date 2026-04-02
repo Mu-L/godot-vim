@@ -165,10 +165,10 @@ impl GodotVimPlugin {
             controller.force_exit_insert_replace(&mut editor);
             controller.force_exit_visual(editor_id, &mut editor);
 
-            // Tier 1 additions: clear parser state (pending operator like `d`)
-            // and abort macro recording. These are not covered by the force_exit_*
-            // methods above, which only handle mode transitions.
-            controller.engine_reset_parser_and_recording();
+            // Clear parser state (pending operator like `d`) so it doesn't
+            // leak to the next editor. Macro recording is NOT aborted here —
+            // it is a session-level concept that survives buffer switches.
+            controller.engine_reset_parser();
 
             // Reset transient shell state (vimdebug, pending effects, caches).
             controller.reset_transients();

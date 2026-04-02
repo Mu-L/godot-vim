@@ -360,16 +360,15 @@ impl VimController {
         godot_groups
     }
 
-    /// Reset parser and abort recording — the Tier 1 operations not covered
-    /// by the Tier 2 `force_exit_*` methods.
+    /// Reset parser state — clears pending operator (e.g. `d` waiting for
+    /// motion) so it doesn't leak to the next editor.
     ///
-    /// Called on the normal detach path after all mode exits are complete.
-    /// Separate from `force_cleanup_without_editor` because the other Tier 1
-    /// operations (mode reset, undo drain, replay abort, substitute preview)
-    /// are already handled by the Tier 2 force-exit calls.
-    pub(crate) fn engine_reset_parser_and_recording(&mut self) {
+    /// Does NOT abort macro recording. Recording is a session-level concept
+    /// that survives buffer switches, matching Vim's behavior where `qa...`
+    /// continues across `:edit` commands. Recording is only aborted by
+    /// emergency paths (`force_cleanup_without_editor` → `emergency_reset`).
+    pub(crate) fn engine_reset_parser(&mut self) {
         self.engine.reset_parser();
-        self.engine.abort_recording();
     }
 
     /// Convenience wrapper to reset transient shell state without touching
