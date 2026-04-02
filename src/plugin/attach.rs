@@ -182,6 +182,7 @@ impl GodotVimPlugin {
         }
 
         if let Some(controller) = &mut self.controller {
+            controller.on_buffer_leave(&editor);
             controller.save_buffer_mappings_to_state(editor_id);
         }
 

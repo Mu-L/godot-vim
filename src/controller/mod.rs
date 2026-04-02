@@ -321,6 +321,21 @@ impl VimController {
         self.state.clear_substitute_preview();
     }
 
+    /// Notify the engine that the current buffer is being left.
+    ///
+    /// Saves the cursor position as the `'"` (last-position) mark so that
+    /// `'"` and `g'"` jump back to the right spot after a tab switch.
+    /// Must be called before `save_buffer_mappings_to_state` per vim-core's
+    /// documented contract.
+    pub(crate) fn on_buffer_leave(&mut self, editor: &Gd<CodeEdit>) {
+        let line = editor.get_caret_line();
+        let col = editor.get_caret_column();
+        let text = editor.get_text().to_string();
+        let line_index = crate::bridge::codec::LineIndex::new(&text);
+        let offset = line_index.line_col_to_byte(&text, line, col);
+        self.engine.on_buffer_leave(offset);
+    }
+
     /// Force-exit visual/select mode on detach, clearing both engine and
     /// Godot-side selection state to prevent stale highlights.
     pub(crate) fn force_exit_visual(&mut self, editor_id: InstanceId, editor: &mut Gd<CodeEdit>) {
