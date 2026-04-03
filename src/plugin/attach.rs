@@ -35,6 +35,12 @@ impl GodotVimCore {
 
         self.detach();
 
+        // Store the editor reference BEFORE signal connections so that
+        // panic recovery can call detach() to disconnect orphaned signals.
+        // Safe: no per-editor signal handler can fire until connections below.
+        self.attached_editor = Some(editor.clone());
+        self.last_editor_id = Some(new_id);
+
         let mut editor = editor;
 
         // gui_input MUST be immediate -- deferred delivery would miss the
@@ -109,9 +115,6 @@ impl GodotVimCore {
         for signal_name in &[SIG_DRAW, SIG_VISIBILITY_CHANGED, SIG_MINIMUM_SIZE_CHANGED] {
             connect_deferred(&mut editor, signal_name, &draw_callable);
         }
-
-        self.attached_editor = Some(editor.clone());
-        self.last_editor_id = Some(new_id);
 
         log::debug!("Attached to editor #{}", new_id.to_i64());
     }

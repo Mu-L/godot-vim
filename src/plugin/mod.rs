@@ -406,6 +406,16 @@ impl GodotVimCore {
         );
         if !ok {
             self.recover_controller_from_panic();
+            // Prevent the dedup guard from blocking re-attachment after
+            // a panic. Without this, the next focus event for the same
+            // editor would be skipped.
+            self.last_editor_id = None;
+            // Disconnect any orphaned signal connections from a partial
+            // attach. Since attached_editor is now stored before signal
+            // connections, detach() has the editor reference and can
+            // disconnect via safe_disconnect (no-op for signals that
+            // were never connected).
+            panic_guard("perform_attach:cleanup_detach", || self.detach(), ());
         }
     }
 
@@ -448,6 +458,11 @@ impl GodotVimCore {
         );
         if !ok {
             self.recover_controller_from_panic();
+            // Clear the dedup guard so re-attachment works when a CodeEdit
+            // reappears. Without this, a panic during detach would leave
+            // last_editor_id set, and the next perform_attach for the same
+            // editor would skip.
+            self.last_editor_id = None;
         }
     }
 
