@@ -5,3 +5,4 @@
 .env
 .godot/
 addons/godot_vim/bin/
+.cargo/
