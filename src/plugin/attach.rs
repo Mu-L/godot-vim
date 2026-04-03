@@ -1,4 +1,4 @@
-//! Editor attachment and detachment: signal wiring, buffer-local mapping
+//! Editor attachment and detachment: signal wiring, per-buffer engine state
 //! save/restore, indent/commentstring sync, and UI lifecycle management.
 
 use godot::classes::CodeEdit;
@@ -61,7 +61,7 @@ impl GodotVimCore {
         connect_deferred(&mut editor, SIG_TEXT_CHANGED, &text_changed_callable);
 
         if let Some(controller) = &mut self.controller {
-            controller.restore_buffer_mappings_from_state(new_id);
+            controller.restore_buffer_engine_state(new_id);
         }
 
         // Seed the undo tree with the editor's current text so that the first
@@ -200,8 +200,7 @@ impl GodotVimCore {
         }
 
         if let Some(controller) = &mut self.controller {
-            controller.on_buffer_leave(&editor);
-            controller.save_buffer_mappings_to_state(editor_id);
+            controller.save_buffer_engine_state(editor_id, &editor);
         }
 
         let gui_callable = self.base().callable("handle_gui_input");

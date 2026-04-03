@@ -46,11 +46,6 @@ impl BufferState {
         self.visual.as_ref()
     }
 
-    #[must_use]
-    pub(crate) fn engine_state(&self) -> Option<&BufferLocalState> {
-        self.engine_state.as_ref()
-    }
-
     pub(crate) fn set_engine_state(&mut self, state: BufferLocalState) {
         self.engine_state = Some(state);
     }
