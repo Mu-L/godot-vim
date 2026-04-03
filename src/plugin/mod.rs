@@ -423,6 +423,12 @@ impl GodotVimCore {
                 }
 
                 self.detach();
+                // Standalone detach (not a precondition to attach) — clear
+                // the dedup guard so re-attachment works when a CodeEdit
+                // reappears. Must be inside the guard so it only runs when
+                // the detach actually executes, not when the re-discovery
+                // guard skips it.
+                self.last_editor_id = None;
                 true
             },
             false,
@@ -430,9 +436,6 @@ impl GodotVimCore {
         if !ok {
             self.recover_controller_from_panic();
         }
-        // This is a standalone detach (not a precondition to attach), so clear
-        // the dedup guard to allow re-attachment when a CodeEdit reappears.
-        self.last_editor_id = None;
     }
 
     #[func]
