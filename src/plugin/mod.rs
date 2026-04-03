@@ -692,6 +692,13 @@ impl GodotVimCore {
         self.pending_caret_suppressions = 0;
     }
 
+    fn cancel_pending_tooltip(&mut self) {
+        if self.pending_tooltip.is_some() {
+            self.pending_tooltip = None;
+            self.base_mut().set_process(false);
+        }
+    }
+
     fn poll_pending_tooltip(&mut self) {
         let Some(pending) = &self.pending_tooltip else {
             self.base_mut().set_process(false);
@@ -711,7 +718,7 @@ impl GodotVimCore {
         }
 
         // Timeout check (500ms)
-        let now = Time::singleton().get_ticks_usec() as u64;
+        let now = Time::singleton().get_ticks_usec();
         if now.saturating_sub(pending.created_at_usec) > 500_000 {
             log::debug!("poll_pending_tooltip: timeout, cancelling");
             self.pending_tooltip = None;
