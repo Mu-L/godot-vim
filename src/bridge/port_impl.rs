@@ -325,32 +325,49 @@ impl NavigationCapable for CodeEditPort<'_> {
         );
     }
 
-    fn show_documentation_tooltip(&mut self, symbol: &str, _line: i32, _col: i32) {
-        log::trace!("show_documentation_tooltip: symbol={symbol:?}");
-
+    fn show_documentation_tooltip(&mut self, symbol: &str, line: i32, col: i32) {
+        // Tier 1 (Godot 4.7+): Synthesize an InputEventShortcut for
+        // SHOW_TOOLTIP_AT_CARET. The shortcut "script_text_editor/show_tooltip"
+        // is only registered in Godot 4.7+; its presence acts as implicit
+        // version detection. When ScriptTextEditor receives this shortcut, it
+        // calls _show_symbol_tooltip(p_shortcut=true), which:
+        //   - Bypasses the is_anything_pressed() guard in make_tooltip
+        //   - Positions the tooltip at the caret (not the mouse)
+        //   - Works on Wayland/X11/macOS/Windows identically
+        // Pattern proven by trigger_script_editor_close() in editor_host.rs.
         let editor_iface = EditorInterface::singleton();
-        let Some(mut settings) = editor_iface.get_editor_settings() else {
-            log::warn!("show_documentation_tooltip: no editor settings available");
-            return;
-        };
+        if let Some(mut settings) = editor_iface.get_editor_settings() {
+            if let Some(shortcut) =
+                godot_calls::get_shortcut(&mut settings, godot_calls::SHORTCUT_SHOW_TOOLTIP)
+            {
+                if let Some(mut viewport) = editor_iface
+                    .get_base_control()
+                    .and_then(|ctrl| ctrl.get_viewport())
+                {
+                    let mut event: Gd<InputEventShortcut> = InputEventShortcut::new_gd();
+                    event.set_shortcut(&shortcut);
+                    viewport.call_deferred(
+                        "push_input",
+                        &[event.to_variant(), false.to_variant()],
+                    );
+                    log::debug!("show_documentation_tooltip: shortcut synthesis for '{symbol}'");
+                    return;
+                }
+            }
+        }
 
-        let Some(shortcut) =
-            godot_calls::get_shortcut(&mut settings, godot_calls::SHORTCUT_SHOW_TOOLTIP)
-        else {
-            log::warn!("show_documentation_tooltip: shortcut not found");
-            return;
-        };
-
-        let mut event: Gd<InputEventShortcut> = InputEventShortcut::new_gd();
-        event.set_shortcut(&shortcut);
-
-        let Some(mut viewport) =
-            editor_iface.get_base_control().and_then(|ctrl| ctrl.get_viewport())
-        else {
-            log::warn!("show_documentation_tooltip: no editor viewport available");
-            return;
-        };
-
-        viewport.call_deferred("push_input", &[event.to_variant(), false.to_variant()]);
+        // Tier 2 (Godot ≤4.6): Emit symbol_hovered signal directly.
+        // The is_anything_pressed() guard in make_tooltip (present since 4.4)
+        // will suppress the tooltip when K is held. This is a Godot limitation
+        // fixed upstream in 4.7 by the p_shortcut bypass. We emit the signal
+        // anyway so third-party listeners or future Godot patches can act on it.
+        self.0.emit_signal(
+            "symbol_hovered",
+            &[symbol.to_variant(), line.to_variant(), col.to_variant()],
+        );
+        log::debug!(
+            "show_documentation_tooltip: signal fallback for '{symbol}' \
+             (shortcut unavailable — tooltip may be suppressed on Godot <4.7)"
+        );
     }
 }
