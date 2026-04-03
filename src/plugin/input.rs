@@ -235,7 +235,8 @@ impl GodotVimCore {
         } else if !has_selection && mode.is_visual_or_select() {
             log::debug!("on_caret_changed: click deselect, exiting visual mode");
             let editor_id = ed.instance_id();
-            controller.force_exit_visual(editor_id, &mut ed);
+            controller.exit_mode_via_pipeline(&mut ed);
+            controller.cleanup_visual_artifacts(editor_id, &mut ed);
 
             let char_col = crate::bridge::codec::i32_to_usize(ed.get_caret_column());
             let line_text = ed.get_line(ed.get_caret_line()).to_string();

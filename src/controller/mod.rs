@@ -401,19 +401,41 @@ impl VimController {
         self.state.buffer(editor_id).set_engine_state(engine_state);
     }
 
-    /// Exit non-Normal mode by sending a synthetic Escape through the engine
-    /// pipeline. This ensures macro recording captures the exit, visual marks
-    /// (`<`/`>`), `LastVisualInfo`, insert-stop marks (`^`), and `EndUndo`
-    /// effects are all produced — identical to the user pressing Esc.
+    /// Exit non-Normal mode by sending synthetic Escapes through the engine
+    /// pipeline until Normal mode is reached. This ensures macro recording
+    /// captures the exit, visual marks (`<`/`>`), `LastVisualInfo`, insert-stop
+    /// marks (`^`), and `EndUndo` effects are all produced — identical to the
+    /// user pressing Esc.
     ///
-    /// Returns `true` if the engine was in a non-Normal mode and Esc was processed.
+    /// Handles mode nesting (e.g., visual → command-line → visual → normal)
+    /// by looping. Safety limit of 5 prevents infinite loops if a bug causes
+    /// Esc to not change mode.
+    ///
+    /// Returns `true` if the engine was in a non-Normal mode and Esc(s) were processed.
     pub(crate) fn exit_mode_via_pipeline(&mut self, editor: &mut Gd<CodeEdit>) -> bool {
         if self.engine.mode().is_normal() {
             return false;
         }
-        log::debug!("exit_mode_via_pipeline: mode={}", self.engine.mode());
-        let mut cx = self.as_process_context();
-        cx.process_single_key(KeyEvent::escape(), editor);
+        const MAX_ESC: usize = 5;
+        for i in 0..MAX_ESC {
+            if self.engine.mode().is_normal() {
+                break;
+            }
+            log::debug!(
+                "exit_mode_via_pipeline: pass {}, mode={}",
+                i + 1,
+                self.engine.mode()
+            );
+            let mut cx = self.as_process_context();
+            cx.process_single_key(KeyEvent::escape(), editor);
+        }
+        if !self.engine.mode().is_normal() {
+            log::error!(
+                "exit_mode_via_pipeline: still in {} after {} Escapes",
+                self.engine.mode(),
+                MAX_ESC
+            );
+        }
         true
     }
 
@@ -433,32 +455,6 @@ impl VimController {
         let remaining = self.undo_depth.drain();
         for _ in 0..remaining {
             editor.end_complex_operation();
-        }
-    }
-
-    /// Force-exit visual/select mode on detach, clearing both engine and
-    /// Godot-side selection state to prevent stale highlights.
-    pub(crate) fn force_exit_visual(&mut self, editor_id: InstanceId, editor: &mut Gd<CodeEdit>) {
-        // Callers must drain pending mapping keys first — a half-consumed
-        // multi-key sequence would reference a now-dead selection.
-        debug_assert!(
-            !self.engine.has_pending_mapping(),
-            "force_exit_visual called with pending mapping keys — drain first"
-        );
-
-        let mode = self.engine.mode();
-        if mode.is_visual() || mode.is_select() {
-            log::debug!("force_exit_visual: editor=#{} mode={}", editor_id.to_i64(), mode);
-
-            if self.engine.has_pending_keys() {
-                log::warn!("force_exit_visual: aborting pending replay before clearing selection");
-                self.engine.abort_replay();
-            }
-
-            self.engine.set_mode(vim_core::primitives::Mode::Normal);
-            self.state.buffer(editor_id).clear_visual_selection();
-            editor.remove_secondary_carets();
-            editor.deselect();
         }
     }
 

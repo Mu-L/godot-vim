@@ -178,6 +178,13 @@ impl GodotVimCore {
             // are all produced — identical to the user pressing Esc.
             controller.exit_mode_via_pipeline(&mut editor);
 
+            if !editor.is_instance_valid() {
+                log::warn!("detach: editor freed during exit_mode_via_pipeline");
+                controller.force_cleanup_without_editor();
+                self.ui.reset_cached_state();
+                return;
+            }
+
             // Defense-in-depth: clear Godot-side visual artifacts in case
             // the pipeline exit left stale selection highlights.
             controller.cleanup_visual_artifacts(editor_id, &mut editor);
