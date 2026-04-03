@@ -193,6 +193,7 @@ impl GodotVimCore {
 
     #[func]
     fn on_child_entered_tree(&mut self, node: Gd<Node>) {
+        if self.controller.is_none() { return; }
         panic_guard(
             "on_child_entered_tree",
             || {
@@ -228,6 +229,7 @@ impl GodotVimCore {
 
     #[func]
     fn on_wrapper_tree_exited(&mut self) {
+        if self.controller.is_none() { return; }
         panic_guard(
             "on_wrapper_tree_exited",
             || {
@@ -240,6 +242,7 @@ impl GodotVimCore {
 
     #[func]
     fn evict_stale_wrappers(&mut self) {
+        if self.controller.is_none() { return; }
         panic_guard(
             "evict_stale_wrappers",
             || {
@@ -304,6 +307,7 @@ impl GodotVimCore {
 
     #[func]
     fn on_floating_window_focused(&mut self) {
+        if self.controller.is_none() { return; }
         panic_guard(
             "on_floating_window_focused",
             || {
