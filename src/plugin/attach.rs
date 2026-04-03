@@ -98,6 +98,17 @@ impl GodotVimCore {
             self.ui.apply_settings(snapshot, mode, &mut editor);
         }
 
+        // ── Immediate UI content refresh ─────────────────────────────────
+        // At this point the engine state is fully restored (marks, search
+        // pattern, mode, hlsearch, etc.) and all overlay nodes exist.
+        // Push a full snapshot so the UI is visually correct from frame 1,
+        // eliminating the class of "stale UI until first keystroke" bugs
+        // (search highlights, status bar mode label, cursor shape, etc.).
+        if let Some(controller) = &mut self.controller {
+            let snap = controller.ui_snapshot(new_id);
+            self.ui.update(&snap, &mut editor);
+        }
+
         // Scrollbar instances are stable across attach/detach -- Godot does not
         // recreate them. If theme changes cause scrollbar recreation, these
         // connections silently break (acceptable: cursor overlay just won't
@@ -151,6 +162,56 @@ impl GodotVimCore {
 
         let editor_id = editor.instance_id();
 
+        // ── Disconnect ALL per-editor signals FIRST ─────────────────────
+        //
+        // CRITICAL: Deferred signals (caret_changed, text_changed, draw,
+        // scrollbar value_changed) must be disconnected BEFORE any operation
+        // that could trigger them (exit_mode_via_pipeline, cleanup_visual_-
+        // artifacts, drain_remaining_undo_depth, etc.).
+        //
+        // Godot's DEFERRED connection flag enqueues callbacks into the
+        // frame's deferred-call queue when the signal is emitted. Crucially,
+        // disconnecting a signal does NOT revoke already-enqueued callbacks.
+        // If we disconnect AFTER operations that move the cursor or modify
+        // text, stale deferred callbacks survive in the queue and fire after
+        // attach() has pointed `self.attached_editor` at the NEW editor --
+        // causing on_caret_changed_impl to misread the new editor's state
+        // (e.g. falsely entering Visual mode if the new editor has a Godot
+        // selection).
+        //
+        // By disconnecting first, the signal emission still occurs
+        // internally (Godot doesn't suppress that), but with no connected
+        // callable, nothing is enqueued into the deferred queue.
+        //
+        // gui_input is IMMEDIATE (not deferred) so it has no queue-based
+        // staleness issue. However, disconnecting it early is also safe --
+        // no new keystrokes arrive during a synchronous detach() call --
+        // and keeps all disconnect logic in one cohesive block.
+
+        let gui_callable = self.base().callable("handle_gui_input");
+        safe_disconnect(&mut editor, SIG_GUI_INPUT, &gui_callable);
+
+        let caret_callable = self.base().callable("on_caret_changed");
+        safe_disconnect(&mut editor, SIG_CARET_CHANGED, &caret_callable);
+
+        let text_changed_callable = self.base().callable("on_text_changed");
+        safe_disconnect(&mut editor, SIG_TEXT_CHANGED, &text_changed_callable);
+
+        let scrollbar_callable = self.base().callable("on_scrollbar_changed");
+        if let Some(mut vscroll) = editor.get_v_scroll_bar() {
+            safe_disconnect(&mut vscroll, SIG_VALUE_CHANGED, &scrollbar_callable);
+        }
+        if let Some(mut hscroll) = editor.get_h_scroll_bar() {
+            safe_disconnect(&mut hscroll, SIG_VALUE_CHANGED, &scrollbar_callable);
+        }
+
+        let draw_callable = self.base().callable("on_editor_draw");
+        for signal_name in &[SIG_DRAW, SIG_VISIBILITY_CHANGED, SIG_MINIMUM_SIZE_CHANGED] {
+            safe_disconnect(&mut editor, signal_name, &draw_callable);
+        }
+
+        // ── Teardown operations (signal-safe: no callbacks can enqueue) ─
+
         // Prevent stale pending keys from leaking to the next editor.
         if let Some(timer) = &mut self.mapping_timer {
             timer.stop();
@@ -175,7 +236,7 @@ impl GodotVimCore {
             // Exit non-Normal mode via the engine pipeline. This ensures
             // macro recording captures the Esc, visual marks (</>),
             // LastVisualInfo, insert-stop marks (^), and EndUndo effects
-            // are all produced — identical to the user pressing Esc.
+            // are all produced -- identical to the user pressing Esc.
             controller.exit_mode_via_pipeline(&mut editor);
 
             if !editor.is_instance_valid() {
@@ -194,7 +255,7 @@ impl GodotVimCore {
             controller.drain_remaining_undo_depth(&mut editor);
 
             // Clear parser state (pending operator like `d`) so it doesn't
-            // leak to the next editor. Macro recording is NOT aborted here —
+            // leak to the next editor. Macro recording is NOT aborted here --
             // it is a session-level concept that survives buffer switches.
             controller.engine_reset_parser();
 
@@ -204,31 +265,9 @@ impl GodotVimCore {
 
         self.ui.detach(&mut editor);
 
-        let scrollbar_callable = self.base().callable("on_scrollbar_changed");
-        if let Some(mut vscroll) = editor.get_v_scroll_bar() {
-            safe_disconnect(&mut vscroll, SIG_VALUE_CHANGED, &scrollbar_callable);
-        }
-        if let Some(mut hscroll) = editor.get_h_scroll_bar() {
-            safe_disconnect(&mut hscroll, SIG_VALUE_CHANGED, &scrollbar_callable);
-        }
-
-        let draw_callable = self.base().callable("on_editor_draw");
-        for signal_name in &[SIG_DRAW, SIG_VISIBILITY_CHANGED, SIG_MINIMUM_SIZE_CHANGED] {
-            safe_disconnect(&mut editor, signal_name, &draw_callable);
-        }
-
         if let Some(controller) = &mut self.controller {
             controller.save_buffer_engine_state(editor_id, &editor);
         }
-
-        let gui_callable = self.base().callable("handle_gui_input");
-        safe_disconnect(&mut editor, SIG_GUI_INPUT, &gui_callable);
-
-        let caret_callable = self.base().callable("on_caret_changed");
-        safe_disconnect(&mut editor, SIG_CARET_CHANGED, &caret_callable);
-
-        let text_changed_callable = self.base().callable("on_text_changed");
-        safe_disconnect(&mut editor, SIG_TEXT_CHANGED, &text_changed_callable);
 
         log::debug!("Detached from editor #{}", editor_id.to_i64());
     }
