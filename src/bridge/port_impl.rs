@@ -358,10 +358,11 @@ impl NavigationCapable for CodeEditPort<'_> {
 
         // Tier 2 (Godot ≤4.6): Mouse warp + symbol_hovered signal.
         // Warp the mouse to the symbol's screen position, then emit the signal.
-        // On X11 this positions the tooltip at the symbol. On Wayland, warp_mouse
-        // is a protocol-level no-op, so the tooltip may appear at the physical
-        // mouse position or be suppressed by the is_anything_pressed() guard.
-        // This is a Godot limitation fixed in 4.7 by the p_shortcut bypass.
+        // Whether warp_mouse succeeds depends on the display server and GPU
+        // driver — it may be a no-op on some configurations. When the warp
+        // fails, the tooltip either appears at the physical mouse position or
+        // is suppressed by the is_anything_pressed() guard in make_tooltip.
+        // Godot 4.7 fixes this with the p_shortcut bypass (Tier 1).
         let rect_local = self.0.get_rect_at_line_column(line, col);
 
         if rect_local.position.x == -1 && rect_local.position.y == -1 {
