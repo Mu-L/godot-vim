@@ -223,14 +223,20 @@ fn resolve_ctrl_key(
     }
 
     // Step 6: Physical keycode fallback (Ctrl+[ on non-Latin layouts).
-    if let Some(ch) = physical_to_ascii(physical_keycode, false) {
+    // Pass the actual shift state so Ctrl+Shift+6 → '^' (not '6').
+    // Strip Shift from modifiers when it was used to derive the character,
+    // since it is now encoded in the character itself ('^' vs '6').
+    let has_shift = modifiers.contains(Modifiers::SHIFT);
+    if let Some(ch) = physical_to_ascii(physical_keycode, has_shift) {
         if ch.is_ascii_graphic() {
+            let mods = if has_shift { modifiers & !Modifiers::SHIFT } else { modifiers };
             log::trace!(
-                "resolve_ctrl_key: physical fallback {:?} -> Key::Char({:?})",
+                "resolve_ctrl_key: physical fallback {:?} shift={} -> Key::Char({:?})",
                 physical_keycode,
+                has_shift,
                 ch
             );
-            return Some(KeyEvent::new(Key::Char(ch), modifiers));
+            return Some(KeyEvent::new(Key::Char(ch), mods));
         }
     }
 
@@ -1593,6 +1599,8 @@ mod tests {
 
     #[test]
     fn ctrl_caret_non_latin_physical_fallback() {
+        // Ctrl+6 (without Shift) on non-Latin: produces Ctrl+'6', not Ctrl+'^'.
+        // To get <C-^> (alternate file), the user must press Ctrl+Shift+6.
         let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x0447) };
         let result = translate_key(
             cyrillic_kc,
@@ -1603,7 +1611,39 @@ mod tests {
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('6'), Modifiers::CTRL)),
-            "Ctrl+6 on non-Latin should resolve via physical keycode"
+            "Ctrl+6 (no Shift) on non-Latin should produce Ctrl+'6'"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_6_non_latin_produces_caret() {
+        let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x0447) };
+        let result = translate_key(
+            cyrillic_kc,
+            GodotKey::KEY_6,
+            0x1E,
+            true, false, true, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('^'), Modifiers::CTRL)),
+            "Ctrl+Shift+6 on non-Latin should produce Ctrl+'^' with Shift stripped"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_bracket_non_latin_produces_brace() {
+        let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x0445) };
+        let result = translate_key(
+            cyrillic_kc,
+            GodotKey::BRACKETLEFT,
+            0x1B,
+            true, false, true, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('{'), Modifiers::CTRL)),
+            "Ctrl+Shift+[ on non-Latin should produce Ctrl+'{{' with Shift stripped"
         );
     }
 
