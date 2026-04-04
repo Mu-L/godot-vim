@@ -78,13 +78,12 @@ fn get_named_key(raw: GodotKey) -> Option<Key> {
 
 /// Check if a character is a dead-key artifact that should be filtered.
 ///
-/// Filters two Unicode blocks that appear as garbage on X11 without XIM:
-/// - U+02C0..=U+036F: spacing modifier letters AND combining diacritical marks.
-///   The two sub-ranges (02C0–02FF and 0300–036F) are adjacent, so clippy
-///   correctly collapses them into one span; no assigned characters in this
-///   range are legitimate standalone input in Vim.
+/// Filters the Combining Diacritical Marks block (U+0300..U+036F) which
+/// appears as garbage on X11 without XIM. The adjacent Spacing Modifier
+/// Letters block (U+02C0..U+02FF) is NOT filtered — it contains legitimate
+/// characters used in some languages (e.g., U+02BC ʻokina in Hawaiian).
 fn is_dead_key_char(ch: char) -> bool {
-    matches!(ch as u32, 0x02C0..=0x036F)
+    matches!(ch as u32, 0x0300..=0x036F)
 }
 
 /// Derive the US-QWERTY character from a physical keycode + shift state.
@@ -227,6 +226,12 @@ pub(crate) fn translate_key(
         }
     }
 
+    // Ctrl+Space: map to Ctrl+@ to match terminal Vim's NUL / <C-@> semantics.
+    // In Insert mode, <C-@> inserts last inserted text and exits.
+    if modifiers.contains(Modifiers::CTRL) && keycode == GodotKey::SPACE {
+        return Some(KeyEvent::new(Key::Char('@'), Modifiers::CTRL));
+    }
+
     // Ctrl+Shift+non-letter: when Shift is held with Ctrl and the key is NOT
     // a letter (A-Z), prefer the unicode value if it's a printable non-control
     // character. This captures Ctrl+Shift+2 → '@', Ctrl+Shift+6 → '^', etc.
@@ -279,7 +284,7 @@ pub(crate) fn translate_key(
     // modifier would cause the engine to see <S-A> instead of just 'A'.
     // Keep Shift only when combined with Ctrl/Alt/Meta (e.g. <C-S-f>);
     // named keys (<S-Tab>, <S-Left>) were already handled above.
-    if !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META) {
+    if !is_altgr && !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META) {
         modifiers &= !Modifiers::SHIFT;
     }
 
@@ -846,9 +851,11 @@ mod tests {
     }
 
     #[test]
-    fn spacing_modifier_circumflex_filtered() {
+    fn spacing_modifier_circumflex_not_filtered() {
+        // U+02C6 is in Spacing Modifier Letters block (no longer filtered).
         let result = translate_key(GodotKey::NONE, GodotKey::NONE, 0x02C6, false, false, false, false);
-        assert_eq!(result, None, "modifier circumflex should be filtered");
+        assert!(result.is_some(), "modifier circumflex should NOT be filtered");
+        assert_eq!(result.unwrap().key(), Key::Char('\u{02C6}'));
     }
 
     #[test]
@@ -903,15 +910,14 @@ mod tests {
 
     #[test]
     fn altgr_with_shift_preserves_shift() {
-        // AltGr+Shift+key: should strip Ctrl+Alt but keep Shift encoding
-        // in the unicode character. Shift is stripped later for printable chars.
+        // AltGr+Shift+key: should strip Ctrl+Alt but preserve Shift.
+        // The is_altgr flag prevents Shift from being stripped in the
+        // printable path, so the engine sees <S-@> for mapping purposes.
         let result = translate_key(GodotKey::Q, GodotKey::Q, '@' as u32, true, true, true, false);
-        // '@' is printable → Shift gets stripped in the printable path
-        // because no Ctrl/Alt remains after AltGr detection.
         assert_eq!(
             result,
-            Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)),
-            "AltGr+Shift with printable unicode should strip all"
+            Some(KeyEvent::new(Key::Char('@'), Modifiers::SHIFT)),
+            "AltGr+Shift should preserve Shift modifier"
         );
     }
 
@@ -1182,5 +1188,84 @@ mod tests {
         assert_eq!(event.key(), Key::Char('j'));
         assert_eq!(event.modifiers(), Modifiers::CTRL);
         assert_eq!(event.latin_key(), None);
+    }
+
+    // ── AltGr Shift preservation ───────────────────────────────────────
+
+    #[test]
+    fn altgr_shift_preserves_shift_modifier() {
+        // AltGr+Shift: ctrl=true, alt=true, shift=true, unicode='@'
+        let result = translate_key(
+            GodotKey::KEY_2, GodotKey::KEY_2,
+            '@' as u32,
+            true, true, true, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event.key(), Key::Char('@'));
+        assert!(
+            event.modifiers().contains(Modifiers::SHIFT),
+            "AltGr+Shift should preserve Shift"
+        );
+    }
+
+    #[test]
+    fn non_altgr_shift_still_stripped_for_printable() {
+        // Regular Shift+'a' = 'A', Shift should be stripped
+        let result = translate_key(
+            GodotKey::A, GodotKey::A,
+            'A' as u32,
+            false, false, true, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event.key(), Key::Char('A'));
+        assert!(
+            !event.modifiers().contains(Modifiers::SHIFT),
+            "Regular Shift should be stripped for printable"
+        );
+    }
+
+    // ── Narrowed dead key filter ───────────────────────────────────────
+
+    #[test]
+    fn okina_not_filtered() {
+        // U+02BC (modifier letter apostrophe / ʻokina) should NOT be filtered
+        let result = translate_key(
+            GodotKey::APOSTROPHE, GodotKey::APOSTROPHE,
+            0x02BC, false, false, false, false,
+        );
+        assert!(result.is_some(), "U+02BC should not be filtered");
+        assert_eq!(result.unwrap().key(), Key::Char('\u{02BC}'));
+    }
+
+    #[test]
+    fn combining_grave_still_filtered() {
+        // U+0300 (combining grave accent) should still be filtered
+        let result = translate_key(
+            GodotKey::QUOTELEFT, GodotKey::QUOTELEFT,
+            0x0300, false, false, false, false,
+        );
+        assert!(result.is_none(), "U+0300 should be filtered");
+    }
+
+    #[test]
+    fn combining_end_still_filtered() {
+        // U+036F should still be filtered
+        let result = translate_key(
+            GodotKey::QUOTELEFT, GodotKey::QUOTELEFT,
+            0x036F, false, false, false, false,
+        );
+        assert!(result.is_none(), "U+036F should be filtered");
+    }
+
+    // ── Ctrl+Space → Ctrl+@ ───────────────────────────────────────────
+
+    #[test]
+    fn ctrl_space_maps_to_ctrl_at() {
+        let result = translate_key(
+            GodotKey::SPACE, GodotKey::SPACE,
+            0, true, false, false, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event, KeyEvent::ctrl('@'));
     }
 }
