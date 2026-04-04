@@ -16,6 +16,7 @@ mod discovery;
 mod floating;
 mod input;
 mod lifecycle;
+mod processing_guard;
 mod signals;
 
 use godot::classes::{
