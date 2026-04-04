@@ -22,7 +22,7 @@ fn get_named_key(raw: GodotKey) -> Option<Key> {
         GodotKey::ESCAPE => Some(Key::Escape),
         GodotKey::ENTER | GodotKey::KP_ENTER => Some(Key::Enter),
         GodotKey::BACKSPACE => Some(Key::Backspace),
-        GodotKey::TAB => Some(Key::Tab),
+        GodotKey::TAB | GodotKey::BACKTAB => Some(Key::Tab),
         GodotKey::DELETE => Some(Key::Delete),
         GodotKey::INSERT => Some(Key::Insert),
         GodotKey::UP => Some(Key::Up),
@@ -132,6 +132,11 @@ pub(crate) fn translate_key(
     }
 
     if let Some(key) = get_named_key(keycode) {
+        // BACKTAB implies Shift — force it on even if the platform doesn't
+        // report is_shift_pressed() for this keycode.
+        if keycode == GodotKey::BACKTAB {
+            modifiers |= Modifiers::SHIFT;
+        }
         log::trace!("parse_godot_key: named key {} mods={}", key, modifiers);
         return Some(KeyEvent::new(key, modifiers));
     }
@@ -441,6 +446,38 @@ mod tests {
         // Shift+Tab should keep the Shift modifier (named keys don't strip it).
         let result = translate_key(GodotKey::TAB, 0, false, false, true, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Tab, Modifiers::SHIFT)));
+    }
+
+    #[test]
+    fn backtab_maps_to_shift_tab() {
+        // BACKTAB with shift=true (most platforms report Shift for Shift+Tab)
+        let result = translate_key(GodotKey::BACKTAB, 0, false, false, true, false);
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Tab, Modifiers::SHIFT)),
+            "BACKTAB with shift=true should produce <S-Tab>"
+        );
+    }
+
+    #[test]
+    fn backtab_forces_shift_even_when_not_reported() {
+        // BACKTAB without shift flag (some platforms don't report Shift for BACKTAB)
+        let result = translate_key(GodotKey::BACKTAB, 0, false, false, false, false);
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Tab, Modifiers::SHIFT)),
+            "BACKTAB should force Shift even when is_shift_pressed() is false"
+        );
+    }
+
+    #[test]
+    fn backtab_with_ctrl() {
+        let result = translate_key(GodotKey::BACKTAB, 0, true, false, true, false);
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Tab, Modifiers::CTRL | Modifiers::SHIFT)),
+            "Ctrl+BACKTAB should produce <C-S-Tab>"
+        );
     }
 
     #[test]
