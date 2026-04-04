@@ -32,6 +32,7 @@ impl GodotVimCore {
         if matches!(
             keycode,
             Key::SHIFT | Key::CTRL | Key::ALT | Key::META | Key::CAPSLOCK
+                | Key::NUMLOCK | Key::SCROLLLOCK
         ) {
             return;
         }
