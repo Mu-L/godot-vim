@@ -104,7 +104,16 @@ pub(crate) fn translate_key(
     shift: bool,
     meta: bool,
 ) -> Option<KeyEvent> {
-    // Build modifiers from bool parameters.
+    // AltGr on Windows: Godot reports Ctrl+Alt simultaneously when IME is
+    // inactive (Normal mode). If both Ctrl and Alt are set with no Meta,
+    // and unicode is a printable non-control character, this is AltGr
+    // producing a composed character — strip Ctrl and Alt so it enters the
+    // normal printable path.
+    let is_altgr = ctrl && alt && !meta && unicode != 0
+        && char::from_u32(unicode).is_some_and(|c| c >= ' ' && !c.is_control());
+    let (ctrl, alt) = if is_altgr { (false, false) } else { (ctrl, alt) };
+
+    // Build modifiers from (possibly AltGr-corrected) bool parameters.
     let mut modifiers = Modifiers::NONE;
     if ctrl {
         modifiers |= Modifiers::CTRL;
@@ -830,5 +839,109 @@ mod tests {
     fn no_modifiers_produces_none_flags() {
         let result = translate_key(GodotKey::ENTER, 0, false, false, false, false);
         assert_eq!(result.unwrap().modifiers(), Modifiers::NONE);
+    }
+
+    // ── AltGr detection ────────────────────────────────────────────────
+
+    #[test]
+    fn altgr_with_printable_unicode_strips_ctrl_alt() {
+        // AltGr+Q on German keyboard: Godot reports ctrl=true, alt=true,
+        // unicode='@'. Should strip both Ctrl and Alt so '@' enters normally.
+        let result = translate_key(GodotKey::Q, '@' as u32, true, true, false, false);
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)),
+            "AltGr with printable unicode should strip Ctrl+Alt"
+        );
+    }
+
+    #[test]
+    fn altgr_with_shift_preserves_shift() {
+        // AltGr+Shift+key: should strip Ctrl+Alt but keep Shift encoding
+        // in the unicode character. Shift is stripped later for printable chars.
+        let result = translate_key(GodotKey::Q, '@' as u32, true, true, true, false);
+        // '@' is printable → Shift gets stripped in the printable path
+        // because no Ctrl/Alt remains after AltGr detection.
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)),
+            "AltGr+Shift with printable unicode should strip all"
+        );
+    }
+
+    #[test]
+    fn real_ctrl_alt_with_zero_unicode_preserved() {
+        // Real Ctrl+Alt+Q (not AltGr): unicode=0, ctrl=true, alt=true.
+        // Should NOT trigger AltGr detection.
+        let result = translate_key(GodotKey::Q, 0, true, true, false, false);
+        // Falls through to Ctrl+letter path → Key::Char('q') with CTRL|ALT
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('q'), Modifiers::CTRL | Modifiers::ALT)),
+            "Real Ctrl+Alt with zero unicode should preserve both flags"
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_meta_not_altgr() {
+        // Ctrl+Alt+Meta is never AltGr — Meta disqualifies.
+        let result = translate_key(GodotKey::Q, '@' as u32, true, true, false, true);
+        // Has Meta → not AltGr. Named-key path doesn't match Q.
+        // Ctrl path fires: Ctrl+letter → Key::Char('q') with CTRL|ALT|META
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(
+                Key::Char('q'),
+                Modifiers::CTRL | Modifiers::ALT | Modifiers::META
+            )),
+            "Ctrl+Alt+Meta should not be treated as AltGr"
+        );
+    }
+
+    #[test]
+    fn ctrl_only_with_printable_not_altgr() {
+        // Only Ctrl (no Alt) with printable unicode — not AltGr.
+        let result = translate_key(GodotKey::A, 1, true, false, false, false);
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('a'), Modifiers::CTRL)),
+            "Ctrl-only should not trigger AltGr detection"
+        );
+    }
+
+    #[test]
+    fn alt_only_with_printable_not_altgr() {
+        // Only Alt (no Ctrl) with printable unicode — not AltGr.
+        let result = translate_key(GodotKey::A, 'a' as u32, false, true, false, false);
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('a'), Modifiers::ALT)),
+            "Alt-only should not trigger AltGr detection"
+        );
+    }
+
+    #[test]
+    fn altgr_with_euro_sign() {
+        // AltGr+E on German keyboard → '€' (U+20AC)
+        let result = translate_key(GodotKey::E, 0x20AC, true, true, false, false);
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('€'), Modifiers::NONE)),
+            "AltGr+E producing euro sign should work"
+        );
+    }
+
+    #[test]
+    fn altgr_with_control_char_not_stripped() {
+        // Ctrl+Alt with a control character unicode — not AltGr
+        // (AltGr always produces printable characters).
+        let result = translate_key(GodotKey::A, 1, true, true, false, false);
+        // Unicode 1 is a control char → AltGr check fails.
+        // Falls to Ctrl+letter path.
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('a'), Modifiers::CTRL | Modifiers::ALT)),
+            "Ctrl+Alt with control char should preserve flags"
+        );
     }
 }
