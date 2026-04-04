@@ -76,6 +76,17 @@ fn get_named_key(raw: GodotKey) -> Option<Key> {
     }
 }
 
+/// Check if a character is a dead-key artifact that should be filtered.
+///
+/// Filters two Unicode blocks that appear as garbage on X11 without XIM:
+/// - U+02C0..=U+036F: spacing modifier letters AND combining diacritical marks.
+///   The two sub-ranges (02C0–02FF and 0300–036F) are adjacent, so clippy
+///   correctly collapses them into one span; no assigned characters in this
+///   range are legitimate standalone input in Vim.
+fn is_dead_key_char(ch: char) -> bool {
+    matches!(ch as u32, 0x02C0..=0x036F)
+}
+
 /// Pure translation from raw key parameters to a vim-core [`KeyEvent`].
 ///
 /// Contains all mapping logic without any Godot FFI calls, making it
@@ -151,13 +162,11 @@ pub(crate) fn translate_key(
     // a letter (A-Z), prefer the unicode value if it's a printable non-control
     // character. This captures Ctrl+Shift+2 → '@', Ctrl+Shift+6 → '^', etc.
     // The shifted symbol already encodes Shift, so strip it from modifiers.
-    if modifiers.contains(Modifiers::CTRL | Modifiers::SHIFT) {
-        if unicode != 0 {
-            if let Some(ch) = char::from_u32(unicode) {
-                if !ch.is_control() && !ch.is_ascii_alphabetic() {
-                    let mods = modifiers & !Modifiers::SHIFT;
-                    return Some(KeyEvent::new(Key::Char(ch), mods));
-                }
+    if modifiers.contains(Modifiers::CTRL | Modifiers::SHIFT) && unicode != 0 {
+        if let Some(ch) = char::from_u32(unicode) {
+            if !ch.is_control() && !ch.is_ascii_alphabetic() {
+                let mods = modifiers & !Modifiers::SHIFT;
+                return Some(KeyEvent::new(Key::Char(ch), mods));
             }
         }
     }
@@ -189,6 +198,10 @@ pub(crate) fn translate_key(
     let ch = char::from_u32(unicode)?;
     if ch.is_control() {
         log::trace!("parse_godot_key: control char U+{:04X} filtered", unicode);
+        return None;
+    }
+    if is_dead_key_char(ch) {
+        log::trace!("parse_godot_key: dead key char U+{:04X} filtered", unicode);
         return None;
     }
 
@@ -724,6 +737,46 @@ mod tests {
                 "F{num} should translate correctly"
             );
         }
+    }
+
+    // ── Dead key filtering ──────────────────────────────────────────────
+
+    #[test]
+    fn combining_acute_accent_filtered() {
+        let result = translate_key(GodotKey::NONE, 0x0301, false, false, false, false);
+        assert_eq!(result, None, "combining acute accent should be filtered");
+    }
+
+    #[test]
+    fn combining_diaeresis_filtered() {
+        let result = translate_key(GodotKey::NONE, 0x0308, false, false, false, false);
+        assert_eq!(result, None, "combining diaeresis should be filtered");
+    }
+
+    #[test]
+    fn spacing_modifier_circumflex_filtered() {
+        let result = translate_key(GodotKey::NONE, 0x02C6, false, false, false, false);
+        assert_eq!(result, None, "modifier circumflex should be filtered");
+    }
+
+    #[test]
+    fn normal_e_acute_not_filtered() {
+        let result = translate_key(GodotKey::NONE, 0x00E9, false, false, false, false);
+        assert!(result.is_some(), "composed é should NOT be filtered");
+        assert_eq!(result.unwrap().key(), Key::Char('é'));
+    }
+
+    #[test]
+    fn backtick_not_filtered() {
+        let result = translate_key(GodotKey::QUOTELEFT, 0x60, false, false, false, false);
+        assert!(result.is_some(), "backtick should NOT be filtered");
+        assert_eq!(result.unwrap().key(), Key::Char('`'));
+    }
+
+    #[test]
+    fn tilde_char_not_filtered() {
+        let result = translate_key(GodotKey::ASCIITILDE, 0x7E, false, false, false, false);
+        assert!(result.is_some(), "tilde should NOT be filtered");
     }
 
     // ── Modifier combination building ───────────────────────────────────
