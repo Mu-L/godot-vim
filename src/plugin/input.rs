@@ -46,14 +46,31 @@ impl GodotVimCore {
         let attached_id = self.attached_editor.as_ref().map(|e| e.instance_id());
         let context = classify_focus(&viewport, attached_id);
 
-        // Always consume Ctrl+hjkl (except in Foreign text) to prevent the
-        // key from reaching native handlers, even when no navigation target exists.
+        // Consume Ctrl+hjkl for cross-panel navigation, with mode awareness:
+        // - Foreign: never intercept (user is typing in a non-Vim text input)
+        // - Editor in Insert/Replace/CommandLine/Select: don't intercept —
+        //   Ctrl+H=backspace, Ctrl+J=newline, Ctrl+K=digraph are Vim bindings
+        // - Editor in Normal/Visual/OP: intercept — no Vim Ctrl+hjkl bindings
+        // - Dock/Search/Unknown: always intercept
         let is_ctrl_only = key_event.is_ctrl_pressed()
             && !key_event.is_alt_pressed()
             && !key_event.is_meta_pressed()
             && !key_event.is_shift_pressed();
-        let is_navigable_context = !matches!(context, FocusContext::Foreign);
-        if is_ctrl_only && is_navigable_context {
+        let should_intercept_hjkl = is_ctrl_only && match context {
+            FocusContext::Foreign => false,
+            FocusContext::Editor => {
+                self.controller.as_ref().is_none_or(|c| {
+                    let mode = c.mode();
+                    matches!(mode,
+                        vim_core::primitives::Mode::Normal
+                        | vim_core::primitives::Mode::Visual(_)
+                        | vim_core::primitives::Mode::OperatorPending(_)
+                    )
+                })
+            }
+            FocusContext::Dock(..) | FocusContext::SearchBox(..) | FocusContext::Unknown => true,
+        };
+        if should_intercept_hjkl {
             if let Some(direction) = navigation::window::direction_from_hjkl(keycode) {
                 if let Some(focus_owner) = viewport.gui_get_focus_owner() {
                     let control: Gd<godot::classes::Control> = focus_owner.upcast();
