@@ -72,6 +72,7 @@ fn get_named_key(raw: GodotKey) -> Option<Key> {
         GodotKey::KP_ADD => Some(Key::Char('+')),
         GodotKey::KP_PERIOD => Some(Key::Char('.')),
         GodotKey::KP_DIVIDE => Some(Key::Char('/')),
+        GodotKey::CLEAR => Some(Key::Char('5')),
         _ => None,
     }
 }
@@ -228,9 +229,11 @@ pub(crate) fn translate_key(
     // which is useless. Use the raw keycode instead — Godot's Key enum maps
     // A-Z to ASCII ordinals 65-90, so we can safely convert.
     if modifiers.contains(Modifiers::CTRL) {
-        let key_val = keycode.ord();
         let key_a = GodotKey::A.ord();
         let key_z = GodotKey::Z.ord();
+
+        // Try logical keycode first (works on most platforms).
+        let key_val = keycode.ord();
         if (key_a..=key_z).contains(&key_val) {
             if let Some(ch) = u32::try_from(key_val).ok().and_then(char::from_u32) {
                 return Some(KeyEvent::new(
@@ -244,12 +247,25 @@ pub(crate) fn translate_key(
             );
             return None;
         }
+
+        // Fallback: physical keycode for non-Latin layouts where the
+        // logical keycode may report the native-layout character.
+        let phys_val = physical_keycode.ord();
+        if (key_a..=key_z).contains(&phys_val) {
+            if let Some(ch) = u32::try_from(phys_val).ok().and_then(char::from_u32) {
+                return Some(KeyEvent::new(
+                    Key::Char(ch.to_ascii_lowercase()),
+                    modifiers,
+                ));
+            }
+        }
     }
 
     // Ctrl+Space: map to Ctrl+@ to match terminal Vim's NUL / <C-@> semantics.
     // In Insert mode, <C-@> inserts last inserted text and exits.
     if modifiers.contains(Modifiers::CTRL) && keycode == GodotKey::SPACE {
-        return Some(KeyEvent::new(Key::Char('@'), Modifiers::CTRL));
+        let mods = modifiers & !Modifiers::SHIFT;
+        return Some(KeyEvent::new(Key::Char('@'), mods));
     }
 
     // Ctrl+Shift+non-letter: when Shift is held with Ctrl and the key is NOT
@@ -1382,5 +1398,103 @@ mod tests {
         );
         let event = result.unwrap();
         assert_eq!(event, KeyEvent::ctrl('@'));
+    }
+
+    // ── Ctrl+Space modifier preservation ──────────────────────────────────
+
+    #[test]
+    fn ctrl_alt_space_preserves_alt() {
+        let result = translate_key(
+            GodotKey::SPACE, GodotKey::SPACE,
+            0,
+            true, true, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('@'), Modifiers::CTRL | Modifiers::ALT))
+        );
+    }
+
+    #[test]
+    fn ctrl_meta_space_preserves_meta() {
+        let result = translate_key(
+            GodotKey::SPACE, GodotKey::SPACE,
+            0,
+            true, false, false, true,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('@'), Modifiers::CTRL | Modifiers::META))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_space_strips_shift() {
+        let result = translate_key(
+            GodotKey::SPACE, GodotKey::SPACE,
+            0,
+            true, false, true, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('@'), Modifiers::CTRL))
+        );
+    }
+
+    // ── CLEAR key ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn clear_key_maps_to_five() {
+        let result = translate_key(
+            GodotKey::CLEAR, GodotKey::CLEAR,
+            0,
+            false, false, false, false,
+        );
+        assert_eq!(result, Some(KeyEvent::new(Key::Char('5'), Modifiers::NONE)));
+    }
+
+    // ── Ctrl+letter physical keycode fallback ─────────────────────────────
+
+    #[test]
+    fn ctrl_letter_physical_fallback_when_logical_is_non_latin() {
+        // Simulate Russian layout: logical keycode is outside A-Z range,
+        // but physical keycode is GodotKey::A (the physical key position)
+        let non_latin_keycode = GodotKey::from_ord(0x0444); // Cyrillic ф
+        let result = translate_key(
+            non_latin_keycode, GodotKey::A,
+            0x01, // control code for Ctrl+A
+            true, false, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('a'), Modifiers::CTRL))
+        );
+    }
+
+    #[test]
+    fn ctrl_letter_logical_still_works_when_latin() {
+        let result = translate_key(
+            GodotKey::A, GodotKey::A,
+            0x01,
+            true, false, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('a'), Modifiers::CTRL))
+        );
+    }
+
+    #[test]
+    fn ctrl_letter_physical_fallback_z() {
+        let non_latin_keycode = GodotKey::from_ord(0x044F); // Cyrillic я
+        let result = translate_key(
+            non_latin_keycode, GodotKey::Z,
+            0x1A, // control code for Ctrl+Z
+            true, false, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('z'), Modifiers::CTRL))
+        );
     }
 }
