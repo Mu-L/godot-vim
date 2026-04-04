@@ -167,6 +167,24 @@ pub(crate) fn translate_key(
         && char::from_u32(unicode).is_some_and(|c| c >= ' ' && !c.is_control());
     let (ctrl, alt) = if is_altgr { (false, false) } else { (ctrl, alt) };
 
+    // Linux AltGr: reported as Alt-only (not Ctrl+Alt like Windows).
+    // Detect by comparing unicode against the physical keycode's base character.
+    // If Alt is the only modifier and the unicode differs from the physical key's
+    // unshifted output, the Alt key is acting as a level-3 modifier (AltGr), not
+    // as a genuine Alt press.
+    let is_altgr_linux = !is_altgr && alt && !ctrl && !meta && unicode != 0
+        && char::from_u32(unicode).is_some_and(|c| c >= ' ' && !c.is_control())
+        && {
+            let uc = char::from_u32(unicode).unwrap();
+            let unshifted_match = physical_to_ascii(physical_keycode, false)
+                .is_some_and(|base| base == uc);
+            let shifted_match = physical_to_ascii(physical_keycode, true)
+                .is_some_and(|base| base == uc);
+            !unshifted_match && !shifted_match
+        };
+    let is_altgr = is_altgr || is_altgr_linux;
+    let alt = if is_altgr_linux { false } else { alt };
+
     // Build modifiers from (possibly AltGr-corrected) bool parameters.
     let mut modifiers = Modifiers::NONE;
     if ctrl {
@@ -997,6 +1015,101 @@ mod tests {
             Some(KeyEvent::new(Key::Char('a'), Modifiers::CTRL | Modifiers::ALT)),
             "Ctrl+Alt with control char should preserve flags"
         );
+    }
+
+    // ── Linux AltGr (Alt-only) ────────────────────────────────────────────
+
+    #[test]
+    fn linux_altgr_strips_alt_when_unicode_differs_from_physical() {
+        // German QWERTZ: AltGr+Q → '@', physical Q → 'q'
+        // Linux reports alt=true, ctrl=false
+        let result = translate_key(
+            GodotKey::Q, GodotKey::Q,
+            '@' as u32,
+            false, true, false, false, // alt only
+        );
+        // Alt should be stripped — '@' is the AltGr character, not Alt+@
+        assert_eq!(result, Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)));
+    }
+
+    #[test]
+    fn linux_altgr_preserves_alt_when_unicode_matches_physical() {
+        // Genuine Alt+Q on US keyboard: unicode='q', physical Q → 'q'
+        // The unicode matches the physical base, so this is real Alt, not AltGr
+        let result = translate_key(
+            GodotKey::Q, GodotKey::Q,
+            'q' as u32,
+            false, true, false, false, // alt only
+        );
+        assert_eq!(result, Some(KeyEvent::new(Key::Char('q'), Modifiers::ALT)));
+    }
+
+    #[test]
+    fn linux_altgr_preserves_alt_when_unicode_is_zero() {
+        // Alt+key with no unicode: not AltGr
+        let result = translate_key(
+            GodotKey::Q, GodotKey::Q,
+            0,
+            false, true, false, false,
+        );
+        assert_eq!(result, None); // zero unicode → None
+    }
+
+    #[test]
+    fn linux_altgr_with_shift_preserves_shift() {
+        // AltGr+Shift+key on Linux: produces different char, Shift should be kept
+        let result = translate_key(
+            GodotKey::KEY_7, GodotKey::KEY_7,
+            '{' as u32,
+            false, true, true, false, // alt + shift
+        );
+        // Alt stripped (AltGr detected), Shift preserved by is_altgr guard
+        assert_eq!(result, Some(KeyEvent::new(Key::Char('{'), Modifiers::SHIFT)));
+    }
+
+    #[test]
+    fn linux_altgr_curly_brace() {
+        // German QWERTZ: AltGr+7 → '{', physical 7 → '7'
+        let result = translate_key(
+            GodotKey::KEY_7, GodotKey::KEY_7,
+            '{' as u32,
+            false, true, false, false,
+        );
+        assert_eq!(result, Some(KeyEvent::new(Key::Char('{'), Modifiers::NONE)));
+    }
+
+    #[test]
+    fn linux_altgr_backslash() {
+        // German QWERTZ: AltGr+ß → '\', physical MINUS → '-'
+        let result = translate_key(
+            GodotKey::MINUS, GodotKey::MINUS,
+            '\\' as u32,
+            false, true, false, false,
+        );
+        assert_eq!(result, Some(KeyEvent::new(Key::Char('\\'), Modifiers::NONE)));
+    }
+
+    #[test]
+    fn linux_altgr_not_triggered_without_alt() {
+        // No alt pressed at all — plain character
+        let result = translate_key(
+            GodotKey::Q, GodotKey::Q,
+            'q' as u32,
+            false, false, false, false,
+        );
+        assert_eq!(result, Some(KeyEvent::new(Key::Char('q'), Modifiers::NONE)));
+    }
+
+    #[test]
+    fn linux_altgr_not_triggered_when_ctrl_also_present() {
+        // Ctrl+Alt → Windows AltGr path, not Linux AltGr
+        let result = translate_key(
+            GodotKey::Q, GodotKey::Q,
+            '@' as u32,
+            true, true, false, false, // ctrl+alt
+        );
+        // Windows AltGr detection handles this — both Ctrl and Alt stripped
+        assert_eq!(result, Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)));
     }
 
     // ── Physical keycode to ASCII ──────────────────────────────────────
