@@ -37,10 +37,10 @@ pub(crate) fn try_handle_completion(
     let mode = engine.mode();
     let in_insert = mode.is_insert() || mode.is_replace();
 
-    // Ctrl+Space: force-trigger completion regardless of popup state.
+    // Ctrl+Space → Ctrl+@ after bridge translation: force-trigger completion.
     if in_insert
         && key.modifiers().contains(Modifiers::CTRL)
-        && key.key() == Key::Char(' ')
+        && key.key() == Key::Char('@')
     {
         if !editor.is_code_completion_enabled() {
             return None;

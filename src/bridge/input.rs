@@ -1476,6 +1476,28 @@ mod tests {
         );
     }
 
+    /// Drift guard: the completion trigger in `controller::completion` checks
+    /// for Ctrl+@ (Key::Char('@') with CTRL). This test verifies that the
+    /// bridge's Ctrl+Space translation produces exactly that KeyEvent.
+    /// If someone changes resolve_ctrl_key's Step 1, this test will break
+    /// and signal that completion.rs must be updated to match.
+    #[test]
+    fn ctrl_space_bridge_output_matches_completion_trigger() {
+        let event = translate_key(
+            GodotKey::SPACE, GodotKey::SPACE,
+            0, true, false, false, false,
+        ).unwrap();
+        // This is the exact condition from try_handle_completion.
+        // If this assertion fails, update completion.rs to match.
+        assert!(
+            event.modifiers().contains(Modifiers::CTRL)
+                && event.key() == Key::Char('@'),
+            "Bridge Ctrl+Space output changed! Was {:?} — update completion.rs \
+             try_handle_completion to match the new post-translation form",
+            event,
+        );
+    }
+
     // ── CLEAR key ─────────────────────────────────────────────────────────
 
     #[test]
