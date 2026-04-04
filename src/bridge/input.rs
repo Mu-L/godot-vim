@@ -141,6 +141,102 @@ fn physical_to_ascii(physical: GodotKey, shift: bool) -> Option<char> {
     }
 }
 
+/// Resolve a Ctrl+key combination to a [`KeyEvent`].
+///
+/// Consolidates all Ctrl key resolution into a single function with a clear
+/// 6-step priority chain. The physical keycode fallback (step 6) ensures
+/// that Ctrl+symbol keys (Ctrl+[, Ctrl+], Ctrl+^, Ctrl+\) work correctly
+/// on non-Latin keyboard layouts.
+///
+/// Priority:
+/// 1. Ctrl+Space → '@' (terminal NUL convention)
+/// 2. Logical letter A-Z → lowercase letter
+/// 3. Physical letter A-Z → lowercase letter (non-Latin fallback)
+/// 4. Ctrl+Shift + printable non-alpha unicode → unicode char (Shift stripped)
+/// 5. Logical keycode is ASCII graphic → that character
+/// 6. Physical keycode via `physical_to_ascii` → US-QWERTY character
+fn resolve_ctrl_key(
+    keycode: GodotKey,
+    physical_keycode: GodotKey,
+    unicode: u32,
+    modifiers: Modifiers,
+) -> Option<KeyEvent> {
+    // Step 1: Ctrl+Space → Ctrl+@ (terminal NUL / <C-@>).
+    if keycode == GodotKey::SPACE {
+        let mods = modifiers & !Modifiers::SHIFT;
+        return Some(KeyEvent::new(Key::Char('@'), mods));
+    }
+
+    let key_a = GodotKey::A.ord();
+    let key_z = GodotKey::Z.ord();
+
+    // Step 2: Logical letter A-Z (works on Latin layouts).
+    let key_val = keycode.ord();
+    if (key_a..=key_z).contains(&key_val) {
+        if let Some(ch) = u32::try_from(key_val).ok().and_then(char::from_u32) {
+            return Some(KeyEvent::new(
+                Key::Char(ch.to_ascii_lowercase()),
+                modifiers,
+            ));
+        }
+        log::warn!(
+            "resolve_ctrl_key: Ctrl+letter keycode={} char conversion failed",
+            key_val
+        );
+        return None;
+    }
+
+    // Step 3: Physical letter A-Z (non-Latin layout fallback).
+    let phys_val = physical_keycode.ord();
+    if (key_a..=key_z).contains(&phys_val) {
+        if let Some(ch) = u32::try_from(phys_val).ok().and_then(char::from_u32) {
+            return Some(KeyEvent::new(
+                Key::Char(ch.to_ascii_lowercase()),
+                modifiers,
+            ));
+        }
+    }
+
+    // Step 4: Ctrl+Shift + printable non-alpha unicode (e.g. Ctrl+Shift+2 → '@').
+    if modifiers.contains(Modifiers::SHIFT) && unicode != 0 {
+        if let Some(ch) = char::from_u32(unicode) {
+            if !ch.is_control() && !ch.is_ascii_alphabetic() {
+                let mods = modifiers & !Modifiers::SHIFT;
+                return Some(KeyEvent::new(Key::Char(ch), mods));
+            }
+        }
+    }
+
+    // Step 5: Logical keycode is ASCII graphic (e.g. Ctrl+[ on Latin layouts).
+    if let Some(ch) = u32::try_from(key_val).ok().and_then(char::from_u32) {
+        if ch.is_ascii_graphic() {
+            log::trace!(
+                "resolve_ctrl_key: logical keycode {:?} -> Key::Char({:?})",
+                keycode,
+                ch
+            );
+            return Some(KeyEvent::new(
+                Key::Char(ch.to_ascii_lowercase()),
+                modifiers,
+            ));
+        }
+    }
+
+    // Step 6: Physical keycode fallback (Ctrl+[ on non-Latin layouts).
+    if let Some(ch) = physical_to_ascii(physical_keycode, false) {
+        if ch.is_ascii_graphic() {
+            log::trace!(
+                "resolve_ctrl_key: physical fallback {:?} -> Key::Char({:?})",
+                physical_keycode,
+                ch
+            );
+            return Some(KeyEvent::new(Key::Char(ch), modifiers));
+        }
+    }
+
+    None
+}
+
 /// Pure translation from raw key parameters to a vim-core [`KeyEvent`].
 ///
 /// Contains all mapping logic without any Godot FFI calls, making it
@@ -225,79 +321,10 @@ pub(crate) fn translate_key(
         return Some(KeyEvent::new(key, modifiers));
     }
 
-    // Ctrl+letter: Godot's unicode is a control code (U+0001 for Ctrl+A, etc.)
-    // which is useless. Use the raw keycode instead — Godot's Key enum maps
-    // A-Z to ASCII ordinals 65-90, so we can safely convert.
+    // Ctrl+key resolution: unified function with physical keycode fallback.
     if modifiers.contains(Modifiers::CTRL) {
-        let key_a = GodotKey::A.ord();
-        let key_z = GodotKey::Z.ord();
-
-        // Try logical keycode first (works on most platforms).
-        let key_val = keycode.ord();
-        if (key_a..=key_z).contains(&key_val) {
-            if let Some(ch) = u32::try_from(key_val).ok().and_then(char::from_u32) {
-                return Some(KeyEvent::new(
-                    Key::Char(ch.to_ascii_lowercase()),
-                    modifiers,
-                ));
-            }
-            log::warn!(
-                "parse_godot_key: Ctrl+letter keycode={} char conversion failed",
-                key_val
-            );
-            return None;
-        }
-
-        // Fallback: physical keycode for non-Latin layouts where the
-        // logical keycode may report the native-layout character.
-        let phys_val = physical_keycode.ord();
-        if (key_a..=key_z).contains(&phys_val) {
-            if let Some(ch) = u32::try_from(phys_val).ok().and_then(char::from_u32) {
-                return Some(KeyEvent::new(
-                    Key::Char(ch.to_ascii_lowercase()),
-                    modifiers,
-                ));
-            }
-        }
-    }
-
-    // Ctrl+Space: map to Ctrl+@ to match terminal Vim's NUL / <C-@> semantics.
-    // In Insert mode, <C-@> inserts last inserted text and exits.
-    if modifiers.contains(Modifiers::CTRL) && keycode == GodotKey::SPACE {
-        let mods = modifiers & !Modifiers::SHIFT;
-        return Some(KeyEvent::new(Key::Char('@'), mods));
-    }
-
-    // Ctrl+Shift+non-letter: when Shift is held with Ctrl and the key is NOT
-    // a letter (A-Z), prefer the unicode value if it's a printable non-control
-    // character. This captures Ctrl+Shift+2 → '@', Ctrl+Shift+6 → '^', etc.
-    // The shifted symbol already encodes Shift, so strip it from modifiers.
-    if modifiers.contains(Modifiers::CTRL | Modifiers::SHIFT) && unicode != 0 {
-        if let Some(ch) = char::from_u32(unicode) {
-            if !ch.is_control() && !ch.is_ascii_alphabetic() {
-                let mods = modifiers & !Modifiers::SHIFT;
-                return Some(KeyEvent::new(Key::Char(ch), mods));
-            }
-        }
-    }
-
-    // Ctrl+non-letter (e.g. Ctrl+[, Ctrl+]): Godot's unicode is again a
-    // control code (Ctrl+[ = U+001B = ESC). We need Key::Char('[') + Ctrl
-    // so the engine can match Vim's <C-[>, <C-]>, <C-^> notation.
-    if modifiers.contains(Modifiers::CTRL) {
-        let key_val = keycode.ord();
-        if let Some(ch) = u32::try_from(key_val).ok().and_then(char::from_u32) {
-            if !ch.is_control() {
-                log::trace!(
-                    "parse_godot_key: Ctrl+non-letter {:?} -> Key::Char({:?})",
-                    keycode,
-                    ch
-                );
-                return Some(KeyEvent::new(
-                    Key::Char(ch.to_ascii_lowercase()),
-                    modifiers,
-                ));
-            }
+        if let Some(event) = resolve_ctrl_key(keycode, physical_keycode, unicode, modifiers) {
+            return Some(event);
         }
     }
 
@@ -1495,6 +1522,72 @@ mod tests {
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('z'), Modifiers::CTRL))
+        );
+    }
+
+    // ── Ctrl+symbol on non-Latin layouts ───────────────────────────────────
+
+    #[test]
+    fn ctrl_bracket_left_non_latin_physical_fallback() {
+        // Russian layout: logical keycode is Cyrillic х (U+0445),
+        // physical keycode is BRACKETLEFT. Should resolve to Ctrl+[.
+        let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x0445) };
+        let result = translate_key(
+            cyrillic_kc,
+            GodotKey::BRACKETLEFT,
+            0x1B, // Ctrl+[ produces ESC control code
+            true, false, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('['), Modifiers::CTRL)),
+            "Ctrl+[ on non-Latin should resolve via physical keycode"
+        );
+    }
+
+    #[test]
+    fn ctrl_bracket_right_non_latin_physical_fallback() {
+        let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x044A) };
+        let result = translate_key(
+            cyrillic_kc,
+            GodotKey::BRACKETRIGHT,
+            0x1D,
+            true, false, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char(']'), Modifiers::CTRL)),
+            "Ctrl+] on non-Latin should resolve via physical keycode"
+        );
+    }
+
+    #[test]
+    fn ctrl_caret_non_latin_physical_fallback() {
+        let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x0447) };
+        let result = translate_key(
+            cyrillic_kc,
+            GodotKey::KEY_6,
+            0x1E,
+            true, false, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('6'), Modifiers::CTRL)),
+            "Ctrl+6 on non-Latin should resolve via physical keycode"
+        );
+    }
+
+    #[test]
+    fn ctrl_bracket_left_latin_still_works() {
+        let result = translate_key(
+            GodotKey::BRACKETLEFT,
+            GodotKey::BRACKETLEFT,
+            0x1B,
+            true, false, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('['), Modifiers::CTRL)),
         );
     }
 }
