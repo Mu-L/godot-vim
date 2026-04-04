@@ -370,7 +370,7 @@ pub(crate) fn translate_key(
     // ALL printable ASCII: letters, digits, and symbols.
     let event = KeyEvent::new(Key::Char(ch), modifiers);
     let event = if !ch.is_ascii()
-        && !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META)
+        && !modifiers.contains(Modifiers::CTRL)
     {
         if let Some(latin_ch) = physical_to_ascii(physical_keycode, shift) {
             log::trace!(
@@ -1748,6 +1748,74 @@ mod tests {
             result,
             Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)),
             "Russian AltGr should still detect AltGr"
+        );
+    }
+
+    // ── Alt latin_key for non-Latin layouts ──────────────────────────────
+
+    #[test]
+    fn alt_non_latin_gets_latin_key() {
+        let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x043E) };
+        let result = translate_key(
+            cyrillic_kc,
+            GodotKey::J,
+            0x043E,
+            false, true, false, false, // ctrl=false, alt=true, shift=false, meta=false
+        );
+        let event = result.expect("should produce a KeyEvent");
+        assert_eq!(event.modifiers(), Modifiers::ALT);
+        assert_eq!(event.key(), Key::Char('\u{043E}'));
+        assert_eq!(
+            event.latin_key(),
+            Some(Key::Char('j')),
+            "Alt + non-Latin should carry latin_key for layout normalization"
+        );
+    }
+
+    #[test]
+    fn meta_non_latin_gets_latin_key() {
+        let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x043E) };
+        let result = translate_key(
+            cyrillic_kc,
+            GodotKey::J,
+            0x043E,
+            false, false, false, true, // meta=true
+        );
+        let event = result.expect("should produce a KeyEvent");
+        assert_eq!(event.modifiers(), Modifiers::META);
+        assert_eq!(
+            event.latin_key(),
+            Some(Key::Char('j')),
+            "Meta + non-Latin should carry latin_key"
+        );
+    }
+
+    #[test]
+    fn alt_latin_no_latin_key() {
+        let result = translate_key(
+            GodotKey::J,
+            GodotKey::J,
+            'j' as u32,
+            false, true, false, false,
+        );
+        let event = result.expect("should produce a KeyEvent");
+        assert_eq!(event.latin_key(), None, "Alt + ASCII should not carry latin_key");
+    }
+
+    #[test]
+    fn ctrl_non_latin_no_latin_key() {
+        let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x043E) };
+        let result = translate_key(
+            cyrillic_kc,
+            GodotKey::J,
+            0x0A,
+            true, false, false, false, // ctrl=true
+        );
+        let event = result.expect("should produce a KeyEvent");
+        assert_eq!(
+            event.latin_key(),
+            None,
+            "Ctrl + non-Latin should NOT carry latin_key (uses resolve_ctrl_key)"
         );
     }
 }

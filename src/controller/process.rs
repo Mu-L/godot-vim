@@ -649,8 +649,16 @@ impl ProcessContext<'_> {
     // then host policy (F-keys, Alt/Meta), then the engine's own judgment.
 
     fn should_passthrough_key(&self, key: KeyEvent) -> bool {
+        // Normalize non-Latin keys for mapping lookup so that e.g.
+        // Alt+Cyrillic-о matches a user's <A-j> mapping.
+        let mapping_key = if let Some(latin) = key.latin_key() {
+            KeyEvent::new(latin, key.modifiers())
+        } else {
+            key
+        };
+
         // Mappings always take priority — never passthrough mid-sequence.
-        if self.engine.has_pending_mapping() || self.engine.could_start_mapping(key) {
+        if self.engine.has_pending_mapping() || self.engine.could_start_mapping(mapping_key) {
             return false;
         }
 
