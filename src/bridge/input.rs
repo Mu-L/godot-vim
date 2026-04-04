@@ -189,6 +189,8 @@ pub(crate) fn translate_key(
             | GodotKey::ALT
             | GodotKey::META
             | GodotKey::CAPSLOCK
+            | GodotKey::NUMLOCK
+            | GodotKey::SCROLLLOCK
     ) {
         log::trace!("parse_godot_key: filtered bare modifier {:?}", keycode);
         return None;
