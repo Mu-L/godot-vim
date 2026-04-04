@@ -17,7 +17,7 @@
 //! ```
 
 use compact_str::CompactString;
-use godot::classes::CodeEdit;
+use godot::classes::{CodeEdit, DisplayServer};
 use godot::prelude::*;
 use vim_core::document::Providers;
 use vim_core::execution::MacroOutput;
@@ -188,6 +188,24 @@ impl ProcessContext<'_> {
         let cache_restored = !has_text_mutation && !has_host_requests && !had_compound_actions;
         if cache_restored {
             *self.persistent_text = Some((editor_id, text));
+        }
+
+        // ── IME lifecycle ─────────────────────────────────────────────────
+        //
+        // Activate the OS input method when entering Insert/Replace so CJK
+        // input works; deactivate it when returning to Normal so keystrokes
+        // aren't intercepted by the IME.
+        {
+            let mode_after = self.engine.mode();
+            if mode_after != mode_before {
+                let was_insert_like = mode_before.is_insert() || mode_before.is_replace();
+                let is_insert_like = mode_after.is_insert() || mode_after.is_replace();
+                if !was_insert_like && is_insert_like {
+                    activate_ime(editor);
+                } else if was_insert_like && !is_insert_like {
+                    deactivate_ime(editor);
+                }
+            }
         }
 
         // ── Per-keystroke DEBUG summary ──────────────────────────────────
@@ -652,4 +670,24 @@ impl ProcessContext<'_> {
         self.drain_pending(editor);
         self.ensure_undo_balanced(editor);
     }
+}
+
+/// Activate IME for text input modes (Insert/Replace).
+///
+/// Cancels any in-progress composition first, then enables the OS IME so that
+/// CJK and other complex input methods work while the user is typing.
+fn activate_ime(editor: &mut Gd<CodeEdit>) {
+    editor.cancel_ime();
+    DisplayServer::singleton().window_set_ime_active(true);
+    log::trace!("IME activated for insert mode");
+}
+
+/// Deactivate IME when leaving text input modes.
+///
+/// Cancels any in-progress composition and disables the OS IME so that Normal
+/// mode keystrokes are not intercepted by the input method.
+fn deactivate_ime(editor: &mut Gd<CodeEdit>) {
+    editor.cancel_ime();
+    DisplayServer::singleton().window_set_ime_active(false);
+    log::trace!("IME deactivated (left insert mode)");
 }
