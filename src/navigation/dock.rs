@@ -38,6 +38,31 @@ impl DockInputResult {
     }
 }
 
+/// Direction for hjkl dock navigation.
+enum DockHjkl {
+    Down,
+    Up,
+    Left,
+    Right,
+}
+
+/// Check logical keycode first, fall back to physical for non-Latin layouts.
+fn dock_hjkl(key_event: &Gd<InputEventKey>) -> Option<DockHjkl> {
+    let logical = key_event.get_keycode();
+    let physical = key_event.get_physical_keycode();
+    hjkl_to_dock(logical).or_else(|| hjkl_to_dock(physical))
+}
+
+fn hjkl_to_dock(key: Key) -> Option<DockHjkl> {
+    match key {
+        Key::J => Some(DockHjkl::Down),
+        Key::K => Some(DockHjkl::Up),
+        Key::H => Some(DockHjkl::Left),
+        Key::L => Some(DockHjkl::Right),
+        _ => None,
+    }
+}
+
 pub(crate) fn handle_dock_input(
     focused: Gd<Control>,
     key_event: &Gd<InputEventKey>,
@@ -52,39 +77,47 @@ pub(crate) fn handle_dock_input(
         return DockInputResult::Ignored;
     }
 
+    // hjkl uses logical-then-physical fallback for non-Latin layout support.
+    // Other keys (/, Enter, Esc) use logical keycode only — they are not
+    // affected by keyboard layout (special keys, not letters).
+    if let Some(direction) = dock_hjkl(key_event) {
+        return match direction {
+            DockHjkl::Down => {
+                if handle_navigation(&focused, NavDirection::Next, 0) {
+                    DockInputResult::Handled
+                } else {
+                    DockInputResult::Ignored
+                }
+            }
+            DockHjkl::Up => {
+                if handle_navigation(&focused, NavDirection::Prev, 0) {
+                    DockInputResult::Handled
+                } else {
+                    DockInputResult::Ignored
+                }
+            }
+            DockHjkl::Left => {
+                if matches!(dock_kind, DockKind::Tree)
+                    && handle_hierarchy(&focused, HierarchyAction::Collapse)
+                {
+                    DockInputResult::Handled
+                } else {
+                    DockInputResult::Ignored
+                }
+            }
+            DockHjkl::Right => {
+                if matches!(dock_kind, DockKind::Tree)
+                    && handle_hierarchy(&focused, HierarchyAction::Expand)
+                {
+                    DockInputResult::Handled
+                } else {
+                    DockInputResult::Ignored
+                }
+            }
+        };
+    }
+
     match key_event.get_keycode() {
-        Key::J => {
-            if handle_navigation(&focused, NavDirection::Next, 0) {
-                DockInputResult::Handled
-            } else {
-                DockInputResult::Ignored
-            }
-        }
-        Key::K => {
-            if handle_navigation(&focused, NavDirection::Prev, 0) {
-                DockInputResult::Handled
-            } else {
-                DockInputResult::Ignored
-            }
-        }
-        Key::H => {
-            if matches!(dock_kind, DockKind::Tree)
-                && handle_hierarchy(&focused, HierarchyAction::Collapse)
-            {
-                DockInputResult::Handled
-            } else {
-                DockInputResult::Ignored
-            }
-        }
-        Key::L => {
-            if matches!(dock_kind, DockKind::Tree)
-                && handle_hierarchy(&focused, HierarchyAction::Expand)
-            {
-                DockInputResult::Handled
-            } else {
-                DockInputResult::Ignored
-            }
-        }
         Key::SLASH => handle_slash(&focused),
         Key::ENTER => handle_enter(&focused, dock_kind),
         Key::ESCAPE => handle_escape_from_dock(),
