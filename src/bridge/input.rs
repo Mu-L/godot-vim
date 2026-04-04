@@ -94,7 +94,6 @@ fn is_dead_key_char(ch: char) -> bool {
 ///
 /// The shift table is hardcoded to US-QWERTY because Godot's
 /// `get_physical_keycode()` is defined as the US-QWERTY scan code.
-#[allow(dead_code)] // Will be wired into translate_key in the next task
 fn physical_to_ascii(physical: GodotKey, shift: bool) -> Option<char> {
     let code = physical.ord();
     // Letters: physical A-Z → 'a'-'z' or 'A'-'Z'
@@ -153,6 +152,7 @@ fn physical_to_ascii(physical: GodotKey, shift: bool) -> Option<char> {
 /// - Control characters not produced by Ctrl+letter
 pub(crate) fn translate_key(
     keycode: GodotKey,
+    physical_keycode: GodotKey,
     unicode: u32,
     ctrl: bool,
     alt: bool,
@@ -283,26 +283,14 @@ pub(crate) fn translate_key(
         modifiers &= !Modifiers::SHIFT;
     }
 
-    // When unicode produced a non-ASCII character, check if the physical key
-    // is a Latin letter. If so, provide the Latin equivalent for command
-    // dispatch in non-insert modes (the engine normalizes via latin_key).
-    // Only letters A-Z are remapped — symbols can't be derived from
-    // keycode+shift and vary across Latin layouts.
+    // When unicode produced a non-ASCII character, derive the Latin command
+    // equivalent from the physical keycode's US-QWERTY position. This covers
+    // ALL printable ASCII: letters, digits, and symbols.
     let event = KeyEvent::new(Key::Char(ch), modifiers);
     let event = if !ch.is_ascii()
         && !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META)
     {
-        let key_val = keycode.ord();
-        let key_a = GodotKey::A.ord();
-        let key_z = GodotKey::Z.ord();
-        if (key_a..=key_z).contains(&key_val) {
-            // Use the original `shift` parameter (not `modifiers`, which had
-            // Shift stripped above) to determine upper/lower case.
-            let latin_ch = if shift {
-                (key_val as u8 as char).to_ascii_uppercase()
-            } else {
-                (key_val as u8 as char).to_ascii_lowercase()
-            };
+        if let Some(latin_ch) = physical_to_ascii(physical_keycode, shift) {
             log::trace!(
                 "parse_godot_key: non-Latin '{}' with Latin equivalent '{}'",
                 ch, latin_ch
@@ -331,6 +319,7 @@ pub(crate) fn translate_key(
 pub(crate) fn parse_godot_key(event: &Gd<InputEventKey>) -> Option<KeyEvent> {
     translate_key(
         event.get_keycode(),
+        event.get_physical_keycode(),
         event.get_unicode(),
         event.is_ctrl_pressed(),
         event.is_alt_pressed(),
@@ -347,25 +336,25 @@ mod tests {
 
     #[test]
     fn named_key_escape() {
-        let result = translate_key(GodotKey::ESCAPE, 0, false, false, false, false);
+        let result = translate_key(GodotKey::ESCAPE, GodotKey::ESCAPE, 0, false, false, false, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Escape, Modifiers::NONE)));
     }
 
     #[test]
     fn named_key_enter() {
-        let result = translate_key(GodotKey::ENTER, 0, false, false, false, false);
+        let result = translate_key(GodotKey::ENTER, GodotKey::ENTER, 0, false, false, false, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Enter, Modifiers::NONE)));
     }
 
     #[test]
     fn named_key_kp_enter() {
-        let result = translate_key(GodotKey::KP_ENTER, 0, false, false, false, false);
+        let result = translate_key(GodotKey::KP_ENTER, GodotKey::KP_ENTER, 0, false, false, false, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Enter, Modifiers::NONE)));
     }
 
     #[test]
     fn named_key_backspace() {
-        let result = translate_key(GodotKey::BACKSPACE, 0, false, false, false, false);
+        let result = translate_key(GodotKey::BACKSPACE, GodotKey::BACKSPACE, 0, false, false, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Backspace, Modifiers::NONE))
@@ -374,38 +363,38 @@ mod tests {
 
     #[test]
     fn named_key_tab() {
-        let result = translate_key(GodotKey::TAB, 0, false, false, false, false);
+        let result = translate_key(GodotKey::TAB, GodotKey::TAB, 0, false, false, false, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Tab, Modifiers::NONE)));
     }
 
     #[test]
     fn named_key_delete() {
-        let result = translate_key(GodotKey::DELETE, 0, false, false, false, false);
+        let result = translate_key(GodotKey::DELETE, GodotKey::DELETE, 0, false, false, false, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Delete, Modifiers::NONE)));
     }
 
     #[test]
     fn named_key_insert() {
-        let result = translate_key(GodotKey::INSERT, 0, false, false, false, false);
+        let result = translate_key(GodotKey::INSERT, GodotKey::INSERT, 0, false, false, false, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Insert, Modifiers::NONE)));
     }
 
     #[test]
     fn named_key_arrows() {
         assert_eq!(
-            translate_key(GodotKey::UP, 0, false, false, false, false),
+            translate_key(GodotKey::UP, GodotKey::UP, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Up, Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::DOWN, 0, false, false, false, false),
+            translate_key(GodotKey::DOWN, GodotKey::DOWN, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Down, Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::LEFT, 0, false, false, false, false),
+            translate_key(GodotKey::LEFT, GodotKey::LEFT, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Left, Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::RIGHT, 0, false, false, false, false),
+            translate_key(GodotKey::RIGHT, GodotKey::RIGHT, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Right, Modifiers::NONE))
         );
     }
@@ -413,19 +402,19 @@ mod tests {
     #[test]
     fn named_key_navigation() {
         assert_eq!(
-            translate_key(GodotKey::HOME, 0, false, false, false, false),
+            translate_key(GodotKey::HOME, GodotKey::HOME, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Home, Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::END, 0, false, false, false, false),
+            translate_key(GodotKey::END, GodotKey::END, 0, false, false, false, false),
             Some(KeyEvent::new(Key::End, Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::PAGEUP, 0, false, false, false, false),
+            translate_key(GodotKey::PAGEUP, GodotKey::PAGEUP, 0, false, false, false, false),
             Some(KeyEvent::new(Key::PageUp, Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::PAGEDOWN, 0, false, false, false, false),
+            translate_key(GodotKey::PAGEDOWN, GodotKey::PAGEDOWN, 0, false, false, false, false),
             Some(KeyEvent::new(Key::PageDown, Modifiers::NONE))
         );
     }
@@ -449,7 +438,7 @@ mod tests {
         for (i, gk) in godot_f_keys.iter().enumerate() {
             let n = (i + 1) as u8;
             assert_eq!(
-                translate_key(*gk, 0, false, false, false, false),
+                translate_key(*gk, *gk, 0, false, false, false, false),
                 Some(KeyEvent::new(Key::F(n), Modifiers::NONE)),
                 "F{n} mapping failed"
             );
@@ -472,7 +461,7 @@ mod tests {
         ];
         for (gk, ch) in kp_keys {
             assert_eq!(
-                translate_key(gk, 0, false, false, false, false),
+                translate_key(gk, gk, 0, false, false, false, false),
                 Some(KeyEvent::new(Key::Char(ch), Modifiers::NONE)),
                 "KP_{ch} mapping failed"
             );
@@ -482,23 +471,23 @@ mod tests {
     #[test]
     fn named_key_keypad_operators() {
         assert_eq!(
-            translate_key(GodotKey::KP_MULTIPLY, 0, false, false, false, false),
+            translate_key(GodotKey::KP_MULTIPLY, GodotKey::KP_MULTIPLY, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Char('*'), Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::KP_SUBTRACT, 0, false, false, false, false),
+            translate_key(GodotKey::KP_SUBTRACT, GodotKey::KP_SUBTRACT, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Char('-'), Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::KP_ADD, 0, false, false, false, false),
+            translate_key(GodotKey::KP_ADD, GodotKey::KP_ADD, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Char('+'), Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::KP_PERIOD, 0, false, false, false, false),
+            translate_key(GodotKey::KP_PERIOD, GodotKey::KP_PERIOD, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Char('.'), Modifiers::NONE))
         );
         assert_eq!(
-            translate_key(GodotKey::KP_DIVIDE, 0, false, false, false, false),
+            translate_key(GodotKey::KP_DIVIDE, GodotKey::KP_DIVIDE, 0, false, false, false, false),
             Some(KeyEvent::new(Key::Char('/'), Modifiers::NONE))
         );
     }
@@ -508,14 +497,14 @@ mod tests {
     #[test]
     fn named_key_with_shift_preserves_shift() {
         // Shift+Tab should keep the Shift modifier (named keys don't strip it).
-        let result = translate_key(GodotKey::TAB, 0, false, false, true, false);
+        let result = translate_key(GodotKey::TAB, GodotKey::TAB, 0, false, false, true, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Tab, Modifiers::SHIFT)));
     }
 
     #[test]
     fn backtab_maps_to_shift_tab() {
         // BACKTAB with shift=true (most platforms report Shift for Shift+Tab)
-        let result = translate_key(GodotKey::BACKTAB, 0, false, false, true, false);
+        let result = translate_key(GodotKey::BACKTAB, GodotKey::BACKTAB, 0, false, false, true, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Tab, Modifiers::SHIFT)),
@@ -526,7 +515,7 @@ mod tests {
     #[test]
     fn backtab_forces_shift_even_when_not_reported() {
         // BACKTAB without shift flag (some platforms don't report Shift for BACKTAB)
-        let result = translate_key(GodotKey::BACKTAB, 0, false, false, false, false);
+        let result = translate_key(GodotKey::BACKTAB, GodotKey::BACKTAB, 0, false, false, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Tab, Modifiers::SHIFT)),
@@ -536,7 +525,7 @@ mod tests {
 
     #[test]
     fn backtab_with_ctrl() {
-        let result = translate_key(GodotKey::BACKTAB, 0, true, false, true, false);
+        let result = translate_key(GodotKey::BACKTAB, GodotKey::BACKTAB, 0, true, false, true, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Tab, Modifiers::CTRL | Modifiers::SHIFT)),
@@ -546,7 +535,7 @@ mod tests {
 
     #[test]
     fn named_key_with_ctrl() {
-        let result = translate_key(GodotKey::LEFT, 0, true, false, false, false);
+        let result = translate_key(GodotKey::LEFT, GodotKey::LEFT, 0, true, false, false, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Left, Modifiers::CTRL)));
     }
 
@@ -555,7 +544,7 @@ mod tests {
     #[test]
     fn ctrl_a() {
         // Ctrl+A: keycode = GodotKey::A, unicode = 1 (control code, ignored).
-        let result = translate_key(GodotKey::A, 1, true, false, false, false);
+        let result = translate_key(GodotKey::A, GodotKey::A, 1, true, false, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('a'), Modifiers::CTRL))
@@ -564,7 +553,7 @@ mod tests {
 
     #[test]
     fn ctrl_z() {
-        let result = translate_key(GodotKey::Z, 26, true, false, false, false);
+        let result = translate_key(GodotKey::Z, GodotKey::Z, 26, true, false, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('z'), Modifiers::CTRL))
@@ -574,7 +563,7 @@ mod tests {
     #[test]
     fn ctrl_letter_is_lowercase() {
         // Even though keycode is uppercase 'A', result char should be 'a'.
-        let result = translate_key(GodotKey::A, 1, true, false, false, false);
+        let result = translate_key(GodotKey::A, GodotKey::A, 1, true, false, false, false);
         let key = result.unwrap().key();
         assert_eq!(key, Key::Char('a'));
     }
@@ -582,7 +571,7 @@ mod tests {
     #[test]
     fn ctrl_shift_letter() {
         // Ctrl+Shift+A should produce Key::Char('a') with CTRL|SHIFT.
-        let result = translate_key(GodotKey::A, 1, true, false, true, false);
+        let result = translate_key(GodotKey::A, GodotKey::A, 1, true, false, true, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(
@@ -596,7 +585,7 @@ mod tests {
     fn ctrl_shift_2_produces_ctrl_at() {
         // Ctrl+Shift+2 on US layout: keycode=KEY_2, unicode='@' (0x40),
         // ctrl=true, shift=true. Should produce Key::Char('@') + CTRL.
-        let result = translate_key(GodotKey::KEY_2, 0x40, true, false, true, false);
+        let result = translate_key(GodotKey::KEY_2, GodotKey::KEY_2, 0x40, true, false, true, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('@'), Modifiers::CTRL)),
@@ -608,7 +597,7 @@ mod tests {
     fn ctrl_shift_6_produces_ctrl_caret() {
         // Ctrl+Shift+6 on US layout: keycode=KEY_6, unicode='^' (0x5E),
         // ctrl=true, shift=true. Should produce Key::Char('^') + CTRL.
-        let result = translate_key(GodotKey::KEY_6, 0x5E, true, false, true, false);
+        let result = translate_key(GodotKey::KEY_6, GodotKey::KEY_6, 0x5E, true, false, true, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('^'), Modifiers::CTRL)),
@@ -621,7 +610,7 @@ mod tests {
     #[test]
     fn ctrl_open_bracket() {
         // Ctrl+[: keycode = GodotKey::BRACKETLEFT, unicode = 0x1B (ESC control code).
-        let result = translate_key(GodotKey::BRACKETLEFT, 0x1B, true, false, false, false);
+        let result = translate_key(GodotKey::BRACKETLEFT, GodotKey::BRACKETLEFT, 0x1B, true, false, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('['), Modifiers::CTRL))
@@ -630,7 +619,7 @@ mod tests {
 
     #[test]
     fn ctrl_close_bracket() {
-        let result = translate_key(GodotKey::BRACKETRIGHT, 0x1D, true, false, false, false);
+        let result = translate_key(GodotKey::BRACKETRIGHT, GodotKey::BRACKETRIGHT, 0x1D, true, false, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char(']'), Modifiers::CTRL))
@@ -643,20 +632,20 @@ mod tests {
     fn uppercase_a_strips_shift() {
         // Typing 'A' (Shift+a): unicode='A' (65), shift=true.
         // Shift should be stripped because it's encoded in the character.
-        let result = translate_key(GodotKey::A, 'A' as u32, false, false, true, false);
+        let result = translate_key(GodotKey::A, GodotKey::A, 'A' as u32, false, false, true, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Char('A'), Modifiers::NONE)));
     }
 
     #[test]
     fn at_sign_strips_shift() {
         // '@' = Shift+2 on US layout: unicode='@' (64), shift=true.
-        let result = translate_key(GodotKey::KEY_2, '@' as u32, false, false, true, false);
+        let result = translate_key(GodotKey::KEY_2, GodotKey::KEY_2, '@' as u32, false, false, true, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)));
     }
 
     #[test]
     fn plain_lowercase_no_modifiers() {
-        let result = translate_key(GodotKey::A, 'a' as u32, false, false, false, false);
+        let result = translate_key(GodotKey::A, GodotKey::A, 'a' as u32, false, false, false, false);
         assert_eq!(result, Some(KeyEvent::new(Key::Char('a'), Modifiers::NONE)));
     }
 
@@ -666,7 +655,7 @@ mod tests {
         // This tests the unicode path — use a key that's not A-Z to avoid
         // hitting the Ctrl+letter branch. But actually Ctrl+Shift+A hits
         // the Ctrl+letter branch first. Let's test with alt+shift instead.
-        let result = translate_key(GodotKey::A, 'A' as u32, false, true, true, false);
+        let result = translate_key(GodotKey::A, GodotKey::A, 'A' as u32, false, true, true, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(
@@ -681,7 +670,7 @@ mod tests {
     #[test]
     fn bare_shift_returns_none() {
         assert_eq!(
-            translate_key(GodotKey::SHIFT, 0, false, false, true, false),
+            translate_key(GodotKey::SHIFT, GodotKey::SHIFT, 0, false, false, true, false),
             None
         );
     }
@@ -689,7 +678,7 @@ mod tests {
     #[test]
     fn bare_ctrl_returns_none() {
         assert_eq!(
-            translate_key(GodotKey::CTRL, 0, true, false, false, false),
+            translate_key(GodotKey::CTRL, GodotKey::CTRL, 0, true, false, false, false),
             None
         );
     }
@@ -697,7 +686,7 @@ mod tests {
     #[test]
     fn bare_alt_returns_none() {
         assert_eq!(
-            translate_key(GodotKey::ALT, 0, false, true, false, false),
+            translate_key(GodotKey::ALT, GodotKey::ALT, 0, false, true, false, false),
             None
         );
     }
@@ -705,7 +694,7 @@ mod tests {
     #[test]
     fn bare_meta_returns_none() {
         assert_eq!(
-            translate_key(GodotKey::META, 0, false, false, false, true),
+            translate_key(GodotKey::META, GodotKey::META, 0, false, false, false, true),
             None
         );
     }
@@ -713,7 +702,7 @@ mod tests {
     #[test]
     fn bare_capslock_returns_none() {
         assert_eq!(
-            translate_key(GodotKey::CAPSLOCK, 0, false, false, false, false),
+            translate_key(GodotKey::CAPSLOCK, GodotKey::CAPSLOCK, 0, false, false, false, false),
             None
         );
     }
@@ -725,6 +714,7 @@ mod tests {
         // Russian 'о' (U+043E) on the physical J key
         let result = translate_key(
             GodotKey::J,          // keycode (Latin equivalent)
+            GodotKey::J,          // physical keycode
             0x043E,               // unicode (Cyrillic о)
             false, false, false, false,
         );
@@ -738,6 +728,7 @@ mod tests {
         // Russian 'О' (U+041E) with Shift on the physical J key
         let result = translate_key(
             GodotKey::J,          // keycode
+            GodotKey::J,          // physical keycode
             0x041E,               // unicode (Cyrillic О)
             false, false, true, false,  // shift=true
         );
@@ -749,7 +740,7 @@ mod tests {
     #[test]
     fn ascii_char_no_latin_key() {
         let result = translate_key(
-            GodotKey::J, 0x006A, // 'j'
+            GodotKey::J, GodotKey::J, 0x006A, // 'j'
             false, false, false, false,
         );
         let ke = result.unwrap();
@@ -761,7 +752,7 @@ mod tests {
     fn ctrl_path_no_latin_key() {
         // Ctrl+J goes through the Ctrl path, not the unicode path
         let result = translate_key(
-            GodotKey::J, 0x000A, // Ctrl+J unicode is control code
+            GodotKey::J, GodotKey::J, 0x000A, // Ctrl+J unicode is control code
             true, false, false, false,
         );
         let ke = result.unwrap();
@@ -774,7 +765,7 @@ mod tests {
     fn non_letter_keycode_no_latin_key() {
         // Non-ASCII char but keycode is not in A-Z range (e.g. a symbol key)
         let result = translate_key(
-            GodotKey::KEY_4,    // keycode for '4' key
+            GodotKey::KEY_4, GodotKey::KEY_4, // keycode + physical
             0x003B,             // ';' (ASCII, would not trigger latin_key anyway)
             false, false, false, false,
         );
@@ -786,7 +777,7 @@ mod tests {
     fn named_key_no_latin_key() {
         // Named keys go through get_named_key, not the unicode path
         let result = translate_key(
-            GodotKey::UP, 0,
+            GodotKey::UP, GodotKey::UP, 0,
             false, false, false, false,
         );
         let ke = result.unwrap();
@@ -800,7 +791,7 @@ mod tests {
     fn zero_unicode_unknown_key_returns_none() {
         // An unrecognized key with no unicode representation.
         assert_eq!(
-            translate_key(GodotKey::UNKNOWN, 0, false, false, false, false),
+            translate_key(GodotKey::UNKNOWN, GodotKey::UNKNOWN, 0, false, false, false, false),
             None
         );
     }
@@ -809,7 +800,7 @@ mod tests {
     fn zero_unicode_with_keycode_not_named_returns_none() {
         // A key that isn't in the named table and has zero unicode.
         assert_eq!(
-            translate_key(GodotKey::LAUNCHMAIL, 0, false, false, false, false),
+            translate_key(GodotKey::LAUNCHMAIL, GodotKey::LAUNCHMAIL, 0, false, false, false, false),
             None
         );
     }
@@ -831,7 +822,7 @@ mod tests {
             (GodotKey::F24, 24),
         ];
         for (godot_key, num) in cases {
-            let result = translate_key(godot_key, 0, false, false, false, false);
+            let result = translate_key(godot_key, godot_key, 0, false, false, false, false);
             assert_eq!(
                 result,
                 Some(KeyEvent::new(Key::F(num), Modifiers::NONE)),
@@ -844,39 +835,39 @@ mod tests {
 
     #[test]
     fn combining_acute_accent_filtered() {
-        let result = translate_key(GodotKey::NONE, 0x0301, false, false, false, false);
+        let result = translate_key(GodotKey::NONE, GodotKey::NONE, 0x0301, false, false, false, false);
         assert_eq!(result, None, "combining acute accent should be filtered");
     }
 
     #[test]
     fn combining_diaeresis_filtered() {
-        let result = translate_key(GodotKey::NONE, 0x0308, false, false, false, false);
+        let result = translate_key(GodotKey::NONE, GodotKey::NONE, 0x0308, false, false, false, false);
         assert_eq!(result, None, "combining diaeresis should be filtered");
     }
 
     #[test]
     fn spacing_modifier_circumflex_filtered() {
-        let result = translate_key(GodotKey::NONE, 0x02C6, false, false, false, false);
+        let result = translate_key(GodotKey::NONE, GodotKey::NONE, 0x02C6, false, false, false, false);
         assert_eq!(result, None, "modifier circumflex should be filtered");
     }
 
     #[test]
     fn normal_e_acute_not_filtered() {
-        let result = translate_key(GodotKey::NONE, 0x00E9, false, false, false, false);
+        let result = translate_key(GodotKey::NONE, GodotKey::NONE, 0x00E9, false, false, false, false);
         assert!(result.is_some(), "composed é should NOT be filtered");
         assert_eq!(result.unwrap().key(), Key::Char('é'));
     }
 
     #[test]
     fn backtick_not_filtered() {
-        let result = translate_key(GodotKey::QUOTELEFT, 0x60, false, false, false, false);
+        let result = translate_key(GodotKey::QUOTELEFT, GodotKey::QUOTELEFT, 0x60, false, false, false, false);
         assert!(result.is_some(), "backtick should NOT be filtered");
         assert_eq!(result.unwrap().key(), Key::Char('`'));
     }
 
     #[test]
     fn tilde_char_not_filtered() {
-        let result = translate_key(GodotKey::ASCIITILDE, 0x7E, false, false, false, false);
+        let result = translate_key(GodotKey::ASCIITILDE, GodotKey::ASCIITILDE, 0x7E, false, false, false, false);
         assert!(result.is_some(), "tilde should NOT be filtered");
     }
 
@@ -885,14 +876,14 @@ mod tests {
     #[test]
     fn all_modifiers_combined() {
         // Ctrl+Alt+Shift+Meta with a named key should produce all four flags.
-        let result = translate_key(GodotKey::UP, 0, true, true, true, true);
+        let result = translate_key(GodotKey::UP, GodotKey::UP, 0, true, true, true, true);
         let expected_mods = Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT | Modifiers::META;
         assert_eq!(result, Some(KeyEvent::new(Key::Up, expected_mods)));
     }
 
     #[test]
     fn no_modifiers_produces_none_flags() {
-        let result = translate_key(GodotKey::ENTER, 0, false, false, false, false);
+        let result = translate_key(GodotKey::ENTER, GodotKey::ENTER, 0, false, false, false, false);
         assert_eq!(result.unwrap().modifiers(), Modifiers::NONE);
     }
 
@@ -902,7 +893,7 @@ mod tests {
     fn altgr_with_printable_unicode_strips_ctrl_alt() {
         // AltGr+Q on German keyboard: Godot reports ctrl=true, alt=true,
         // unicode='@'. Should strip both Ctrl and Alt so '@' enters normally.
-        let result = translate_key(GodotKey::Q, '@' as u32, true, true, false, false);
+        let result = translate_key(GodotKey::Q, GodotKey::Q, '@' as u32, true, true, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)),
@@ -914,7 +905,7 @@ mod tests {
     fn altgr_with_shift_preserves_shift() {
         // AltGr+Shift+key: should strip Ctrl+Alt but keep Shift encoding
         // in the unicode character. Shift is stripped later for printable chars.
-        let result = translate_key(GodotKey::Q, '@' as u32, true, true, true, false);
+        let result = translate_key(GodotKey::Q, GodotKey::Q, '@' as u32, true, true, true, false);
         // '@' is printable → Shift gets stripped in the printable path
         // because no Ctrl/Alt remains after AltGr detection.
         assert_eq!(
@@ -928,7 +919,7 @@ mod tests {
     fn real_ctrl_alt_with_zero_unicode_preserved() {
         // Real Ctrl+Alt+Q (not AltGr): unicode=0, ctrl=true, alt=true.
         // Should NOT trigger AltGr detection.
-        let result = translate_key(GodotKey::Q, 0, true, true, false, false);
+        let result = translate_key(GodotKey::Q, GodotKey::Q, 0, true, true, false, false);
         // Falls through to Ctrl+letter path → Key::Char('q') with CTRL|ALT
         assert_eq!(
             result,
@@ -940,7 +931,7 @@ mod tests {
     #[test]
     fn ctrl_alt_meta_not_altgr() {
         // Ctrl+Alt+Meta is never AltGr — Meta disqualifies.
-        let result = translate_key(GodotKey::Q, '@' as u32, true, true, false, true);
+        let result = translate_key(GodotKey::Q, GodotKey::Q, '@' as u32, true, true, false, true);
         // Has Meta → not AltGr. Named-key path doesn't match Q.
         // Ctrl path fires: Ctrl+letter → Key::Char('q') with CTRL|ALT|META
         assert_eq!(
@@ -956,7 +947,7 @@ mod tests {
     #[test]
     fn ctrl_only_with_printable_not_altgr() {
         // Only Ctrl (no Alt) with printable unicode — not AltGr.
-        let result = translate_key(GodotKey::A, 1, true, false, false, false);
+        let result = translate_key(GodotKey::A, GodotKey::A, 1, true, false, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('a'), Modifiers::CTRL)),
@@ -967,7 +958,7 @@ mod tests {
     #[test]
     fn alt_only_with_printable_not_altgr() {
         // Only Alt (no Ctrl) with printable unicode — not AltGr.
-        let result = translate_key(GodotKey::A, 'a' as u32, false, true, false, false);
+        let result = translate_key(GodotKey::A, GodotKey::A, 'a' as u32, false, true, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('a'), Modifiers::ALT)),
@@ -978,7 +969,7 @@ mod tests {
     #[test]
     fn altgr_with_euro_sign() {
         // AltGr+E on German keyboard → '€' (U+20AC)
-        let result = translate_key(GodotKey::E, 0x20AC, true, true, false, false);
+        let result = translate_key(GodotKey::E, GodotKey::E, 0x20AC, true, true, false, false);
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('€'), Modifiers::NONE)),
@@ -990,7 +981,7 @@ mod tests {
     fn altgr_with_control_char_not_stripped() {
         // Ctrl+Alt with a control character unicode — not AltGr
         // (AltGr always produces printable characters).
-        let result = translate_key(GodotKey::A, 1, true, true, false, false);
+        let result = translate_key(GodotKey::A, GodotKey::A, 1, true, true, false, false);
         // Unicode 1 is a control char → AltGr check fails.
         // Falls to Ctrl+letter path.
         assert_eq!(
@@ -1105,5 +1096,91 @@ mod tests {
         assert_eq!(physical_to_ascii(GodotKey::CTRL, false), None);
         assert_eq!(physical_to_ascii(GodotKey::TAB, false), None);
         assert_eq!(physical_to_ascii(GodotKey::ENTER, false), None);
+    }
+
+    // ── Physical keycode latin_key for symbols ─────────────────────────
+
+    #[test]
+    fn non_latin_period_gets_latin_key_from_physical() {
+        // Russian layout: physical '.' key produces 'ю' (U+044E)
+        let result = translate_key(
+            GodotKey::PERIOD, GodotKey::PERIOD,
+            0x044E, false, false, false, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event.key(), Key::Char('ю'));
+        assert_eq!(event.latin_key(), Some(Key::Char('.')));
+    }
+
+    #[test]
+    fn non_latin_semicolon_gets_latin_key_from_physical() {
+        // Russian layout: physical ';' key produces 'ж' (U+0436)
+        let result = translate_key(
+            GodotKey::SEMICOLON, GodotKey::SEMICOLON,
+            0x0436, false, false, false, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event.key(), Key::Char('ж'));
+        assert_eq!(event.latin_key(), Some(Key::Char(';')));
+    }
+
+    #[test]
+    fn non_latin_shifted_gets_shifted_latin_key() {
+        // Russian: Shift+physical ';' → 'Ж', shifted US-QWERTY = ':'
+        let result = translate_key(
+            GodotKey::SEMICOLON, GodotKey::SEMICOLON,
+            0x0416, false, false, true, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event.key(), Key::Char('Ж'));
+        assert_eq!(event.latin_key(), Some(Key::Char(':')));
+    }
+
+    #[test]
+    fn non_latin_slash_gets_latin_key() {
+        // Greek layout: physical '/' produces 'ς' (U+03C2)
+        let result = translate_key(
+            GodotKey::SLASH, GodotKey::SLASH,
+            0x03C2, false, false, false, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event.key(), Key::Char('ς'));
+        assert_eq!(event.latin_key(), Some(Key::Char('/')));
+    }
+
+    #[test]
+    fn ascii_unicode_does_not_get_latin_key() {
+        // English layout: '.' produces '.' — already ASCII
+        let result = translate_key(
+            GodotKey::PERIOD, GodotKey::PERIOD,
+            0x002E, false, false, false, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event.key(), Key::Char('.'));
+        assert_eq!(event.latin_key(), None);
+    }
+
+    #[test]
+    fn non_latin_letter_still_gets_latin_key() {
+        // Russian: physical 'j' → 'о' (U+043E)
+        let result = translate_key(
+            GodotKey::J, GodotKey::J,
+            0x043E, false, false, false, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event.key(), Key::Char('о'));
+        assert_eq!(event.latin_key(), Some(Key::Char('j')));
+    }
+
+    #[test]
+    fn ctrl_path_unaffected_by_physical_keycode() {
+        let result = translate_key(
+            GodotKey::J, GodotKey::J,
+            0x000A, true, false, false, false,
+        );
+        let event = result.unwrap();
+        assert_eq!(event.key(), Key::Char('j'));
+        assert_eq!(event.modifiers(), Modifiers::CTRL);
+        assert_eq!(event.latin_key(), None);
     }
 }
