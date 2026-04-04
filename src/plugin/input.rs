@@ -99,6 +99,24 @@ impl GodotVimCore {
         if !key_event.is_pressed() { return; }
         let Some(key) = bridge::input::parse_godot_key(&key_event) else { return; };
 
+        // IME compose guard: when TextEdit is actively composing (CJK input,
+        // dead keys, alt-code unicode), don't consume the key — let it flow
+        // through to TextEdit's native IME handling. Only guard in Insert/Replace
+        // modes where text input is expected.
+        if editor.has_ime_text() {
+            if let Some(controller) = &self.controller {
+                let mode = controller.mode();
+                if matches!(mode,
+                    vim_core::primitives::Mode::Insert
+                    | vim_core::primitives::Mode::Replace
+                    | vim_core::primitives::Mode::VirtualReplace
+                ) {
+                    log::trace!("gui_input: IME compose active in {:?}, passing through key={}", mode, key);
+                    return;
+                }
+            }
+        }
+
         // Cancel any pending tooltip — a new keystroke supersedes the hover.
         // Done before cloning `editor` to avoid borrow conflicts with `&mut self`.
         self.cancel_pending_tooltip();
