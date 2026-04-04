@@ -277,7 +277,15 @@ pub(crate) fn translate_key(
                 .is_some_and(|base| base == uc);
             let shifted_match = physical_to_ascii(physical_keycode, true)
                 .is_some_and(|base| base == uc);
-            !unshifted_match && !shifted_match
+            // Logical keycode cross-check: if the unicode matches the logical
+            // keycode's character (case-insensitive), this is a genuine Alt
+            // press, not AltGr. Fixes false positives on QWERTZ (Y↔Z) and
+            // AZERTY (A↔Q, W↔Z) where the physical position differs from the
+            // logical key.
+            let logical_match = u32::try_from(keycode.ord()).ok()
+                .and_then(char::from_u32)
+                .is_some_and(|lc| lc.eq_ignore_ascii_case(&uc));
+            !unshifted_match && !shifted_match && !logical_match
         };
     let is_altgr = is_altgr || is_altgr_linux;
     let alt = if is_altgr_linux { false } else { alt };
@@ -1588,6 +1596,96 @@ mod tests {
         assert_eq!(
             result,
             Some(KeyEvent::new(Key::Char('['), Modifiers::CTRL)),
+        );
+    }
+
+    // ── Linux AltGr: QWERTZ/AZERTY false positive fixes ───────────────────
+
+    #[test]
+    fn linux_altgr_qwertz_alt_z_preserves_alt() {
+        // QWERTZ: Alt+Z. Physical=Y (swapped), Logical=Z, Unicode='z'.
+        // Should NOT trigger AltGr — this is a genuine Alt press.
+        let result = translate_key(
+            GodotKey::Z,    // logical keycode (layout says Z)
+            GodotKey::Y,    // physical keycode (Y position on QWERTZ)
+            'z' as u32,     // unicode matches logical key
+            false,          // ctrl
+            true,           // alt
+            false,          // shift
+            false,          // meta
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('z'), Modifiers::ALT)),
+            "QWERTZ Alt+Z should preserve Alt (not false-positive AltGr)"
+        );
+    }
+
+    #[test]
+    fn linux_altgr_qwertz_alt_y_preserves_alt() {
+        // QWERTZ: Alt+Y. Physical=Z (swapped), Logical=Y, Unicode='y'.
+        let result = translate_key(
+            GodotKey::Y,    // logical keycode
+            GodotKey::Z,    // physical keycode (Z position on QWERTZ)
+            'y' as u32,     // unicode matches logical key
+            false, true, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('y'), Modifiers::ALT)),
+            "QWERTZ Alt+Y should preserve Alt (not false-positive AltGr)"
+        );
+    }
+
+    #[test]
+    fn linux_altgr_azerty_alt_q_preserves_alt() {
+        // AZERTY: Alt+Q. Physical=A (swapped), Logical=Q, Unicode='q'.
+        let result = translate_key(
+            GodotKey::Q,    // logical keycode
+            GodotKey::A,    // physical keycode (A position on AZERTY)
+            'q' as u32,     // unicode matches logical key
+            false, true, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('q'), Modifiers::ALT)),
+            "AZERTY Alt+Q should preserve Alt (not false-positive AltGr)"
+        );
+    }
+
+    #[test]
+    fn linux_altgr_german_still_detected() {
+        // German AltGr+Q → '@'. Physical=Q, Logical=Q, Unicode='@'.
+        // Unicode doesn't match logical OR physical — AltGr should trigger.
+        let result = translate_key(
+            GodotKey::Q,
+            GodotKey::Q,
+            '@' as u32,
+            false, true, false, false,
+        );
+        // AltGr strips Alt, so we get plain '@'
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)),
+            "German AltGr+Q should still detect AltGr and produce plain '@'"
+        );
+    }
+
+    #[test]
+    fn linux_altgr_russian_still_detected() {
+        // Russian AltGr: Physical=Q, Logical=Cyrillic, Unicode='@'.
+        // Neither physical 'q' nor Cyrillic matches '@' — AltGr triggers.
+        let cyrillic_kc = unsafe { std::mem::transmute::<i32, GodotKey>(0x0439) };
+        let result = translate_key(
+            cyrillic_kc,
+            GodotKey::Q,
+            '@' as u32,
+            false, true, false, false,
+        );
+        assert_eq!(
+            result,
+            Some(KeyEvent::new(Key::Char('@'), Modifiers::NONE)),
+            "Russian AltGr should still detect AltGr"
         );
     }
 }
