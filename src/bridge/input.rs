@@ -45,6 +45,18 @@ fn get_named_key(raw: GodotKey) -> Option<Key> {
         GodotKey::F10 => Some(Key::F(10)),
         GodotKey::F11 => Some(Key::F(11)),
         GodotKey::F12 => Some(Key::F(12)),
+        GodotKey::F13 => Some(Key::F(13)),
+        GodotKey::F14 => Some(Key::F(14)),
+        GodotKey::F15 => Some(Key::F(15)),
+        GodotKey::F16 => Some(Key::F(16)),
+        GodotKey::F17 => Some(Key::F(17)),
+        GodotKey::F18 => Some(Key::F(18)),
+        GodotKey::F19 => Some(Key::F(19)),
+        GodotKey::F20 => Some(Key::F(20)),
+        GodotKey::F21 => Some(Key::F(21)),
+        GodotKey::F22 => Some(Key::F(22)),
+        GodotKey::F23 => Some(Key::F(23)),
+        GodotKey::F24 => Some(Key::F(24)),
         GodotKey::KP_0 => Some(Key::Char('0')),
         GodotKey::KP_1 => Some(Key::Char('1')),
         GodotKey::KP_2 => Some(Key::Char('2')),
@@ -686,6 +698,32 @@ mod tests {
             translate_key(GodotKey::LAUNCHMAIL, 0, false, false, false, false),
             None
         );
+    }
+
+    #[test]
+    fn f13_through_f24_translated() {
+        let cases = [
+            (GodotKey::F13, 13),
+            (GodotKey::F14, 14),
+            (GodotKey::F15, 15),
+            (GodotKey::F16, 16),
+            (GodotKey::F17, 17),
+            (GodotKey::F18, 18),
+            (GodotKey::F19, 19),
+            (GodotKey::F20, 20),
+            (GodotKey::F21, 21),
+            (GodotKey::F22, 22),
+            (GodotKey::F23, 23),
+            (GodotKey::F24, 24),
+        ];
+        for (godot_key, num) in cases {
+            let result = translate_key(godot_key, 0, false, false, false, false);
+            assert_eq!(
+                result,
+                Some(KeyEvent::new(Key::F(num), Modifiers::NONE)),
+                "F{num} should translate correctly"
+            );
+        }
     }
 
     // ── Modifier combination building ───────────────────────────────────
