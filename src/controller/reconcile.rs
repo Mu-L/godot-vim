@@ -43,11 +43,12 @@ fn diff_texts<'a>(
         .min(cursor_byte);
     let common_prefix = snap_to_char_boundary_down(before_text, raw_prefix);
 
-    // Common suffix (bytes after the edit region). Clamped so that
-    // prefix + suffix never exceeds the shorter text — otherwise
-    // overlap produces inverted ranges.
-    let max_suffix = before_text.len().saturating_sub(cursor_byte)
-        .min(after_text.len().saturating_sub(common_prefix));
+    // Common suffix (bytes after the edit region). cursor_byte is a
+    // position in after_text, so bound suffix length by the bytes AFTER
+    // the cursor in after_text. The second term prevents overlap with
+    // the prefix in before_text.
+    let max_suffix = after_text.len().saturating_sub(cursor_byte)
+        .min(before_text.len().saturating_sub(common_prefix));
     let raw_suffix = before_text
         .bytes()
         .rev()
@@ -173,8 +174,9 @@ mod tests {
 
     #[test]
     fn diff_simple_insertion() {
-        // cursor at 5 (right after "hello"), so suffix can include "\n"
-        let diff = diff_texts("hello\n", "hello world\n", 5).unwrap();
+        // cursor_byte=11: after "hello world" in "hello world\n" (12 bytes).
+        // Suffix correctly absorbs the trailing "\n" even though cursor > before.len().
+        let diff = diff_texts("hello\n", "hello world\n", 11).unwrap();
         assert_eq!(diff.deleted_range, (5, 5));
         assert_eq!(diff.deleted_text, "");
         assert_eq!(diff.inserted_text, " world");
@@ -190,8 +192,9 @@ mod tests {
 
     #[test]
     fn diff_cjk_insertion() {
-        // cursor at 2 (right after "ab"), so suffix can include "c\n"
-        let diff = diff_texts("abc\n", "ab你好c\n", 2).unwrap();
+        // cursor_byte=8: after "ab你好" (2 ASCII + 6 UTF-8 bytes) in "ab你好c\n".
+        // Suffix correctly absorbs "c\n" even though cursor > before.len().
+        let diff = diff_texts("abc\n", "ab你好c\n", 8).unwrap();
         assert_eq!(diff.deleted_range, (2, 2));
         assert_eq!(diff.deleted_text, "");
         assert_eq!(diff.inserted_text, "你好");
@@ -234,6 +237,33 @@ mod tests {
         assert_eq!(diff.deleted_range, (0, 1));
         assert_eq!(diff.deleted_text, "a");
         assert_eq!(diff.inserted_text, "x");
+    }
+
+    // ── Regression: completion dot-repeat (cursor past before.len()) ────
+
+    #[test]
+    fn diff_completion_prefix_replacement() {
+        // Simulates: user types "p" on a new line, autocomplete replaces
+        // with "physics_interpolation_mode". cursor_byte is at the end of
+        // the completed word (past before_text.len()).
+        //
+        // Before: "func f():\n    p\n    print(\"Test\")\n"
+        // After:  "func f():\n    physics_interpolation_mode\n    print(\"Test\")\n"
+        let before = "func f():\n    p\n    print(\"Test\")\n";
+        let after  = "func f():\n    physics_interpolation_mode\n    print(\"Test\")\n";
+        let cursor_byte = "func f():\n    physics_interpolation_mode".len(); // 40
+
+        let diff = diff_texts(before, after, cursor_byte).unwrap();
+
+        // The prefix "p" is shared, so the diff is a pure insertion after "p".
+        // Critically, the suffix "\n    print(\"Test\")\n" must be absorbed —
+        // otherwise dot-repeat records the wrong text.
+        assert_eq!(diff.deleted_range, (15, 15), "nothing deleted (pure insertion)");
+        assert_eq!(diff.deleted_text, "");
+        assert_eq!(
+            diff.inserted_text, "hysics_interpolation_mode",
+            "only the suffix beyond the shared 'p' prefix"
+        );
     }
 
     // ── snap edge cases ─────────────────────────────────────────────────
