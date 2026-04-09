@@ -24,9 +24,17 @@
 
 ### Godot Asset Library (Recommended)
 1. Open your Godot project → **AssetLib** tab
-2. Search **"[GodotVim](https://godotengine.org/asset-library/asset/4666)"** → **Download** → **Install**
-3. **Project → Project Settings**  → **Plugins** → Enable **GodotVim**
-4. **Restart the Editor** (required for full initialization)
+2. Search **"[GodotVim](https://godotengine.org/asset-library/asset/4666)"** → **Download**
+3. In the install dialog, make sure **"Ignore asset root"** is **checked**, then click **Install**
+4. **Project → Project Settings** → **Plugins** → Enable **GodotVim**
+5. **Restart the Editor** (required for full initialization)
+
+### Manual (from Releases page)
+1. Download `godot-vim-vX.Y.Z.zip` from the [Releases page](https://github.com/hmdfrds/godot-vim/releases/latest)
+2. Extract the archive — you'll get a `godot-vim-vX.Y.Z/` folder containing `addons/`, `LICENSE`, and `README.md`
+3. Copy the **`addons/godot_vim/`** folder (from inside the extracted folder) into your Godot project's root, so the final path is `<your-project>/addons/godot_vim/`
+4. **Project → Project Settings** → **Plugins** → Enable **GodotVim**
+5. **Restart the Editor** (required for full initialization)
 
 ### Upgrading from v0.x
 
@@ -115,6 +123,7 @@ Record with `qa`, replay with `@a`. Named registers `"a`-`"z`, system clipboard 
 | Problem | Solution |
 |---------|----------|
 | Plugin not appearing | Ensure `addons/godot_vim/` contains `plugin.cfg`, `.gdextension`, and the compiled library. Enable in Project Settings > Plugins. |
+| `addons/` folder missing after Asset Library install | "Ignore asset root" was unchecked. Re-install from AssetLib with the box **checked**, or manually copy `addons/godot_vim/` from the release zip. |
 | Key not working | Check `passthrough_keys` setting — the key may be bypassing Vim. Check `:mappings` for conflicts. |
 | `.godot-vimrc` not loading | Verify the file is at `res://.godot-vimrc` or `user://.godot-vimrc`. Run `:source` to force reload. |
 | Clipboard not working | Enable `editor/clipboard_enabled` in EditorSettings, or use `"+y` / `"+p`. |
