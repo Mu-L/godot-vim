@@ -155,7 +155,7 @@ jobs:
 
       - name: Generate SBOM
         run: |
-          cargo install cargo-cyclonedx
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
           cargo cyclonedx --format json --output-file vim-core-sbom.cdx.json
 
       - name: Generate release body
