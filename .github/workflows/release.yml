@@ -159,7 +159,7 @@ jobs:
       - name: Generate SBOM
         run: |
           cargo install cargo-cyclonedx --version 0.5.9 --locked
-          cargo cyclonedx --format json --output-file vim-core-sbom.cdx.json
+          cargo cyclonedx --format json --output-file godot-vim-sbom.cdx.json
 
       - name: Generate release body
         id: body
@@ -311,4 +311,4 @@ jobs:
             artifacts/libgodot_vim.so/libgodot_vim.so.sha256
             artifacts/godot_vim.dll/godot_vim.dll.sha256
             artifacts/libgodot_vim.dylib/libgodot_vim.dylib.sha256
-            vim-core-sbom.cdx.json
+            godot-vim-sbom.cdx.json
