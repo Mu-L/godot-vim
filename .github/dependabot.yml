@@ -1,8 +1,11 @@
-# Automated GitHub Actions version updates.
-# Creates PRs when pinned actions release new versions.
+# Automated dependency updates.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"

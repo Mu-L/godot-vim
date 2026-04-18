@@ -31,7 +31,7 @@ jobs:
       - run: cargo build --release --locked --target x86_64-unknown-linux-gnu
 
       - name: Generate checksum
-        run: sha256sum target/x86_64-unknown-linux-gnu/release/libgodot_vim.so > libgodot_vim.so.sha256
+        run: sha256sum target/x86_64-unknown-linux-gnu/release/libgodot_vim.so | awk '{print $1 "  libgodot_vim.so"}' > libgodot_vim.so.sha256
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
