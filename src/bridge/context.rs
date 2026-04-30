@@ -20,6 +20,7 @@ use super::document::GodotDocument;
 /// Fold state lives entirely in Godot's scene tree, so this provider must
 /// make FFI calls on every query. The queries are cheap (O(1) per line in
 /// Godot's internal data structure), so no caching is needed.
+#[allow(dead_code)] // Borrowing version; OwnedGodotFoldProvider is the active variant.
 pub(crate) struct GodotFoldProvider<'a> {
     editor: &'a Gd<CodeEdit>,
 }
@@ -59,6 +60,7 @@ impl FoldProvider for GodotFoldProvider<'_> {
     }
 }
 
+#[allow(dead_code)]
 impl<'a> GodotFoldProvider<'a> {
     #[must_use]
     pub(crate) fn new(editor: &'a Gd<CodeEdit>) -> Self {
@@ -117,6 +119,7 @@ impl FoldProvider for OwnedGodotFoldProvider {
 /// ends with a block-opening character (`:`, `{`, `(`, `[`), the new line
 /// gets one extra indent level. The trailing character is checked against
 /// Godot's syntax highlighter to avoid false positives inside string literals.
+#[allow(dead_code)] // Borrowing version; OwnedGodotIndentProvider is the active variant.
 pub(crate) struct GodotIndentProvider<'a> {
     editor: &'a Gd<CodeEdit>,
 }
@@ -167,6 +170,7 @@ impl IndentProvider for GodotIndentProvider<'_> {
     }
 }
 
+#[allow(dead_code)]
 impl<'a> GodotIndentProvider<'a> {
     #[must_use]
     pub(crate) fn new(editor: &'a Gd<CodeEdit>) -> Self {
@@ -233,6 +237,7 @@ impl IndentProvider for OwnedGodotIndentProvider {
 /// (cursor position, selection, viewport geometry, fold/indent state) happens
 /// here. The returned `InputContext` is fully self-contained and requires no
 /// further Godot calls during engine processing.
+#[allow(dead_code)] // Was used by the old manual pipeline; kept for reference.
 pub(crate) fn build_context<'a>(
     editor: &Gd<CodeEdit>,
     doc: &'a GodotDocument<'a>,
@@ -281,6 +286,7 @@ pub(crate) fn build_context<'a>(
     ctx
 }
 
+#[allow(dead_code)]
 const DEFAULT_VIEWPORT_WIDTH: usize = 80;
 
 /// Estimate viewport width in columns from pixel dimensions and font metrics.
@@ -289,6 +295,7 @@ const DEFAULT_VIEWPORT_WIDTH: usize = 80;
 /// space-character advance. Exact for monospace fonts (the code editor case);
 /// only approximate if a proportional font is somehow configured. Falls back
 /// to 80 columns when font metrics are unavailable or degenerate.
+#[allow(dead_code)]
 fn approximate_viewport_width(editor: &Gd<CodeEdit>) -> usize {
     let pixel_width = editor.get_size().x;
     if pixel_width <= 0.0 {

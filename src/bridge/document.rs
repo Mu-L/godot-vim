@@ -21,6 +21,7 @@ pub(crate) struct GodotDocument<'a> {
     line_index: codec::LineIndex,
 }
 
+#[allow(dead_code)] // Was used by old manual pipeline; OwnedGodotHost now owns the document.
 impl<'a> GodotDocument<'a> {
     #[must_use]
     pub(crate) fn new(text: &'a str) -> Self {

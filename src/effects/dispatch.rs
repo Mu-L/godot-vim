@@ -300,6 +300,7 @@ pub(crate) fn dispatch(
 ///
 /// Used by vimdebug step mode to apply text mutations immediately while
 /// deferring pass2 effects for interactive inspection.
+#[allow(dead_code)] // Used by vimdebug step mode; currently disabled in new session pipeline.
 pub(crate) fn split_effects_by_pass(effects: Vec<Effect>) -> (Vec<Effect>, Vec<Effect>) {
     effects.into_iter().partition(|effect| {
         effect.is_text_mutation()

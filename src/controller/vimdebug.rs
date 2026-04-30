@@ -85,18 +85,21 @@ impl VimdebugState {
         self.range.clone()
     }
 
+    #[allow(dead_code)] // Called when vimdebug watch annotations are wired to the new pipeline.
     pub(crate) fn capture_provenance(&mut self, provenance: Option<&str>) {
         if self.is_enabled() {
             self.provenance = provenance.map(CompactString::from);
         }
     }
 
+    #[allow(dead_code)] // Called when vimdebug watch annotations are wired to the new pipeline.
     pub(crate) fn capture_effects_summary(&mut self, summary: CompactString) {
         if self.is_enabled() {
             self.effects = Some(summary);
         }
     }
 
+    #[allow(dead_code)] // Called when vimdebug watch annotations are wired to the new pipeline.
     pub(crate) fn capture_range(&mut self, range: Option<MatchRange>) {
         if self.is_enabled() {
             self.range = range;
@@ -109,6 +112,7 @@ impl VimdebugState {
         self.range = None;
     }
 
+    #[allow(dead_code)] // Used by vimdebug step mode (currently disabled in new pipeline).
     pub(crate) fn load_step_effects(&mut self, descriptions: Vec<CompactString>) {
         self.step_pending = descriptions
             .into_iter()

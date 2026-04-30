@@ -11,6 +11,7 @@ use crate::types::RemapPolicy;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LineNumber(usize);
 
+#[allow(dead_code)] // Used by dispatch.rs for compound action construction.
 impl LineNumber {
     #[must_use]
     pub(crate) const fn new(val: usize) -> Self { Self(val) }

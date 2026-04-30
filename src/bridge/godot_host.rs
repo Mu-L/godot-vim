@@ -88,6 +88,10 @@ pub(crate) struct GodotHost {
 
     // ── Deferred actions for controller ─────────────────────────────────
     pending_ui_actions: Vec<PendingUiAction>,
+
+    // ── Vimdebug support ───────────────────────────────────────────────
+    /// Whether vimdebug needs the effects summary captured this cycle.
+    vimdebug_enabled: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -395,6 +399,7 @@ impl GodotHost {
             auto_brace_eligible: false,
             engine_auto_pairs_active: false,
             pending_ui_actions: Vec::new(),
+            vimdebug_enabled: false,
         }
     }
 
@@ -426,6 +431,7 @@ impl GodotHost {
     }
 
     /// Force a full text cache rebuild from the editor.
+    #[allow(dead_code)]
     pub(crate) fn invalidate_cache(&mut self) {
         self.text_cache = self.editor.get_text().to_string();
         self.line_index = LineIndex::new(&self.text_cache);
@@ -465,16 +471,58 @@ impl GodotHost {
         std::mem::take(&mut self.pending_ui_actions)
     }
 
-    // ── Field accessors ─────────────────────────────────────────────────
+    // ── Undo safety ─────────────────────────────────────────────────────
 
+    /// Close any orphaned `begin_complex_operation` calls left open by
+    /// a bug or panic. Insert/Replace legitimately hold depth=1 across
+    /// keystrokes (opened on mode entry, closed on Esc); depth>1 is a bug.
+    pub(crate) fn ensure_undo_balanced(&mut self, mode: Mode) {
+        if mode.is_insert() || mode.is_replace() {
+            let depth = self.undo_depth.depth();
+            if depth > 1 {
+                log::error!(
+                    "Abnormal undo depth {} in {} mode (expected 1) editor=#{} -- engine bug?",
+                    depth, mode, self.editor.instance_id().to_i64(),
+                );
+            }
+            return;
+        }
+
+        let godot_groups = self.undo_depth.drain();
+        if godot_groups > 0 {
+            self.state.globals_mut().set_error(
+                "Internal: orphaned undo group(s) recovered -- undo may be inconsistent",
+            );
+        }
+        for i in 0..godot_groups {
+            log::warn!("Closing orphaned undo group ({}/{})", i + 1, godot_groups);
+            self.editor.end_complex_operation();
+        }
+    }
+
+    // ── Vimdebug support ───────────────────────────────────────────────
+
+    pub(crate) fn set_vimdebug_enabled(&mut self, enabled: bool) {
+        self.vimdebug_enabled = enabled;
+    }
+
+    // ── Field accessors ─────────────────────────────────────────────────
+    //
+    // These form GodotHost's public API. Some are currently unused because
+    // the old ProcessContext pipeline was removed; they remain for the
+    // controller/testing code that may need them.
+
+    #[allow(dead_code)]
     pub(crate) fn editor(&self) -> &Gd<CodeEdit> {
         &self.editor
     }
 
+    #[allow(dead_code)]
     pub(crate) fn editor_mut(&mut self) -> &mut Gd<CodeEdit> {
         &mut self.editor
     }
 
+    #[allow(dead_code)]
     pub(crate) fn state(&self) -> &ShellState {
         &self.state
     }
@@ -483,6 +531,7 @@ impl GodotHost {
         &mut self.state
     }
 
+    #[allow(dead_code)]
     pub(crate) fn undo_depth(&self) -> &UndoDepth {
         &self.undo_depth
     }
@@ -491,10 +540,12 @@ impl GodotHost {
         &mut self.undo_depth
     }
 
+    #[allow(dead_code)]
     pub(crate) fn line_index(&self) -> &LineIndex {
         &self.line_index
     }
 
+    #[allow(dead_code)]
     pub(crate) fn security_policy(&self) -> &SecurityPolicy {
         &self.security_policy
     }
@@ -503,37 +554,11 @@ impl GodotHost {
         self.highlight_yank_duration_ms
     }
 
+    #[allow(dead_code)]
     pub(crate) fn clipboard(&mut self) -> &mut GodotClipboard {
         &mut self.clipboard
     }
 
-    /// Split borrow: return mutable references to state and undo_depth
-    /// simultaneously, along with the security policy and other config
-    /// needed by `ProcessContext`.
-    ///
-    /// This enables the controller's `as_process_context()` to build a
-    /// `ProcessContext` from VimSession's internals without conflicting borrows.
-    pub(crate) fn split_borrow_for_context(
-        &mut self,
-    ) -> HostContextBorrow<'_> {
-        HostContextBorrow {
-            state: &mut self.state,
-            undo_depth: &mut self.undo_depth,
-            security_policy: &self.security_policy,
-            highlight_yank_duration_ms: self.highlight_yank_duration_ms,
-            clipboard: &mut self.clipboard,
-        }
-    }
-}
-
-/// Simultaneously borrowed fields from [`GodotHost`] for building a
-/// [`crate::controller::context::ProcessContext`].
-pub(crate) struct HostContextBorrow<'a> {
-    pub(crate) state: &'a mut ShellState,
-    pub(crate) undo_depth: &'a mut UndoDepth,
-    pub(crate) security_policy: &'a SecurityPolicy,
-    pub(crate) highlight_yank_duration_ms: u32,
-    pub(crate) clipboard: &'a mut GodotClipboard,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

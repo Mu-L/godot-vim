@@ -2,25 +2,20 @@
 //! and vim-core's synchronous command model.
 //!
 //! Manages a [`VimSession<GodotHost>`] (when attached to an editor) or a bare
-//! [`VimEngine`] (when detached) and orchestrates each keystroke through a
-//! four-stage pipeline: context build → engine process → effect dispatch →
-//! host request handling. The controller never touches the Godot scene tree
-//! directly — UI actions that require tree access are deferred via
+//! [`VimEngine`] (when detached). Each keystroke flows through
+//! `VimSession::process_key()` with pre/post hooks for completion, passthrough,
+//! vimdebug, IME, and perf. The controller never touches the Godot scene tree
+//! directly -- UI actions that require tree access are deferred via
 //! [`PendingUiAction`] for the plugin layer to execute.
 //!
 //! Sub-modules:
-//! - [`process`] — keystroke pipeline (`process_cycle`, `process_single_key`, `drain_pending`)
-//! - [`host_bridge`] — host request dispatch and controller-command interception
-//! - [`completion`] — CodeEdit autocomplete popup interception
-//! - [`norm`] — `:norm` compound execution across line ranges
-//! - [`passthrough`] — key bypass classification (F-keys, Alt/Meta, user overrides)
-//! - [`perf`] — per-keystroke latency tracking (`:perf`)
-//! - [`vimdebug`] — effect inspector (`:vimdebug watch/step`)
+//! - [`process`] -- keystroke pipeline (`process_cycle`, `resolve_mapping_timeout`)
+//! - [`completion`] -- CodeEdit autocomplete popup interception
+//! - [`passthrough`] -- key bypass classification (F-keys, Alt/Meta, user overrides)
+//! - [`perf`] -- per-keystroke latency tracking (`:perf`)
+//! - [`vimdebug`] -- effect inspector (`:vimdebug watch/step`)
 
 mod completion;
-mod context;
-mod host_bridge;
-mod norm;
 mod passthrough;
 pub(crate) mod perf;
 mod process;
@@ -49,17 +44,9 @@ pub(crate) enum PendingUiAction {
     SourceConfigFile,
 }
 
-/// Runaway guard for macro/mapping replay within a single `process_cycle`.
-/// Sized for `999@q` worst case: 999 replays * 20 keys = ~20k, with 5x margin.
-const MAX_DRAIN_ITERATIONS: u32 = 100_000;
-
 const PERF_RING_CAPACITY: usize = 1000;
 /// Per-keystroke budget; exceeding this logs a warning with phase breakdown.
 const PERF_BUDGET_US: perf::Microseconds = perf::Microseconds(2000);
-
-/// Host request recursion depth limit. Typical depth is 1-2;
-/// `:source` chains can reach 3. Five allows headroom without risk.
-const MAX_HOST_DEPTH: u32 = 5;
 
 /// Transient per-cycle / per-keystroke state that must be reset on every
 /// cleanup path (dead editor, panic recovery, tab switch).
@@ -539,22 +526,35 @@ impl VimController {
         self.host_state_mut().buffer(editor_id).set_engine_state(engine_state);
     }
 
-    /// Exit non-Normal mode by sending synthetic Escapes through the engine
+    /// Exit non-Normal mode by sending synthetic Escapes through the session
     /// pipeline until Normal mode is reached. This ensures macro recording
     /// captures the exit, visual marks (`<`/`>`), `LastVisualInfo`, insert-stop
-    /// marks (`^`), and `EndUndo` effects are all produced — identical to the
+    /// marks (`^`), and `EndUndo` effects are all produced -- identical to the
     /// user pressing Esc.
     ///
-    /// Handles mode nesting (e.g., visual → command-line → visual → normal)
+    /// Handles mode nesting (e.g., visual -> command-line -> visual -> normal)
     /// by looping. Safety limit of 5 prevents infinite loops if a bug causes
     /// Esc to not change mode.
     ///
     /// Returns `true` if the engine was in a non-Normal mode and Esc(s) were processed.
-    pub(crate) fn exit_mode_via_pipeline(&mut self, editor: &mut Gd<CodeEdit>) -> bool {
+    pub(crate) fn exit_mode_via_pipeline(&mut self, _editor: &mut Gd<CodeEdit>) -> bool {
         if self.engine().mode().is_normal() {
             return false;
         }
         const MAX_ESC: usize = 5;
+
+        // Pre-process setup for session.process_key().
+        if let Some(ref mut session) = self.session {
+            let engine_mode = session.engine().mode();
+            let auto_pairs_active = session.engine().options().auto_pairs().is_some();
+            let scrolloff = crate::bridge::codec::usize_to_i32(session.engine().options().scrolloff());
+            session.host_mut().refresh_from_editor();
+            session.host_mut().set_auto_brace_eligible(engine_mode.is_insert());
+            session.host_mut().set_engine_auto_pairs_active(auto_pairs_active);
+            session.host_mut().set_scrolloff(scrolloff);
+            session.host_mut().set_current_mode(engine_mode);
+        }
+
         for i in 0..MAX_ESC {
             if self.engine().mode().is_normal() {
                 break;
@@ -564,8 +564,9 @@ impl VimController {
                 i + 1,
                 self.engine().mode()
             );
-            let mut cx = self.as_process_context();
-            cx.process_single_key(KeyEvent::escape(), editor);
+            if let Some(ref mut session) = self.session {
+                let _ = session.process_key(KeyEvent::escape());
+            }
         }
         if !self.engine().mode().is_normal() {
             log::error!(
@@ -716,18 +717,16 @@ impl VimController {
         }
     }
 
-    // ── Processing entry points (delegate to ProcessContext) ─────────
+    // ── Processing entry points ────────────────────────────────────────
 
     /// Single entry point for keystroke processing from `gui_input`.
     pub(crate) fn process_cycle(&mut self, key: KeyEvent, editor: &mut Gd<CodeEdit>) -> bool {
-        let mut cx = self.as_process_context();
-        cx.process_cycle_impl(key, editor)
+        self.process_cycle_impl(key, editor)
     }
 
     /// Force-resolve a pending mapping after timeout, then drain expanded keys.
     pub(crate) fn resolve_mapping_timeout(&mut self, editor: &mut Gd<CodeEdit>) {
-        let mut cx = self.as_process_context();
-        cx.resolve_mapping_timeout_impl(editor)
+        self.resolve_mapping_timeout_impl(editor)
     }
 
     /// Process a mouse drag selection detected by `on_caret_changed`.
@@ -741,82 +740,39 @@ impl VimController {
         head_col: i32,
         shape: vim_core::primitives::SelectionShape,
     ) -> bool {
-        let editor_id = editor.instance_id();
+        let session = self.session.as_mut().expect("process_mouse_selection: requires active session");
 
-        let text = match self.transient.persistent_text.take() {
-            Some((id, t)) if id == editor_id => t,
-            _ => editor.get_text().to_string(),
-        };
-        let doc = crate::bridge::document::GodotDocument::new(&text);
+        // Compute byte offsets from line/col using the host's document.
+        let text = editor.get_text().to_string();
+        let li = crate::bridge::codec::LineIndex::new(&text);
+        let anchor_offset = li.line_col_to_byte(&text, anchor_line, anchor_col);
+        let head_offset = li.line_col_to_byte(&text, head_line, head_col);
 
-        let anchor_offset = doc.line_index().line_col_to_byte(
-            doc.text(), anchor_line, anchor_col,
-        );
-        let head_offset = doc.line_index().line_col_to_byte(
-            doc.text(), head_line, head_col,
-        );
+        // Sync host state before processing.
+        let current_mode = session.engine().mode();
+        session.host_mut().refresh_from_editor();
+        session.host_mut().set_auto_brace_eligible(false); // entering Visual, not Insert
+        session.host_mut().set_current_mode(current_mode);
 
-        let fold_provider = crate::bridge::context::GodotFoldProvider::new(editor);
-        let indent_provider = crate::bridge::context::GodotIndentProvider::new(editor);
-        let providers = vim_core::document::Providers::new()
-            .with_fold(&fold_provider)
-            .with_indent(&indent_provider);
-        let ctx = crate::bridge::context::build_context(editor, &doc, providers);
+        let result = session.process_mouse_selection(anchor_offset, head_offset, shape);
 
-        let mut response = self.engine_mut().process_mouse_selection(
-            anchor_offset, head_offset, shape, &ctx,
-        );
-
-        let effects = response.take_effects();
-        if effects.is_empty() {
-            self.transient.persistent_text = Some((editor_id, text));
-            return false;
-        }
-
-        let host_requests = response.take_host_requests();
-        {
-            let mut cx = self.as_process_context();
-            let line_index_hint = Some(doc.into_line_index());
-            // Auto-brace ineligible: entering Visual, not Insert.
-            cx.apply_effects(effects, editor, crate::effects::dispatch::AutoBraceMode::Ineligible, &text, line_index_hint);
-
-            if !host_requests.is_empty() {
-                cx.handle_host_requests(host_requests, editor, 0);
+        // Handle any deferred actions (window nav from mouse selection is unlikely but safe).
+        for action in &result.deferred_actions {
+            match action {
+                vim_core::execution::host_api::DeferredAction::WindowNav(nav) => {
+                    let nav_action = process::convert_window_nav_action(*nav);
+                    let control: Gd<godot::classes::Control> = editor.clone().upcast();
+                    crate::navigation::handle_window_nav_action(&control, nav_action);
+                }
+                _ => {
+                    log::debug!("process_mouse_selection: unhandled deferred action {:?}", action);
+                }
             }
         }
 
-        true
-    }
-
-    // ── Process context factory ──────────────────────────────────────
-
-    /// Split `&mut self` into individually-borrowed fields for the processing
-    /// pipeline. See [`context::ProcessContext`] for why this is needed.
-    ///
-    /// Requires an active session (editor attached). The engine, state, and
-    /// undo depth are borrowed from the session's internals via
-    /// [`VimSession::engine_and_host_mut`] and [`GodotHost::split_borrow_for_context`].
-    fn as_process_context(&mut self) -> context::ProcessContext<'_> {
-        let session = self.session.as_mut()
-            .expect("as_process_context: requires active session");
-        let (engine, host) = session.engine_and_host_mut();
-        let host_borrow = host.split_borrow_for_context();
-        context::ProcessContext {
-            engine,
-            state: host_borrow.state,
-            undo_depth: host_borrow.undo_depth,
-            persistent_text: &mut self.transient.persistent_text,
-            vimdebug: &mut self.transient.vimdebug,
-            pending_step_effects: &mut self.transient.pending_step_effects,
-            operations_this_cycle: &mut self.transient.operations_this_cycle,
-            perf: &mut self.perf,
-            pending_ui_action: &mut self.transient.pending_ui_action,
-            security_policy: host_borrow.security_policy,
-            highlight_yank_duration_ms: host_borrow.highlight_yank_duration_ms,
-            passthrough_keys: &self.passthrough_keys,
-            code_complete_enabled: self.code_complete_enabled,
-            clipboard: host_borrow.clipboard,
-        }
+        // Check if effects were produced by checking if cursor or mode changed.
+        // VimSession handles effect application internally via GodotHost::apply_effects.
+        result.consumed
     }
 }
 

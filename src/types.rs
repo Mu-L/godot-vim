@@ -119,6 +119,7 @@ pub(crate) struct MatchRange {
 
 impl MatchRange {
     #[must_use]
+    #[allow(dead_code)] // Used by vimdebug range annotation; currently disabled in new pipeline.
     pub(crate) const fn new(start: CharLineCol, end: CharLineCol) -> Self {
         Self { start, end, replacement: None }
     }

@@ -748,6 +748,7 @@ name = "vim-core"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "aho-corasick",
  "arrayvec",
  "bitflags",
  "cfg-if",
