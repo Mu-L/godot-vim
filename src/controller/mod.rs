@@ -1,11 +1,12 @@
 //! Per-editor controller: mediates between Godot's event-driven input model
 //! and vim-core's synchronous command model.
 //!
-//! Owns the [`VimEngine`] and orchestrates each keystroke through a four-stage
-//! pipeline: context build → engine process → effect dispatch → host request
-//! handling. The controller never touches the Godot scene tree directly —
-//! UI actions that require tree access are deferred via [`PendingUiAction`]
-//! for the plugin layer to execute.
+//! Manages a [`VimSession<GodotHost>`] (when attached to an editor) or a bare
+//! [`VimEngine`] (when detached) and orchestrates each keystroke through a
+//! four-stage pipeline: context build → engine process → effect dispatch →
+//! host request handling. The controller never touches the Godot scene tree
+//! directly — UI actions that require tree access are deferred via
+//! [`PendingUiAction`] for the plugin layer to execute.
 //!
 //! Sub-modules:
 //! - [`process`] — keystroke pipeline (`process_cycle`, `process_single_key`, `drain_pending`)
@@ -31,10 +32,11 @@ use std::collections::HashSet;
 use compact_str::CompactString;
 use godot::classes::CodeEdit;
 use godot::prelude::*;
-use vim_core::execution::VimEngine;
+use vim_core::execution::{VimEngine, VimSession};
 use vim_core::keymap::KeyEvent;
 use vim_core::primitives::Direction;
 
+use crate::bridge::godot_host::GodotHost;
 use crate::host::SecurityPolicy;
 use crate::settings::{FileAccessScope, ShellExecution};
 use crate::state::ShellState;
@@ -111,18 +113,24 @@ impl TransientShellState {
     }
 }
 
-/// Per-editor orchestrator that owns the [`VimEngine`] and bridges Godot's
-/// event-driven input to vim-core's synchronous command model.
+/// Per-editor orchestrator that bridges Godot's event-driven input to
+/// vim-core's synchronous command model.
 ///
-/// Created once in `enter_tree`, shared across all editor tabs. Per-buffer
-/// state is keyed by `InstanceId` in [`ShellState`]; the engine itself is
-/// tab-agnostic. Lifetime spans `enter_tree` to `exit_tree`.
+/// Created once in `enter_tree`, shared across all editor tabs. The engine
+/// persists across attach/detach cycles; the host (`GodotHost`) is created
+/// on attach and destroyed on detach. Between attach and detach, the engine
+/// and host live together in a [`VimSession`]. When detached, the engine is
+/// stored bare in `detached_engine`.
+///
+/// Invariant: exactly one of `session` or `detached_engine` is `Some` at all
+/// times. Helper methods [`engine()`](Self::engine) / [`engine_mut()`](Self::engine_mut)
+/// abstract over this.
 pub(crate) struct VimController {
-    engine: VimEngine,
-    state: ShellState,
-    /// Ensures Godot's `begin/end_complex_operation` calls are always balanced,
-    /// even after panics or abnormal mode transitions.
-    undo_depth: crate::effects::UndoDepth,
+    /// Active session (engine + host). `Some` when an editor is attached.
+    session: Option<VimSession<GodotHost>>,
+    /// Bare engine stored between detach and the next attach.
+    /// `Some` when no editor is attached.
+    detached_engine: Option<VimEngine>,
     /// Per-cycle / per-keystroke state that must be reset on every cleanup path.
     /// See [`TransientShellState::reset()`] for the canonical reset logic.
     transient: TransientShellState,
@@ -134,18 +142,16 @@ pub(crate) struct VimController {
     /// Whether Godot's native code completion should auto-trigger on typing.
     /// Mirrors `text_editor/completion/code_complete_enabled` from EditorSettings.
     code_complete_enabled: bool,
-    /// System clipboard abstraction — production uses [`GodotClipboard`],
-    /// tests can substitute a mock.
-    clipboard: crate::bridge::clipboard::GodotClipboard,
 }
 
 impl VimController {
     #[must_use]
     pub(crate) fn new() -> Self {
-        let mut ctrl = Self {
-            engine: VimEngine::new(),
-            state: ShellState::default(),
-            undo_depth: crate::effects::UndoDepth::new(),
+        let mut engine = VimEngine::new();
+        engine.set_shadow_execution(true);
+        Self {
+            session: None,
+            detached_engine: Some(engine),
             transient: TransientShellState::new(),
             passthrough_keys: HashSet::new(),
             security_policy: SecurityPolicy {
@@ -156,10 +162,72 @@ impl VimController {
             perf: perf::PerfTracker::new(PERF_RING_CAPACITY, PERF_BUDGET_US),
             highlight_yank_duration_ms: u32::try_from(crate::settings::defaults::HIGHLIGHT_YANK_DURATION).unwrap_or(150),
             code_complete_enabled: true,
-            clipboard: crate::bridge::clipboard::GodotClipboard,
-        };
-        ctrl.engine.set_shadow_execution(true);
-        ctrl
+        }
+    }
+
+    // ── Engine accessors (work in both attached and detached state) ───
+
+    /// Immutable access to the engine, regardless of attach state.
+    fn engine(&self) -> &VimEngine {
+        self.session.as_ref().map(|s| s.engine())
+            .or(self.detached_engine.as_ref())
+            .expect("VimController invariant: engine always available")
+    }
+
+    /// Mutable access to the engine, regardless of attach state.
+    fn engine_mut(&mut self) -> &mut VimEngine {
+        if let Some(ref mut session) = self.session {
+            return session.engine_mut();
+        }
+        self.detached_engine.as_mut()
+            .expect("VimController invariant: engine always available")
+    }
+
+    // ── Session accessors (only valid when attached) ─────────────────
+
+    fn session_mut(&mut self) -> &mut VimSession<GodotHost> {
+        self.session.as_mut().expect("VimController: not attached")
+    }
+
+    /// Mutable access to the host's shell state.
+    ///
+    /// Only valid when a session is active (editor attached).
+    fn host_state_mut(&mut self) -> &mut ShellState {
+        self.session_mut().host_mut().state_mut()
+    }
+
+    // ── Attach / detach lifecycle ────────────────────────────────────
+
+    /// Create a `VimSession<GodotHost>` by taking the detached engine and
+    /// pairing it with a new `GodotHost` wrapping the given editor.
+    ///
+    /// Must only be called when detached (i.e., `detached_engine` is `Some`).
+    /// Syncs controller-level config (security policy, highlight yank duration)
+    /// into the new host.
+    pub(crate) fn attach_session(&mut self, editor: Gd<CodeEdit>) {
+        let engine = self.detached_engine.take()
+            .expect("attach_session: must be in detached state");
+        let mut host = GodotHost::new(editor);
+        host.set_security_policy(self.security_policy.clone());
+        host.set_highlight_yank_duration_ms(self.highlight_yank_duration_ms);
+        self.session = Some(VimSession::from_parts(engine, host));
+    }
+
+    /// Decompose the active session: drop the host, reclaim the engine.
+    ///
+    /// Returns the `GodotHost` for any final cleanup the caller needs.
+    /// No-ops if already detached.
+    pub(crate) fn detach_session(&mut self) -> Option<GodotHost> {
+        let session = self.session.take()?;
+        let (engine, host) = session.into_parts();
+        self.detached_engine = Some(engine);
+        Some(host)
+    }
+
+    /// Whether a session is currently active (editor attached).
+    #[must_use]
+    pub(crate) fn is_attached(&self) -> bool {
+        self.session.is_some()
     }
 
     // ── Configuration setters ─────────────────────────────────────────
@@ -177,7 +245,7 @@ impl VimController {
     }
 
     pub(crate) fn apply_settings(&mut self, snapshot: &crate::settings::SettingsSnapshot) {
-        snapshot.apply_to_options(self.engine.options_mut());
+        snapshot.apply_to_options(self.engine_mut().options_mut());
         self.set_passthrough_keys(&snapshot.passthrough_keys);
         self.set_security_policy(crate::host::SecurityPolicy {
             shell_execution: snapshot.shell_execution,
@@ -196,50 +264,66 @@ impl VimController {
     /// `highlight_yank`) from shell state. Safe to call once per cycle
     /// only — Godot's single-threaded signal model guarantees this.
     pub(crate) fn ui_snapshot(&mut self, editor_id: InstanceId) -> crate::types::UiSnapshot {
-        let mode = self.engine.mode();
-        let vs = self.engine.state();
+        // Extract engine-owned values first (immutable borrow of engine).
+        let mode = self.engine().mode();
+        let cmdline_prompt = if mode.is_command_line() {
+            Some(self.engine().state().command_line().prompt())
+        } else {
+            None
+        };
+        let cmdline_input = CompactString::from(self.engine().state().command_line().input());
+        let cmdline_cursor = self.engine().state().command_line().cursor();
+        let recording_register = self.engine().state().macros().recording_register().map(|r| r.char());
+        let search_pattern = self.engine().state().search().pattern().map(|p| {
+            (CompactString::from(p), Direction::from(self.engine().state().search().direction()))
+        });
+        let pending_keys = self.engine().pending_mapping_display();
+        let pending_command = self.engine().pending_command_display();
+
+        // Now borrow host state mutably for shell-state fields.
+        let state = self.host_state_mut();
+        let message = state.globals().message_status().clone();
+        let hlsearch_enabled = state.globals().hlsearch_enabled();
+        let visual_head = state.buffer_ref(editor_id).and_then(|b| b.visual().map(|v| v.head_pos));
+        let substitute_preview = state.take_substitute_preview();
+        let highlight_yank = state.take_highlight_yank();
+
+        let vimdebug = match (self.transient.vimdebug.provenance().cloned(), self.transient.vimdebug.effects_summary().cloned()) {
+            (Some(provenance), Some(effects)) => {
+                match self.transient.vimdebug.step_status_line() {
+                    Some(step_status) => crate::types::VimdebugSnapshot::Step {
+                        provenance,
+                        effects,
+                        range: self.transient.vimdebug.range(),
+                        step_status,
+                    },
+                    None => crate::types::VimdebugSnapshot::Watch {
+                        provenance,
+                        effects,
+                        range: self.transient.vimdebug.range(),
+                    },
+                }
+            }
+            _ => crate::types::VimdebugSnapshot::Inactive,
+        };
+
         crate::types::UiSnapshot {
             mode,
-            message: self.state.globals().message_status().clone(),
+            message,
             cmdline: crate::types::CommandLineState {
-                prompt: if mode.is_command_line() {
-                    Some(vs.command_line().prompt())
-                } else {
-                    None
-                },
-                input: CompactString::from(vs.command_line().input()),
-                cursor: vs.command_line().cursor(),
+                prompt: cmdline_prompt,
+                input: cmdline_input,
+                cursor: cmdline_cursor,
             },
-            recording_register: vs.macros().recording_register().map(|r| r.char()),
-            search_pattern: vs.search().pattern().map(|p| {
-                (CompactString::from(p), Direction::from(vs.search().direction()))
-            }),
-            hlsearch_enabled: self.state.globals().hlsearch_enabled(),
-            visual_head: self.state.buffer_ref(editor_id).and_then(|b| b.visual().map(|v| v.head_pos)),
-            pending_keys: self.engine.pending_mapping_display(),
-            pending_command: self.engine.pending_command_display(),
-            substitute_preview: self.state.take_substitute_preview(),
-            vimdebug: match (self.transient.vimdebug.provenance().cloned(), self.transient.vimdebug.effects_summary().cloned()) {
-                (Some(provenance), Some(effects)) => {
-                    match self.transient.vimdebug.step_status_line() {
-                        Some(step_status) => crate::types::VimdebugSnapshot::Step {
-                            provenance,
-                            effects,
-                            range: self.transient.vimdebug.range(),
-                            step_status,
-                        },
-                        None => crate::types::VimdebugSnapshot::Watch {
-                            provenance,
-                            effects,
-                            range: self.transient.vimdebug.range(),
-                        },
-                    }
-                }
-                // Either field alone (or both absent) means vimdebug is inactive
-                // or has not captured anything yet this cycle.
-                _ => crate::types::VimdebugSnapshot::Inactive,
-            },
-            highlight_yank: self.state.take_highlight_yank(),
+            recording_register,
+            search_pattern,
+            hlsearch_enabled,
+            visual_head,
+            pending_keys,
+            pending_command,
+            substitute_preview,
+            vimdebug,
+            highlight_yank,
         }
     }
 
@@ -251,7 +335,7 @@ impl VimController {
     /// Sync indent settings from CodeEdit on attach. CodeEdit is the source
     /// of truth for tab/space and indent widths — not plugin settings.
     pub(crate) fn sync_indent(&mut self, expandtab: bool, shiftwidth: usize, tabstop: usize) {
-        let opts = self.engine.options_mut();
+        let opts = self.engine_mut().options_mut();
         opts.set_expandtab(expandtab);
         opts.set_shiftwidth(shiftwidth);
         opts.set_tabstop(tabstop);
@@ -260,7 +344,7 @@ impl VimController {
     /// Sync from CodeEdit's language-specific comment delimiters (e.g., `"# %s"`
     /// for GDScript) so the `gc` commentary operator uses the right format.
     pub(crate) fn set_commentstring(&mut self, cs: &str) {
-        self.engine.options_mut().set_commentstring(cs);
+        self.engine_mut().options_mut().set_commentstring(cs);
     }
 
     /// Sync auto-brace pairs from CodeEdit so the engine handles auto-pairing
@@ -269,7 +353,7 @@ impl VimController {
         use vim_core::primitives::{AutoPairs, Pair};
 
         if !editor.is_auto_brace_completion_enabled() {
-            self.engine.options_mut().set_auto_pairs(None);
+            self.engine_mut().options_mut().set_auto_pairs(None);
             return;
         }
 
@@ -278,8 +362,6 @@ impl VimController {
         for (k, v) in dict.iter_shared() {
             let open_str = k.to_string();
             let close_str = v.to_string();
-            // Engine auto-pairs only supports single-char pairs; skip multi-char
-            // (e.g., `/*` / `*/`). Host-side auto-brace handles those.
             let mut open_chars = open_str.chars();
             let mut close_chars = close_str.chars();
             if let (Some(open), None, Some(close), None) = (
@@ -292,7 +374,7 @@ impl VimController {
             }
         }
 
-        self.engine
+        self.engine_mut()
             .options_mut()
             .set_auto_pairs(Some(AutoPairs { pairs: pairs.into() }));
     }
@@ -304,14 +386,14 @@ impl VimController {
     /// to restore marks, changelist, last_visual, sticky_column, buffer_overrides,
     /// buffer_mappings, and exchange.
     pub(crate) fn restore_buffer_engine_state(&mut self, editor_id: InstanceId) {
-        let state = self.state.buffer(editor_id).take_engine_state()
+        let state = self.host_state_mut().buffer(editor_id).take_engine_state()
             .unwrap_or_default();
-        self.engine.on_buffer_enter(state);
+        self.engine_mut().on_buffer_enter(state);
     }
 
     /// Seed the undo tree on first attach (no-op if already initialized).
     pub(crate) fn init_undo_tree(&mut self, editor_id: InstanceId, text: &str) {
-        let buf = self.state.buffer(editor_id);
+        let buf = self.host_state_mut().buffer(editor_id);
         if buf.undo_tree().is_none() {
             buf.init_undo_tree(text);
         }
@@ -323,7 +405,10 @@ impl VimController {
     /// since every editor lifecycle transition passes through them. Uses
     /// Godot's ObjectDB to probe liveness.
     pub(crate) fn sweep_stale_buffers(&mut self) {
-        let removed = self.state.sweep_invalid_buffers(|id| {
+        let Some(ref mut session) = self.session else {
+            return;
+        };
+        let removed = session.host_mut().state_mut().sweep_invalid_buffers(|id| {
             Gd::<godot::classes::Object>::try_from_instance_id(id).is_ok()
         });
         if !removed.is_empty() {
@@ -336,7 +421,7 @@ impl VimController {
 
     #[must_use]
     pub(crate) fn mode(&self) -> vim_core::primitives::Mode {
-        self.engine.mode()
+        self.engine().mode()
     }
 
     /// Called on `text_changed` signal so the next keystroke fetches fresh
@@ -357,14 +442,11 @@ impl VimController {
     pub(crate) fn reconcile_external_text_change(&mut self, editor: &Gd<CodeEdit>) {
         use vim_core::primitives::Mode;
 
-        let mode = self.engine.mode();
+        let mode = self.engine().mode();
         if !matches!(mode, Mode::Insert | Mode::Replace | Mode::VirtualReplace) {
             return;
         }
 
-        // Read old text from the cache. If no cache exists (first change
-        // after attach, or cache was invalidated by a prior mutation in
-        // the same frame), we have no baseline to diff against — skip.
         let Some((_, before_text)) = self.transient.persistent_text.take() else {
             log::trace!(
                 "reconcile_external: no cached text available, skipping"
@@ -381,7 +463,7 @@ impl VimController {
         );
 
         reconcile::reconcile_external_text_change(
-            &mut self.engine,
+            self.engine_mut(),
             &before_text,
             &after_text,
             cursor_byte,
@@ -402,10 +484,16 @@ impl VimController {
     /// calls and optionally `undo()` to roll back partial mutations.
     pub(crate) fn force_cleanup_without_editor(&mut self) -> u32 {
         log::debug!("force_cleanup_without_editor: canonical Tier 1 reset");
-        self.engine.emergency_reset();
-        let godot_groups = self.undo_depth.drain();
-        self.state.clear_substitute_preview();
-        self.state.take_highlight_yank();
+        self.engine_mut().emergency_reset();
+        let godot_groups = if let Some(ref mut session) = self.session {
+            let host = session.host_mut();
+            let groups = host.undo_depth_mut().drain();
+            host.state_mut().clear_substitute_preview();
+            host.state_mut().take_highlight_yank();
+            groups
+        } else {
+            0
+        };
         self.transient.reset();
         godot_groups
     }
@@ -418,7 +506,7 @@ impl VimController {
     /// continues across `:edit` commands. Recording is only aborted by
     /// emergency paths (`force_cleanup_without_editor` → `emergency_reset`).
     pub(crate) fn engine_reset_parser(&mut self) {
-        self.engine.reset_parser();
+        self.engine_mut().reset_parser();
     }
 
     /// Convenience wrapper to reset transient shell state without touching
@@ -430,7 +518,9 @@ impl VimController {
 
     /// Discard any unconsumed yank highlight to prevent cross-editor flash.
     pub(crate) fn clear_highlight_yank(&mut self) {
-        self.state.take_highlight_yank();
+        if let Some(ref mut session) = self.session {
+            session.host_mut().state_mut().take_highlight_yank();
+        }
     }
 
     /// Save all per-buffer engine state for the current editor.
@@ -445,8 +535,8 @@ impl VimController {
         let text = editor.get_text().to_string();
         let line_index = crate::bridge::codec::LineIndex::new(&text);
         let offset = line_index.line_col_to_byte(&text, line, col);
-        let engine_state = self.engine.on_buffer_leave(offset);
-        self.state.buffer(editor_id).set_engine_state(engine_state);
+        let engine_state = self.engine_mut().on_buffer_leave(offset);
+        self.host_state_mut().buffer(editor_id).set_engine_state(engine_state);
     }
 
     /// Exit non-Normal mode by sending synthetic Escapes through the engine
@@ -461,26 +551,26 @@ impl VimController {
     ///
     /// Returns `true` if the engine was in a non-Normal mode and Esc(s) were processed.
     pub(crate) fn exit_mode_via_pipeline(&mut self, editor: &mut Gd<CodeEdit>) -> bool {
-        if self.engine.mode().is_normal() {
+        if self.engine().mode().is_normal() {
             return false;
         }
         const MAX_ESC: usize = 5;
         for i in 0..MAX_ESC {
-            if self.engine.mode().is_normal() {
+            if self.engine().mode().is_normal() {
                 break;
             }
             log::debug!(
                 "exit_mode_via_pipeline: pass {}, mode={}",
                 i + 1,
-                self.engine.mode()
+                self.engine().mode()
             );
             let mut cx = self.as_process_context();
             cx.process_single_key(KeyEvent::escape(), editor);
         }
-        if !self.engine.mode().is_normal() {
+        if !self.engine().mode().is_normal() {
             log::error!(
                 "exit_mode_via_pipeline: still in {} after {} Escapes",
-                self.engine.mode(),
+                self.engine().mode(),
                 MAX_ESC
             );
         }
@@ -491,7 +581,7 @@ impl VimController {
     /// visual mode via the pipeline. Defense-in-depth: ensures no stale
     /// selection highlights remain even if the pipeline exit was a no-op.
     pub(crate) fn cleanup_visual_artifacts(&mut self, editor_id: InstanceId, editor: &mut Gd<CodeEdit>) {
-        self.state.buffer(editor_id).clear_visual_selection();
+        self.host_state_mut().buffer(editor_id).clear_visual_selection();
         editor.remove_secondary_carets();
         editor.deselect();
     }
@@ -500,7 +590,11 @@ impl VimController {
     /// The pipeline's `EndUndo` effect handles the normal case; this catches
     /// edge cases where undo groups are still open.
     pub(crate) fn drain_remaining_undo_depth(&mut self, editor: &mut Gd<CodeEdit>) {
-        let remaining = self.undo_depth.drain();
+        let remaining = if let Some(ref mut session) = self.session {
+            session.host_mut().undo_depth_mut().drain()
+        } else {
+            0
+        };
         for _ in 0..remaining {
             editor.end_complex_operation();
         }
@@ -509,22 +603,22 @@ impl VimController {
     /// Sync sticky column from a mouse click or external caret move.
     /// This is the only shell-side write path; the engine owns the column.
     pub(crate) fn set_engine_sticky_column(&mut self, col: usize) {
-        self.engine.set_sticky_column(col);
+        self.engine_mut().set_sticky_column(col);
     }
 
     #[must_use]
     pub(crate) fn has_pending_mapping(&self) -> bool {
-        self.engine.has_pending_mapping()
+        self.engine().has_pending_mapping()
     }
 
     #[must_use]
     pub(crate) fn could_start_mapping(&self, key: vim_core::keymap::KeyEvent) -> bool {
-        self.engine.could_start_mapping(key)
+        self.engine().could_start_mapping(key)
     }
 
     #[must_use]
     pub(crate) fn timeoutlen(&self) -> u32 {
-        self.engine.timeoutlen()
+        self.engine().timeoutlen()
     }
 
     /// Used by `on_mapping_timeout_impl` to detect whether timeout
@@ -543,19 +637,33 @@ impl VimController {
     /// `ClearHighlights` from config sourcing. The catch-all arm trips a
     /// debug assertion if a new effect type appears.
     pub(crate) fn reload_config(&mut self, text: &str) {
-        self.engine.clear_mappings();
-        let mut response = self.engine.source_config_text(text);
+        self.engine_mut().clear_mappings();
+        let mut response = self.engine_mut().source_config_text(text);
         let effects = response.take_effects();
+        // When detached (no session), config effects are logged but cannot
+        // be routed to shell state. This happens during initial enter_tree
+        // before any editor is attached.
+        let has_session = self.session.is_some();
         for effect in effects {
             match effect {
                 vim_core::effects::Effect::ShowMessage { text: msg } => {
-                    crate::effects::messages::handle_show_message(self.state.globals_mut(), &msg);
+                    if has_session {
+                        crate::effects::messages::handle_show_message(self.host_state_mut().globals_mut(), &msg);
+                    } else {
+                        log::info!("reload_config (detached): {}", msg);
+                    }
                 }
                 vim_core::effects::Effect::ShowError { error } => {
-                    crate::effects::messages::handle_show_error(self.state.globals_mut(), &error);
+                    if has_session {
+                        crate::effects::messages::handle_show_error(self.host_state_mut().globals_mut(), &error);
+                    } else {
+                        log::warn!("reload_config (detached): {}", error);
+                    }
                 }
                 vim_core::effects::Effect::ClearHighlights => {
-                    crate::effects::search::handle_clear_highlights(self.state.globals_mut());
+                    if has_session {
+                        crate::effects::search::handle_clear_highlights(self.host_state_mut().globals_mut());
+                    }
                 }
                 other => {
                     debug_assert!(
@@ -600,10 +708,12 @@ impl VimController {
         editor.deselect();
         editor.remove_secondary_carets();
         let editor_id = editor.instance_id();
-        self.state.buffer(editor_id).clear_visual_selection();
-        self.state.globals_mut().set_error(
-            "Recovered from internal error \u{2014} state reset to Normal mode",
-        );
+        if let Some(ref mut session) = self.session {
+            session.host_mut().state_mut().buffer(editor_id).clear_visual_selection();
+            session.host_mut().state_mut().globals_mut().set_error(
+                "Recovered from internal error \u{2014} state reset to Normal mode",
+            );
+        }
     }
 
     // ── Processing entry points (delegate to ProcessContext) ─────────
@@ -653,7 +763,7 @@ impl VimController {
             .with_indent(&indent_provider);
         let ctx = crate::bridge::context::build_context(editor, &doc, providers);
 
-        let mut response = self.engine.process_mouse_selection(
+        let mut response = self.engine_mut().process_mouse_selection(
             anchor_offset, head_offset, shape, &ctx,
         );
 
@@ -682,22 +792,30 @@ impl VimController {
 
     /// Split `&mut self` into individually-borrowed fields for the processing
     /// pipeline. See [`context::ProcessContext`] for why this is needed.
+    ///
+    /// Requires an active session (editor attached). The engine, state, and
+    /// undo depth are borrowed from the session's internals via
+    /// [`VimSession::engine_and_host_mut`] and [`GodotHost::split_borrow_for_context`].
     fn as_process_context(&mut self) -> context::ProcessContext<'_> {
+        let session = self.session.as_mut()
+            .expect("as_process_context: requires active session");
+        let (engine, host) = session.engine_and_host_mut();
+        let host_borrow = host.split_borrow_for_context();
         context::ProcessContext {
-            engine: &mut self.engine,
-            state: &mut self.state,
-            undo_depth: &mut self.undo_depth,
+            engine,
+            state: host_borrow.state,
+            undo_depth: host_borrow.undo_depth,
             persistent_text: &mut self.transient.persistent_text,
             vimdebug: &mut self.transient.vimdebug,
             pending_step_effects: &mut self.transient.pending_step_effects,
             operations_this_cycle: &mut self.transient.operations_this_cycle,
             perf: &mut self.perf,
             pending_ui_action: &mut self.transient.pending_ui_action,
-            security_policy: &self.security_policy,
-            highlight_yank_duration_ms: self.highlight_yank_duration_ms,
+            security_policy: host_borrow.security_policy,
+            highlight_yank_duration_ms: host_borrow.highlight_yank_duration_ms,
             passthrough_keys: &self.passthrough_keys,
             code_complete_enabled: self.code_complete_enabled,
-            clipboard: &mut self.clipboard,
+            clipboard: host_borrow.clipboard,
         }
     }
 }
@@ -723,16 +841,14 @@ mod tests {
         #[allow(unused, unreachable_code)]
         fn check(c: VimController) {
             let VimController {
-                engine: _,                     // engine: emergency_reset()
-                state: _,                      // shell: selective clears
-                undo_depth: _,                 // undo: drain()
+                session: _,                    // engine+host: emergency_reset() + host cleanup
+                detached_engine: _,            // engine: emergency_reset() when detached
                 transient: _,                  // transient: .reset()
                 passthrough_keys: _,           // config
                 security_policy: _,            // config
                 perf: _,                       // persistent
                 highlight_yank_duration_ms: _, // config
                 code_complete_enabled: _,      // config
-                clipboard: _,                  // config (stateless ZST)
             } = c;
         }
     }

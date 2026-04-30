@@ -28,10 +28,13 @@ impl GodotVimCore {
         }
 
         // Evict buffer state for editors freed since last attach to prevent
-        // unbounded growth of the per-editor buffer map.
+        // unbounded growth of the per-editor buffer map. Safe to call in
+        // either attached or detached state — no-ops when detached.
         if let Some(controller) = &mut self.controller {
-            log::trace!("attach: sweeping stale buffers before attaching #{}", new_id.to_i64());
-            controller.sweep_stale_buffers();
+            if controller.is_attached() {
+                log::trace!("attach: sweeping stale buffers before attaching #{}", new_id.to_i64());
+                controller.sweep_stale_buffers();
+            }
         }
 
         self.detach();
@@ -43,6 +46,13 @@ impl GodotVimCore {
         self.last_editor_id = Some(new_id);
 
         let mut editor = editor;
+
+        // Create the VimSession by pairing the detached engine with a new
+        // GodotHost wrapping this editor. Must happen before any method
+        // that accesses host state (restore_buffer, init_undo_tree, etc.).
+        if let Some(controller) = &mut self.controller {
+            controller.attach_session(editor.clone());
+        }
 
         // gui_input MUST be immediate -- deferred delivery would miss the
         // `set_input_as_handled()` window, letting keystrokes leak to Godot.
@@ -157,6 +167,7 @@ impl GodotVimCore {
             log::warn!("detach: editor no longer valid, skipping cleanup");
             if let Some(controller) = &mut self.controller {
                 controller.force_cleanup_without_editor();
+                controller.detach_session();
             }
             self.ui.reset_cached_state();
             return;
@@ -231,6 +242,7 @@ impl GodotVimCore {
             if !editor.is_instance_valid() {
                 log::warn!("detach: editor freed during mapping timeout resolution");
                 controller.force_cleanup_without_editor();
+                controller.detach_session();
                 self.ui.reset_cached_state();
                 return;
             }
@@ -244,6 +256,7 @@ impl GodotVimCore {
             if !editor.is_instance_valid() {
                 log::warn!("detach: editor freed during exit_mode_via_pipeline");
                 controller.force_cleanup_without_editor();
+                controller.detach_session();
                 self.ui.reset_cached_state();
                 return;
             }
@@ -269,6 +282,9 @@ impl GodotVimCore {
 
         if let Some(controller) = &mut self.controller {
             controller.save_buffer_engine_state(editor_id, &editor);
+            // Decompose the session: drop the GodotHost, reclaim the engine
+            // for re-use on the next attach.
+            controller.detach_session();
         }
 
         log::debug!("Detached from editor #{}", editor_id.to_i64());

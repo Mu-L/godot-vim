@@ -453,6 +453,46 @@ impl GodotHost {
     pub(crate) fn line_index(&self) -> &LineIndex {
         &self.line_index
     }
+
+    pub(crate) fn security_policy(&self) -> &SecurityPolicy {
+        &self.security_policy
+    }
+
+    pub(crate) fn highlight_yank_duration_ms(&self) -> u32 {
+        self.highlight_yank_duration_ms
+    }
+
+    pub(crate) fn clipboard(&mut self) -> &mut GodotClipboard {
+        &mut self.clipboard
+    }
+
+    /// Split borrow: return mutable references to state and undo_depth
+    /// simultaneously, along with the security policy and other config
+    /// needed by `ProcessContext`.
+    ///
+    /// This enables the controller's `as_process_context()` to build a
+    /// `ProcessContext` from VimSession's internals without conflicting borrows.
+    pub(crate) fn split_borrow_for_context(
+        &mut self,
+    ) -> HostContextBorrow<'_> {
+        HostContextBorrow {
+            state: &mut self.state,
+            undo_depth: &mut self.undo_depth,
+            security_policy: &self.security_policy,
+            highlight_yank_duration_ms: self.highlight_yank_duration_ms,
+            clipboard: &mut self.clipboard,
+        }
+    }
+}
+
+/// Simultaneously borrowed fields from [`GodotHost`] for building a
+/// [`crate::controller::context::ProcessContext`].
+pub(crate) struct HostContextBorrow<'a> {
+    pub(crate) state: &'a mut ShellState,
+    pub(crate) undo_depth: &'a mut UndoDepth,
+    pub(crate) security_policy: &'a SecurityPolicy,
+    pub(crate) highlight_yank_duration_ms: u32,
+    pub(crate) clipboard: &'a mut GodotClipboard,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
