@@ -762,8 +762,10 @@ impl VimController {
             }
         }
 
-        // Check if effects were produced by checking if cursor or mode changed.
-        // VimSession handles effect application internally via GodotHost::apply_effects.
+        // Ensure undo groups are balanced after mouse selection processing.
+        let mode = session.engine().mode();
+        session.host_mut().ensure_undo_balanced(mode);
+
         result.consumed
     }
 }

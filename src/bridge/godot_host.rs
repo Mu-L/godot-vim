@@ -157,6 +157,15 @@ impl VimHost for GodotHost {
             return;
         }
 
+        // Track the last mode change so handle_request sees the current mode.
+        // VimSession delivers effects BEFORE calling handle_request, so updating
+        // current_mode here ensures it reflects the post-effects state.
+        for effect in effects {
+            if let Effect::SetMode { mode, .. } = effect {
+                self.current_mode = *mode;
+            }
+        }
+
         let effects_vec: Vec<Effect> = effects.to_vec();
 
         let auto_brace = if self.auto_brace_eligible {
@@ -200,6 +209,7 @@ impl VimHost for GodotHost {
             text_cache,
             line_index,
             cursor_offset,
+            visual_selection,
             ..
         } = self;
 
@@ -241,6 +251,12 @@ impl VimHost for GodotHost {
             editor.get_caret_line(),
             editor.get_caret_column(),
         );
+
+        // Sync visual selection from ShellState buffer to host field.
+        // VimSession::build_context calls host.selection() on every keystroke
+        // and drain iteration — this must reflect the live selection state.
+        *visual_selection = state.buffer_ref(editor_id)
+            .and_then(|b| b.visual().cloned());
     }
 
     fn handle_request(&mut self, request: &HostRequest) -> Option<HostResult> {

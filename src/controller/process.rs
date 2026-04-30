@@ -399,6 +399,13 @@ impl VimController {
             }
             _ => {} // Consume all other keys while stepping
         }
+        // Step effects bypass GodotHost::apply_effects, so the text cache
+        // may be stale. Force a rebuild on the next access.
+        if matches!(ch, Some('n') | Some('c')) {
+            if let Some(session) = self.session.as_mut() {
+                session.host_mut().invalidate_cache();
+            }
+        }
         true
     }
 }
