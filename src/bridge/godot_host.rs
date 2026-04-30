@@ -41,6 +41,8 @@ pub(crate) enum PendingUiAction {
     SourceConfigFile,
     ShowUndoTree,
     Vimdebug(compact_str::CompactString),
+    PerfReport,
+    PerfReset,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -82,6 +84,7 @@ pub(crate) struct GodotHost {
     scrolloff: i32,
     highlight_yank_duration_ms: u32,
     auto_brace_eligible: bool,
+    engine_auto_pairs_active: bool,
 
     // ── Deferred actions for controller ─────────────────────────────────
     pending_ui_actions: Vec<PendingUiAction>,
@@ -165,11 +168,14 @@ impl VimHost for GodotHost {
             Some(self.line_index.clone())
         };
 
-        let auto_brace_snapshot = if self.auto_brace_eligible {
+        let mut auto_brace_snapshot = if self.auto_brace_eligible {
             AutoBraceSnapshot::from_editor(&self.editor)
         } else {
             AutoBraceSnapshot::disabled()
         };
+        if self.engine_auto_pairs_active {
+            auto_brace_snapshot.filter_engine_owned_pairs();
+        }
 
         let editor_id = self.editor.instance_id();
         let scrolloff = self.scrolloff;
@@ -290,6 +296,20 @@ impl GodotHost {
                         message: None,
                     };
                 }
+                "perf" => {
+                    self.pending_ui_actions.push(PendingUiAction::PerfReport);
+                    return HostResult::Success {
+                        id: request.id(),
+                        message: None,
+                    };
+                }
+                "perf reset" => {
+                    self.pending_ui_actions.push(PendingUiAction::PerfReset);
+                    return HostResult::Success {
+                        id: request.id(),
+                        message: None,
+                    };
+                }
                 cmd_str if cmd_str.starts_with("vimdebug") => {
                     self.pending_ui_actions.push(PendingUiAction::Vimdebug(
                         compact_str::CompactString::from(cmd_str),
@@ -304,13 +324,29 @@ impl GodotHost {
         }
 
         let mode_str = mode_to_vim_string(self.current_mode);
-        crate::host::execute(
+        let result = crate::host::execute(
             request,
             &mut self.editor,
             &self.security_policy,
             mode_str,
             &self.clipboard,
-        )
+        );
+
+        // Sandbox ReadConfigFile results to filter dangerous commands.
+        if self.security_policy.project_vimrc == ProjectVimrc::Sandbox {
+            if let HostRequest::ReadConfigFile { .. } = request {
+                if let HostResult::Data { id, data, offset } = result {
+                    let sandboxed = crate::config::sandbox::sandbox_config_text(data.as_str());
+                    return HostResult::Data {
+                        id,
+                        data: compact_str::CompactString::from(sandboxed),
+                        offset,
+                    };
+                }
+            }
+        }
+
+        result
     }
 }
 
@@ -357,6 +393,7 @@ impl GodotHost {
             scrolloff: 0,
             highlight_yank_duration_ms: 150,
             auto_brace_eligible: false,
+            engine_auto_pairs_active: false,
             pending_ui_actions: Vec::new(),
         }
     }
@@ -398,6 +435,10 @@ impl GodotHost {
 
     pub(crate) fn set_auto_brace_eligible(&mut self, eligible: bool) {
         self.auto_brace_eligible = eligible;
+    }
+
+    pub(crate) fn set_engine_auto_pairs_active(&mut self, active: bool) {
+        self.engine_auto_pairs_active = active;
     }
 
     pub(crate) fn set_scrolloff(&mut self, scrolloff: i32) {
