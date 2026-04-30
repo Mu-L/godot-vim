@@ -66,6 +66,51 @@ impl<'a> GodotFoldProvider<'a> {
     }
 }
 
+/// Owned variant of [`GodotFoldProvider`] for use as a field in [`GodotHost`].
+///
+/// `Gd::clone()` is a cheap refcount bump, so owning the handle has
+/// negligible cost. The owned variant satisfies `VimHost::providers()`
+/// which returns references tied to `&self`.
+pub(crate) struct OwnedGodotFoldProvider {
+    editor: Gd<CodeEdit>,
+}
+
+impl OwnedGodotFoldProvider {
+    #[must_use]
+    pub(crate) fn new(editor: Gd<CodeEdit>) -> Self {
+        Self { editor }
+    }
+}
+
+impl FoldProvider for OwnedGodotFoldProvider {
+    fn next_visible_line(&self, line: LineNumber, direction: Direction) -> LineNumber {
+        if !self.is_folded(line) {
+            return line;
+        }
+        let line_i32 = codec::usize_to_i32(usize::from(line));
+        let result = match direction {
+            Direction::Forward => self.editor.move_down_visible(line_i32),
+            Direction::Backward => self.editor.move_up_visible(line_i32),
+            _ => {
+                log::warn!("Unknown Direction variant {:?} in next_visible_line — treating as Forward", direction);
+                self.editor.move_down_visible(line_i32)
+            }
+        };
+        LineNumber::from(codec::i32_to_usize(result))
+    }
+
+    fn is_folded(&self, line: LineNumber) -> bool {
+        let line_i32 = codec::usize_to_i32(usize::from(line));
+        let line_count = self.editor.get_line_count();
+        if line_i32 >= line_count {
+            log::trace!("is_folded: line {} >= count {}", line_i32, line_count);
+            return false;
+        }
+        let offset = self.editor.get_next_visible_line_offset_from(line_i32, 1);
+        offset > 1
+    }
+}
+
 /// Adapts Godot's CodeEdit into vim-core's `IndentProvider` trait.
 ///
 /// Implements a simple heuristic for `o`/`O` commands: if the current line
@@ -126,6 +171,59 @@ impl<'a> GodotIndentProvider<'a> {
     #[must_use]
     pub(crate) fn new(editor: &'a Gd<CodeEdit>) -> Self {
         Self { editor }
+    }
+}
+
+/// Owned variant of [`GodotIndentProvider`] for use as a field in [`GodotHost`].
+pub(crate) struct OwnedGodotIndentProvider {
+    editor: Gd<CodeEdit>,
+}
+
+// SAFETY: same justification as GodotIndentProvider. Godot is single-threaded;
+// the Send bound on IndentProvider is for hypothetical multi-threaded hosts.
+unsafe impl Send for OwnedGodotIndentProvider {}
+
+impl OwnedGodotIndentProvider {
+    #[must_use]
+    pub(crate) fn new(editor: Gd<CodeEdit>) -> Self {
+        Self { editor }
+    }
+}
+
+impl IndentProvider for OwnedGodotIndentProvider {
+    fn indent_for_new_line(&self, line: LineNumber) -> compact_str::CompactString {
+        use compact_str::CompactString;
+
+        let line_i32 = codec::usize_to_i32(usize::from(line));
+        let line_count = self.editor.get_line_count();
+        if line_i32 >= line_count {
+            return CompactString::default();
+        }
+
+        let line_text = self.editor.get_line(line_i32).to_string();
+
+        let indent: CompactString = line_text.chars().take_while(|&c| c == ' ' || c == '\t').collect();
+
+        let trimmed = line_text.trim_end();
+        let last_char_col = codec::usize_to_i32(trimmed.chars().count().saturating_sub(1));
+        let should_indent = !trimmed.is_empty()
+            && (trimmed.ends_with(':')
+                || trimmed.ends_with('{')
+                || trimmed.ends_with('(')
+                || trimmed.ends_with('['))
+            && self.editor.is_in_string_ex(line_i32).column(last_char_col).done() == -1;
+
+        if should_indent {
+            let use_spaces = self.editor.is_indent_using_spaces();
+            let indent_size = self.editor.safe_indent_size();
+            if use_spaces {
+                compact_str::format_compact!("{indent}{}", " ".repeat(indent_size))
+            } else {
+                compact_str::format_compact!("{indent}\t")
+            }
+        } else {
+            indent
+        }
     }
 }
 
