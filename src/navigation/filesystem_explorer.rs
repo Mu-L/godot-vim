@@ -28,8 +28,6 @@ pub(crate) struct FileSystemExplorer {
     prompt_label: Option<Gd<Label>>,
     prompt_container: Option<Gd<Node>>,
     prompt_mode: PromptMode,
-    cached_tree: Option<Gd<Tree>>,
-    cached_file_list: Option<Gd<ItemList>>,
     active_control: Option<Gd<Control>>,
     callable_submitted: Option<Callable>,
     callable_gui_input: Option<Callable>,
@@ -42,8 +40,6 @@ impl FileSystemExplorer {
             prompt_label: None,
             prompt_container: None,
             prompt_mode: PromptMode::Inactive,
-            cached_tree: None,
-            cached_file_list: None,
             active_control: None,
             callable_submitted: None,
             callable_gui_input: None,
@@ -68,8 +64,6 @@ impl FileSystemExplorer {
         self.prompt.take();
         self.prompt_label.take();
         self.prompt_mode = PromptMode::Inactive;
-        self.cached_tree = None;
-        self.cached_file_list = None;
         self.active_control = None;
     }
 
@@ -315,7 +309,7 @@ impl FileSystemExplorer {
         if success {
             self.dismiss_prompt();
         }
-        // On failure, execute_create/rename already called show_prompt_error
+        // On failure, execute_create already called show_prompt_error
         // and restored prompt_mode, so the prompt stays open for retry.
     }
 
@@ -368,16 +362,6 @@ impl FileSystemExplorer {
     }
 
     fn validate_cache(&mut self) {
-        if let Some(ref tree) = self.cached_tree {
-            if !tree.is_instance_valid() || !tree.is_inside_tree() {
-                self.cached_tree = None;
-            }
-        }
-        if let Some(ref list) = self.cached_file_list {
-            if !list.is_instance_valid() || !list.is_inside_tree() {
-                self.cached_file_list = None;
-            }
-        }
         if let Some(ref ctrl) = self.active_control {
             if !ctrl.is_instance_valid() {
                 self.active_control = None;
