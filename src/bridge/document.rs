@@ -21,6 +21,7 @@ pub(crate) struct GodotDocument<'a> {
     line_index: codec::LineIndex,
 }
 
+#[allow(dead_code)] // Was used by old manual pipeline; OwnedGodotHost now owns the document.
 impl<'a> GodotDocument<'a> {
     #[must_use]
     pub(crate) fn new(text: &'a str) -> Self {
@@ -77,12 +78,19 @@ impl Document for GodotDocument<'_> {
     }
 
     fn offset_to_pos(&self, offset: Offset) -> Option<Position> {
-        let lc = self.line_index.offset_to_line_col(self.text, offset.get())?;
-        Some(Position::from_raw(i32_to_usize(lc.line), i32_to_usize(lc.col)))
+        let lc = self
+            .line_index
+            .offset_to_line_col(self.text, offset.get())?;
+        Some(Position::from_raw(
+            i32_to_usize(lc.line),
+            i32_to_usize(lc.col),
+        ))
     }
 
     fn pos_to_offset(&self, pos: Position) -> Option<Offset> {
-        let offset = self.line_index.line_col_to_offset(self.text, pos.line().get(), pos.col().get())?;
+        let offset =
+            self.line_index
+                .line_col_to_offset(self.text, pos.line().get(), pos.col().get())?;
         Some(Offset::new(offset))
     }
 }
@@ -159,7 +167,9 @@ mod tests {
         assert_eq!(GodotDocument::new("\n\n").line_count(), 3);
     }
 
-    fn o(n: usize) -> Offset { Offset::new(n) }
+    fn o(n: usize) -> Offset {
+        Offset::new(n)
+    }
 
     #[test]
     fn offset_to_pos_start() {
@@ -372,7 +382,8 @@ mod tests {
             if let Some(pos) = doc.offset_to_pos(o(offset)) {
                 let back = doc.pos_to_offset(pos).unwrap();
                 assert_eq!(
-                    back, o(offset),
+                    back,
+                    o(offset),
                     "roundtrip failed at offset {offset} (pos {pos:?})"
                 );
             }

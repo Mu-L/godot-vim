@@ -46,7 +46,11 @@ fn extract_word_at_col(line_text: &str, col: usize) -> Option<&str> {
     }
 
     let word = &line_text[start..end];
-    if word.is_empty() { None } else { Some(word) }
+    if word.is_empty() {
+        None
+    } else {
+        Some(word)
+    }
 }
 
 /// Extract the word under the cursor and pass it to `action`.
@@ -61,7 +65,13 @@ fn with_word_under_cursor(
 
     if let Some(word) = extract_word_at_col(&line_text, i32_to_usize(col)) {
         action(editor, word, line, col);
-        log::debug!("{}: signal emitted for '{}' at {}:{}", label, word, line, col);
+        log::debug!(
+            "{}: signal emitted for '{}' at {}:{}",
+            label,
+            word,
+            line,
+            col
+        );
     } else {
         log::debug!("{}: no symbol under cursor at {}:{}", label, line, col);
     }
@@ -69,7 +79,7 @@ fn with_word_under_cursor(
 
 /// `gd`: emit Godot's `symbol_lookup` signal, which `ScriptTextEditor`
 /// handles by performing the actual LSP lookup and navigation.
-pub(super) fn handle_goto_definition(editor: &mut impl NavigationCapable) {
+pub(crate) fn handle_goto_definition(editor: &mut impl NavigationCapable) {
     with_word_under_cursor(editor, "gd", |ed, word, line, col| {
         ed.emit_symbol_lookup(word, line, col);
     });
@@ -78,7 +88,7 @@ pub(super) fn handle_goto_definition(editor: &mut impl NavigationCapable) {
 /// `K`: show documentation tooltip for the symbol under the cursor.
 /// Synthesizes Godot's `SHOW_TOOLTIP_AT_CARET` shortcut event to bypass
 /// the `is_anything_pressed()` guard that blocks signal-based tooltips.
-pub(super) fn handle_show_documentation(editor: &mut impl NavigationCapable) {
+pub(crate) fn handle_show_documentation(editor: &mut impl NavigationCapable) {
     with_word_under_cursor(editor, "K", |ed, word, line, col| {
         ed.show_documentation_tooltip(word, line, col);
     });

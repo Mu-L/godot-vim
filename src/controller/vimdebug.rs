@@ -58,7 +58,7 @@ impl VimdebugState {
             // Exhaustive destructure: adding a new field to VimdebugState
             // causes a compile error here until it is handled.
             let Self {
-                mode: _,          // just set above
+                mode: _, // just set above
                 provenance,
                 effects,
                 range,
@@ -85,18 +85,21 @@ impl VimdebugState {
         self.range.clone()
     }
 
+    #[allow(dead_code)] // Called when vimdebug watch annotations are wired to the new pipeline.
     pub(crate) fn capture_provenance(&mut self, provenance: Option<&str>) {
         if self.is_enabled() {
             self.provenance = provenance.map(CompactString::from);
         }
     }
 
+    #[allow(dead_code)] // Called when vimdebug watch annotations are wired to the new pipeline.
     pub(crate) fn capture_effects_summary(&mut self, summary: CompactString) {
         if self.is_enabled() {
             self.effects = Some(summary);
         }
     }
 
+    #[allow(dead_code)] // Called when vimdebug watch annotations are wired to the new pipeline.
     pub(crate) fn capture_range(&mut self, range: Option<MatchRange>) {
         if self.is_enabled() {
             self.range = range;
@@ -109,10 +112,14 @@ impl VimdebugState {
         self.range = None;
     }
 
+    #[allow(dead_code)] // Used by vimdebug step mode (currently disabled in new pipeline).
     pub(crate) fn load_step_effects(&mut self, descriptions: Vec<CompactString>) {
         self.step_pending = descriptions
             .into_iter()
-            .map(|d| StepEffect { description: d, applied: false })
+            .map(|d| StepEffect {
+                description: d,
+                applied: false,
+            })
             .collect();
         self.step_index = 0;
     }
@@ -178,7 +185,9 @@ impl VimdebugState {
         let display_idx = if current < total { current + 1 } else { total };
         Some(compact_str::format_compact!(
             "[{}/{}] {} | n:next p:prev c:all q:quit",
-            display_idx, total, desc
+            display_idx,
+            total,
+            desc
         ))
     }
 }

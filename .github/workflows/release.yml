@@ -12,7 +12,7 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Configure private repo access
         shell: bash
@@ -20,25 +20,31 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           key: linux
 
       - run: cargo build --release --locked --target x86_64-unknown-linux-gnu
 
-      - uses: actions/upload-artifact@v4
+      - name: Stage artifact
+        run: |
+          mkdir -p staging
+          cp target/x86_64-unknown-linux-gnu/release/libgodot_vim.so staging/
+          sha256sum staging/libgodot_vim.so | awk '{print $1 "  libgodot_vim.so"}' > staging/libgodot_vim.so.sha256
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: libgodot_vim.so
-          path: target/x86_64-unknown-linux-gnu/release/libgodot_vim.so
+          path: staging/*
 
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Configure private repo access
         shell: bash
@@ -46,25 +52,32 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           key: windows
 
       - run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
-      - uses: actions/upload-artifact@v4
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp target/x86_64-pc-windows-msvc/release/godot_vim.dll staging/
+          sha256sum staging/godot_vim.dll | awk '{print $1 "  godot_vim.dll"}' > staging/godot_vim.dll.sha256
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: godot_vim.dll
-          path: target/x86_64-pc-windows-msvc/release/godot_vim.dll
+          path: staging/*
 
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Configure private repo access
         shell: bash
@@ -72,11 +85,11 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           key: macos
 
@@ -93,36 +106,51 @@ jobs:
             target/x86_64-apple-darwin/release/libgodot_vim.dylib \
             -output libgodot_vim.dylib
 
-      - uses: actions/upload-artifact@v4
+      - name: Stage artifact
+        run: |
+          mkdir -p staging
+          cp libgodot_vim.dylib staging/
+          shasum -a 256 staging/libgodot_vim.dylib > staging/libgodot_vim.dylib.sha256
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: libgodot_vim.dylib
-          path: libgodot_vim.dylib
+          path: staging/*
 
   release:
     needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - name: Configure private repo access
+        shell: bash
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: artifacts
+          merge-multiple: true
 
       - name: Assemble addon
         run: |
           mkdir -p addons/godot_vim/bin
-          cp artifacts/libgodot_vim.so/libgodot_vim.so addons/godot_vim/bin/
-          cp artifacts/godot_vim.dll/godot_vim.dll addons/godot_vim/bin/
-          cp artifacts/libgodot_vim.dylib/libgodot_vim.dylib addons/godot_vim/bin/
+          cp artifacts/libgodot_vim.so addons/godot_vim/bin/
+          cp artifacts/godot_vim.dll addons/godot_vim/bin/
+          cp artifacts/libgodot_vim.dylib addons/godot_vim/bin/
 
       - name: VirusTotal Scan
         id: vt
-        uses: crazy-max/ghaction-virustotal@v4
+        uses: crazy-max/ghaction-virustotal@d34968c958ae283fe976efed637081b9f9dcf74f  # v4
         with:
           vt_api_key: ${{ secrets.VT_API_KEY }}
           request_rate: 4
@@ -130,6 +158,16 @@ jobs:
             addons/godot_vim/bin/libgodot_vim.so
             addons/godot_vim/bin/godot_vim.dll
             addons/godot_vim/bin/libgodot_vim.dylib
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32  # v4.1.0
+        with:
+          subject-path: 'addons/godot_vim/bin/*'
+
+      - name: Generate SBOM
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --format json --override-filename godot-vim-sbom.cdx
 
       - name: Generate release body
         id: body
@@ -139,101 +177,14 @@ jobs:
         run: |
           set -eu
 
-          # Find previous release tag (most recent v* tag, excluding current)
           PREV_TAG=$(git tag --list "v*" --sort=-version:refname | grep -vFx "$VERSION" | head -1 || true)
           if [ -z "$PREV_TAG" ]; then
             PREV_TAG=$(git rev-list --max-parents=0 HEAD)
-            echo "No previous tag found, using root commit: $PREV_TAG"
-          else
-            echo "Previous tag: $PREV_TAG"
           fi
 
-          # Accumulator files (safer than bash string concat with newlines)
-          FEATURES_FILE=$(mktemp)
-          FIXES_FILE=$(mktemp)
-          PERF_FILE=$(mktemp)
-          BREAKING_FILE=$(mktemp)
-
-          # Parse commits between PREV_TAG and HEAD
-          while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            hash="${line%% *}"
-            subject="${line#* }"
-
-            # BREAKING CHANGE detection in commit body
-            body=$(git show --no-patch --format="%B" "$hash")
-            if echo "$body" | grep -qE "^BREAKING CHANGE:|^BREAKING:"; then
-              breaking_line=$(echo "$body" | grep -E "^BREAKING CHANGE:|^BREAKING:" | head -1 | sed -E 's/^BREAKING( CHANGE)?:[[:space:]]*//')
-              echo "- ${breaking_line}" >> "$BREAKING_FILE"
-            fi
-
-            # Parse conventional commit type and format entry
-            case "$subject" in
-              feat\(*\):*)
-                scope=$(printf '%s' "$subject" | sed -E 's/^feat\(([^)]+)\):.*/\1/')
-                msg=$(printf '%s' "$subject" | sed -E 's/^feat\([^)]+\):[[:space:]]*//')
-                echo "- **${scope}:** ${msg}" >> "$FEATURES_FILE"
-                ;;
-              feat:*)
-                msg=$(printf '%s' "$subject" | sed -E 's/^feat:[[:space:]]*//')
-                echo "- ${msg}" >> "$FEATURES_FILE"
-                ;;
-              fix\(*\):*)
-                scope=$(printf '%s' "$subject" | sed -E 's/^fix\(([^)]+)\):.*/\1/')
-                msg=$(printf '%s' "$subject" | sed -E 's/^fix\([^)]+\):[[:space:]]*//')
-                echo "- **${scope}:** ${msg}" >> "$FIXES_FILE"
-                ;;
-              fix:*)
-                msg=$(printf '%s' "$subject" | sed -E 's/^fix:[[:space:]]*//')
-                echo "- ${msg}" >> "$FIXES_FILE"
-                ;;
-              perf\(*\):*)
-                scope=$(printf '%s' "$subject" | sed -E 's/^perf\(([^)]+)\):.*/\1/')
-                msg=$(printf '%s' "$subject" | sed -E 's/^perf\([^)]+\):[[:space:]]*//')
-                echo "- **${scope}:** ${msg}" >> "$PERF_FILE"
-                ;;
-              perf:*)
-                msg=$(printf '%s' "$subject" | sed -E 's/^perf:[[:space:]]*//')
-                echo "- ${msg}" >> "$PERF_FILE"
-                ;;
-              # Silently drop: docs, ci, chore, test, refactor, style, build,
-              # Merge commits, Bump version commits, and plain commits.
-            esac
-          done < <(git log "${PREV_TAG}..HEAD" --format="%H %s")
-
-          # Assemble the body
           {
             echo 'RELEASE_BODY<<BODYEOF'
 
-            if [ -s "$BREAKING_FILE" ]; then
-              echo "## Breaking Changes"
-              echo ""
-              cat "$BREAKING_FILE"
-              echo ""
-            fi
-
-            if [ -s "$FEATURES_FILE" ]; then
-              echo "## Features"
-              echo ""
-              cat "$FEATURES_FILE"
-              echo ""
-            fi
-
-            if [ -s "$FIXES_FILE" ]; then
-              echo "## Bug Fixes"
-              echo ""
-              cat "$FIXES_FILE"
-              echo ""
-            fi
-
-            if [ -s "$PERF_FILE" ]; then
-              echo "## Performance"
-              echo ""
-              cat "$PERF_FILE"
-              echo ""
-            fi
-
-            # VirusTotal section (always present — binaries are always scanned)
             if [ -n "${VT_ANALYSIS:-}" ]; then
               echo "## VirusTotal Scan"
               echo ""
@@ -250,9 +201,6 @@ jobs:
             echo 'BODYEOF'
           } >> "$GITHUB_OUTPUT"
 
-          # Cleanup
-          rm -f "$FEATURES_FILE" "$FIXES_FILE" "$PERF_FILE" "$BREAKING_FILE"
-
       - name: Create addon zip
         env:
           VERSION: ${{ inputs.version }}
@@ -268,8 +216,9 @@ jobs:
           zip -r "godot-vim-${VERSION}.zip" "$STAGE"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
         with:
+          draft: true
           tag_name: ${{ inputs.version }}
           name: GodotVim ${{ inputs.version }}
           body: ${{ steps.body.outputs.RELEASE_BODY }}
@@ -278,3 +227,7 @@ jobs:
             addons/godot_vim/bin/libgodot_vim.so
             addons/godot_vim/bin/godot_vim.dll
             addons/godot_vim/bin/libgodot_vim.dylib
+            artifacts/libgodot_vim.so.sha256
+            artifacts/godot_vim.dll.sha256
+            artifacts/libgodot_vim.dylib.sha256
+            godot-vim-sbom.cdx.json

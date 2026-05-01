@@ -7,8 +7,8 @@ use godot::prelude::*;
 
 use crate::bridge::code_edit_ext::CodeEditExt;
 
-use super::GodotVimCore;
 use super::signals::{connect_deferred, connect_immediate, safe_disconnect};
+use super::GodotVimCore;
 
 const SIG_GUI_INPUT: &str = "gui_input";
 const SIG_CARET_CHANGED: &str = "caret_changed";
@@ -28,10 +28,16 @@ impl GodotVimCore {
         }
 
         // Evict buffer state for editors freed since last attach to prevent
-        // unbounded growth of the per-editor buffer map.
+        // unbounded growth of the per-editor buffer map. Safe to call in
+        // either attached or detached state — no-ops when detached.
         if let Some(controller) = &mut self.controller {
-            log::trace!("attach: sweeping stale buffers before attaching #{}", new_id.to_i64());
-            controller.sweep_stale_buffers();
+            if controller.is_attached() {
+                log::trace!(
+                    "attach: sweeping stale buffers before attaching #{}",
+                    new_id.to_i64()
+                );
+                controller.sweep_stale_buffers();
+            }
         }
 
         self.detach();
@@ -44,6 +50,13 @@ impl GodotVimCore {
 
         let mut editor = editor;
 
+        // Create the VimSession by pairing the detached engine with a new
+        // GodotHost wrapping this editor. Must happen before any method
+        // that accesses host state (restore_buffer, init_undo_tree, etc.).
+        if let Some(controller) = &mut self.controller {
+            controller.attach_session(editor.clone());
+        }
+
         // gui_input MUST be immediate -- deferred delivery would miss the
         // `set_input_as_handled()` window, letting keystrokes leak to Godot.
         let gui_callable = self.base().callable("handle_gui_input");
@@ -54,10 +67,8 @@ impl GodotVimCore {
         let caret_callable = self.base().callable("on_caret_changed");
         connect_deferred(&mut editor, SIG_CARET_CHANGED, &caret_callable);
 
-        // Catches external text changes (Find-and-Replace, plugins, auto-format)
-        // that bypass the Vim keystroke pipeline. Vim-driven edits already
-        // invalidate the cache inline, so this is harmless but necessary for
-        // external edits.
+        // Godot requires the connected handler to exist; the handler is a
+        // no-op (engine-handled insert keeps state in sync via effects).
         let text_changed_callable = self.base().callable("on_text_changed");
         connect_deferred(&mut editor, SIG_TEXT_CHANGED, &text_changed_callable);
 
@@ -157,6 +168,7 @@ impl GodotVimCore {
             log::warn!("detach: editor no longer valid, skipping cleanup");
             if let Some(controller) = &mut self.controller {
                 controller.force_cleanup_without_editor();
+                controller.detach_session();
             }
             self.ui.reset_cached_state();
             return;
@@ -231,6 +243,7 @@ impl GodotVimCore {
             if !editor.is_instance_valid() {
                 log::warn!("detach: editor freed during mapping timeout resolution");
                 controller.force_cleanup_without_editor();
+                controller.detach_session();
                 self.ui.reset_cached_state();
                 return;
             }
@@ -244,6 +257,7 @@ impl GodotVimCore {
             if !editor.is_instance_valid() {
                 log::warn!("detach: editor freed during exit_mode_via_pipeline");
                 controller.force_cleanup_without_editor();
+                controller.detach_session();
                 self.ui.reset_cached_state();
                 return;
             }
@@ -269,6 +283,9 @@ impl GodotVimCore {
 
         if let Some(controller) = &mut self.controller {
             controller.save_buffer_engine_state(editor_id, &editor);
+            // Decompose the session: drop the GodotHost, reclaim the engine
+            // for re-use on the next attach.
+            controller.detach_session();
         }
 
         log::debug!("Detached from editor #{}", editor_id.to_i64());
@@ -288,7 +305,9 @@ fn sync_commentstring_from_editor(
     let delimiters = editor.get_comment_delimiters();
     let mut best: Option<String> = None;
     for i in 0..delimiters.len() {
-        let Some(gstr) = delimiters.get(i) else { continue };
+        let Some(gstr) = delimiters.get(i) else {
+            continue;
+        };
         let s = gstr.to_string();
         // Block comments contain a space separator (e.g. "/* */") -- skip.
         if s.contains(' ') {
@@ -300,7 +319,11 @@ fn sync_commentstring_from_editor(
     }
     if let Some(delim) = best {
         let cs = format!("{delim} %s");
-        log::debug!("sync_commentstring: '{}' for editor #{}", cs, editor.instance_id().to_i64());
+        log::debug!(
+            "sync_commentstring: '{}' for editor #{}",
+            cs,
+            editor.instance_id().to_i64()
+        );
         controller.set_commentstring(&cs);
     } else {
         log::trace!("sync_commentstring: no line comment delimiter found, keeping default");
@@ -323,6 +346,9 @@ pub(super) fn sync_indent_from_editor(
 
     log::debug!(
         "sync_indent: expandtab={} shiftwidth={} tabstop={} for editor #{}",
-        use_spaces, indent_size, tab_size, editor.instance_id().to_i64(),
+        use_spaces,
+        indent_size,
+        tab_size,
+        editor.instance_id().to_i64(),
     );
 }

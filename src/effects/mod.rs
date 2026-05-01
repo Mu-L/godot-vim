@@ -12,13 +12,14 @@ pub(crate) mod cursor;
 pub(crate) mod dispatch;
 pub(crate) mod messages;
 pub(crate) mod mode;
-mod navigation;
+pub(crate) mod navigation;
 mod registers;
 pub(crate) mod scroll;
 pub(crate) mod search;
 pub(crate) mod text;
 pub(crate) mod undo;
 
-pub(crate) use compound::{CompoundAction, LineNumber, WindowNavAction};
+pub(crate) use compound::WindowNavAction;
+#[allow(unused_imports)] // Used by testing/bridge_tests.
 pub(crate) use dispatch::{dispatch, DispatchContext};
 pub(crate) use undo::UndoDepth;
