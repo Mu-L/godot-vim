@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "godot-vim"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "bitflags",
  "compact_str",
@@ -763,6 +763,16 @@ dependencies = [
  "thiserror",
  "unicode-segmentation",
  "unicode-width",
+ "vim-text",
+]
+
+[[package]]
+name = "vim-text"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "bitflags",
+ "memchr",
 ]
 
 [[package]]

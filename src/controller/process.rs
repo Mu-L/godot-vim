@@ -112,6 +112,21 @@ impl VimController {
         // ── Vimdebug: capture provenance before engine process ──────────
         self.transient.vimdebug.clear_captures();
 
+        // ── Clipboard sync: pre-populate + register for clipboard=unnamedplus ──
+        {
+            let session = self
+                .session
+                .as_mut()
+                .expect("process_cycle: requires active session");
+            let opts = session.engine().resolved_options();
+            if opts.clipboard_has_unnamedplus() || opts.clipboard_has_unnamed() {
+                let text = godot::classes::DisplayServer::singleton()
+                    .clipboard_get()
+                    .to_string();
+                session.sync_clipboard(&text);
+            }
+        }
+
         // ── CORE: session.process_key(key) ──────────────────────────────
         let result = {
             let session = self
