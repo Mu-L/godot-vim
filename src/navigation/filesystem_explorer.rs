@@ -6,8 +6,8 @@
 //! the generic dock navigation in `dock.rs`.
 
 use godot::classes::{
-    Control, DirAccess, DisplayServer, EditorInterface, FileAccess, HBoxContainer,
-    InputEventKey, InputEventShortcut, ItemList, Label, LineEdit, Node, Tree, VBoxContainer,
+    Control, DirAccess, DisplayServer, EditorInterface, FileAccess, HBoxContainer, Input,
+    InputEventKey, ItemList, Label, LineEdit, Node, Tree, VBoxContainer,
 };
 use godot::global::Key;
 use godot::prelude::*;
@@ -421,12 +421,14 @@ fn parent_dir(path: &str) -> String {
     }
 }
 
-/// Trigger a Godot editor shortcut by its registered path.
+/// Trigger a FileSystem dock shortcut by its registered path.
 ///
-/// Looks up the `Shortcut` from `EditorSettings`, wraps it in an
-/// `InputEventShortcut`, and pushes it into the editor viewport's input
-/// pipeline. `Shortcut::matches_event()` uses pointer identity for
-/// `InputEventShortcut`, so this works regardless of the user's keybinding.
+/// Looks up the `Shortcut` from `EditorSettings`, extracts the first
+/// `InputEventKey` from its events array, and injects it via
+/// `Input::parse_input_event`. We send an `InputEventKey` (not
+/// `InputEventShortcut`) because `FileSystemDock::_tree_gui_input`
+/// casts the event to `InputEventKey` first — `InputEventShortcut`
+/// would fail the cast and be silently ignored.
 fn trigger_dock_shortcut(path: &str) {
     let editor_iface = EditorInterface::singleton();
     let Some(mut settings) = editor_iface.get_editor_settings() else {
@@ -437,17 +439,28 @@ fn trigger_dock_shortcut(path: &str) {
         return;
     };
 
-    let mut event: Gd<InputEventShortcut> = InputEventShortcut::new_gd();
-    event.set_shortcut(&shortcut);
+    let events = shortcut.get_events();
+    for i in 0..events.len() {
+        let Some(variant) = events.get(i) else {
+            continue;
+        };
+        let Ok(source) = variant.try_to::<Gd<InputEventKey>>() else {
+            continue;
+        };
 
-    let Some(mut viewport) = editor_iface
-        .get_base_control()
-        .and_then(|ctrl| ctrl.get_viewport())
-    else {
+        let mut event = InputEventKey::new_gd();
+        event.set_keycode(source.get_keycode());
+        event.set_physical_keycode(source.get_physical_keycode());
+        event.set_ctrl_pressed(source.is_ctrl_pressed());
+        event.set_shift_pressed(source.is_shift_pressed());
+        event.set_alt_pressed(source.is_alt_pressed());
+        event.set_meta_pressed(source.is_meta_pressed());
+        event.set_pressed(true);
+        Input::singleton().parse_input_event(&event);
         return;
-    };
+    }
 
-    viewport.call_deferred("push_input", &[event.to_variant(), false.to_variant()]);
+    log::warn!("filesystem_explorer: no InputEventKey in shortcut '{}'", path);
 }
 
 fn get_selected_path(control: &Gd<Control>, kind: DockKind) -> Option<String> {
