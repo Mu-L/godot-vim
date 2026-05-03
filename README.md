@@ -18,6 +18,10 @@
   <img src="https://img.shields.io/github/license/hmdfrds/godot-vim" alt="License">
 </p>
 
+<p align="center">
+  <img src="media/hero.gif" alt="GodotVim Demo" width="800" />
+</p>
+
 ---
 
 ## Installation
@@ -90,9 +94,24 @@ Not just Vim in an editor — Vim that speaks Godot:
 
 [All Godot commands →](docs/REFERENCE.md#custom-commands)
 
+<p align="center">
+  <img src="media/dock_filesystem.gif" alt="Panel Navigation" width="800" />
+  <br><em>Navigate between docks with Ctrl+h/j/k/l — browse files, scenes, and inspector without the mouse</em>
+</p>
+
+<p align="center">
+  <img src="media/docs.gif" alt="Go-to-definition and Hover Docs" width="800" />
+  <br><em>K for hover docs, gd for go-to-definition</em>
+</p>
+
 ### Search and Replace
 
 Incremental search highlighting as you type. `:s/old/new/g` highlights every match region in yellow as you type the pattern — see exactly what will be affected before you press Enter.
+
+<p align="center">
+  <img src="media/incremental_search_replace.gif" alt="Incremental Search and Replace" width="800" />
+  <br><em>Live match highlighting as you type the substitution pattern</em>
+</p>
 
 ### Custom Cursor
 
@@ -114,6 +133,11 @@ vnoremap > >gv
 
 
 Hot-reloads on save. 20 built-in presets togglable via the `:mappings` dialog. [Config syntax →](docs/REFERENCE.md#godot-vimrc-syntax) · [All presets →](docs/REFERENCE.md#preset-mappings)
+
+<p align="center">
+  <img src="media/mappings.gif" alt="Mappings Dialog" width="800" />
+  <br><em>Toggle built-in presets and manage custom mappings with :mappings</em>
+</p>
 
 ### Macros, Registers, and Marks
 
