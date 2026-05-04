@@ -27,6 +27,7 @@ use std::collections::HashSet;
 use compact_str::CompactString;
 use godot::classes::CodeEdit;
 use godot::prelude::*;
+use vim_core::document::Document;
 use vim_core::execution::{VimEngine, VimSession};
 use vim_core::keymap::KeyEvent;
 use vim_core::primitives::Direction;
@@ -190,7 +191,10 @@ impl VimController {
         let mut host = GodotHost::new(editor);
         host.set_security_policy(self.security_policy.clone());
         host.set_highlight_yank_duration_ms(self.highlight_yank_duration_ms);
-        self.session = Some(VimSession::from_parts(engine, host));
+        let mut session = VimSession::from_parts(engine, host);
+        let initial_text = session.host().text().to_owned();
+        session.engine_mut().set_shadow_text(initial_text);
+        self.session = Some(session);
     }
 
     /// Decompose the active session: drop the host, reclaim the engine.
@@ -712,6 +716,53 @@ impl VimController {
                 .globals_mut()
                 .set_error("Recovered from internal error \u{2014} state reset to Normal mode");
         }
+    }
+
+    // ── External text change reconciliation ─────────────────────────────
+
+    /// Detect and reconcile an external text change (e.g. Find-and-Replace,
+    /// external formatter, Godot refactoring) by diffing the host's cached
+    /// text against the live editor text.
+    ///
+    /// Returns `true` if a change was detected and reconciled.
+    /// No-ops when detached (no session).
+    pub(crate) fn reconcile_external_edit(&mut self, editor: &Gd<CodeEdit>) -> bool {
+        use vim_core::document::Document;
+
+        let session = match self.session.as_mut() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let new_text = editor.get_text().to_string();
+        let old_text = session.host().text();
+
+        if old_text == new_text {
+            return false;
+        }
+
+        // Compute cursor byte offset in the new text.
+        let new_index = crate::bridge::codec::LineIndex::new(&new_text);
+        let cursor_byte = new_index.line_col_to_byte(
+            &new_text,
+            editor.get_caret_line(),
+            editor.get_caret_column(),
+        );
+
+        // Clone old text before mutably borrowing the session for the engine.
+        let old_text_owned = old_text.to_owned();
+
+        reconcile::reconcile_external_text_change(
+            session.engine_mut(),
+            &old_text_owned,
+            &new_text,
+            cursor_byte,
+        );
+
+        // Update the host's cache so the next call doesn't re-detect.
+        session.host_mut().invalidate_cache();
+
+        true
     }
 
     // ── Processing entry points ────────────────────────────────────────
