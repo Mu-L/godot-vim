@@ -475,6 +475,24 @@ Place a `.godot-vimrc` file at your project root (`res://.godot-vimrc`) or user 
 | `<C-x>` | Ctrl + x |
 | `<S-x>` | Shift + x |
 | `<A-x>` / `<M-x>` | Alt / Meta + x |
+| `<Action>name<CR>` | Execute a Godot editor action by name |
+
+### Godot Actions
+
+Invoke any Godot editor shortcut by name using `<Action>` in mappings or `:action` from the command line:
+
+```vim
+" In .godot-vimrc — map Leader+s to save
+nnoremap <Leader>s <Action>editor/save_scene<CR>
+
+" From command line
+:action editor/save_scene
+:actionlist script_text_editor    " list actions matching a filter
+```
+
+Use `:actionlist` to browse all available action names.
+
+**Limitation:** Actions in `scene_tree/`, `spatial_editor/`, `canvas_item_editor/`, and `filesystem_dock/` categories will not fire while the text editor is focused. Godot's own code blocks these shortcuts when a text field has focus. Actions in `script_text_editor/`, `script_editor/`, and `editor/` categories work reliably from within the code editor.
 
 ### Preset Markers
 
