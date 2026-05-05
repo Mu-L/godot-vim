@@ -324,9 +324,10 @@ pub(crate) fn execute(
                 }
                 _ => actions.join("\n"),
             };
-            HostResult::Success {
+            HostResult::Data {
                 id: request.id(),
-                message: Some(CompactString::from(text)),
+                data: CompactString::from(text),
+                offset: None,
             }
         }
 
