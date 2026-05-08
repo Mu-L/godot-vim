@@ -615,8 +615,7 @@ pub(crate) fn dispatch_pass2_effect(
         | Effect::SaveSelections { .. }
         | Effect::RestoreSelections { .. }
         | Effect::SelectNextMatch { .. }
-        | Effect::SelectPreviousMatch { .. }
-        | Effect::SelectSyntaxNode { .. } => {
+        | Effect::SelectPreviousMatch { .. } => {
             log::trace!("[internal] multi-selection effect (no-op in CodeEdit)");
         }
 
