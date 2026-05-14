@@ -54,7 +54,7 @@ pub(crate) struct TransientShellState {
     /// Cross-drain runaway guard: catches `:norm` calling back into `drain_pending`.
     operations_this_cycle: u32,
     /// Deferred for the plugin layer (scene tree owner) after `process_cycle`.
-    pending_ui_action: Option<PendingUiAction>,
+    pending_ui_actions: Vec<PendingUiAction>,
     /// Effect inspector state (`:vimdebug watch/step`).
     vimdebug: vimdebug::VimdebugState,
     /// Pass-2 effects deferred by vimdebug step-mode.
@@ -65,7 +65,7 @@ impl TransientShellState {
     fn new() -> Self {
         Self {
             operations_this_cycle: 0,
-            pending_ui_action: None,
+            pending_ui_actions: Vec::new(),
             vimdebug: vimdebug::VimdebugState::default(),
             pending_step_effects: None,
         }
@@ -78,12 +78,12 @@ impl TransientShellState {
     fn reset(&mut self) {
         let Self {
             operations_this_cycle,
-            pending_ui_action,
+            pending_ui_actions,
             vimdebug,
             pending_step_effects,
         } = self;
         *operations_this_cycle = 0;
-        *pending_ui_action = None;
+        pending_ui_actions.clear();
         vimdebug.set_mode(vimdebug::VimdebugMode::Off);
         *pending_step_effects = None;
     }
@@ -210,7 +210,7 @@ impl VimController {
         };
         let mut host = GodotHost::new(editor);
         host.set_state(state);
-        host.set_security_policy(self.ctx.security_policy.clone());
+        host.set_security_policy(self.ctx.security_policy);
         host.set_highlight_yank_duration_ms(self.ctx.highlight_yank_duration_ms);
         let mut session = VimSession::from_parts(engine, host);
         let initial_text = session.host().text().to_owned();
@@ -631,6 +631,16 @@ impl VimController {
                 MAX_ESC
             );
         }
+
+        // Sync multi-cursor positions and ensure undo balance after
+        // pipeline-driven mode exit. Without this, multi-cursor Godot
+        // carets can be stale and orphaned undo groups can leak.
+        if let ControllerPhase::Attached { ref mut session } = self.phase {
+            process::sync_multi_cursors_to_godot(session);
+            let mode = session.engine().mode();
+            session.host_mut().ensure_undo_balanced(mode);
+        }
+
         true
     }
 
@@ -761,8 +771,8 @@ impl VimController {
 
     // ── Pending UI actions ───────────────────────────────────────────
 
-    pub(crate) fn take_pending_ui_action(&mut self) -> Option<PendingUiAction> {
-        self.ctx.transient.pending_ui_action.take()
+    pub(crate) fn take_pending_ui_actions(&mut self) -> Vec<PendingUiAction> {
+        std::mem::take(&mut self.ctx.transient.pending_ui_actions)
     }
 
     /// Panic recovery composed from the canonical Tier 1 cleanup.
@@ -814,6 +824,139 @@ impl VimController {
 
     // ── External text change reconciliation ─────────────────────────────
 
+    /// Reconcile a `text_set` signal: `CodeEdit.set_text()` replaced the
+    /// buffer wholesale (file reload, VCS revert).
+    ///
+    /// Semantics differ from `reconcile_external_edit`:
+    /// - Godot destroys its own undo stack on `set_text()`.
+    /// - The caret is reset to (0,0) by Godot.
+    /// - We fence (reset) the engine undo tree and clear the UndoStore,
+    ///   since old undo entries reference pre-reload text.
+    /// - Positions (marks, jumplist) are remapped through the diff so they
+    ///   survive across the reload when possible.
+    ///
+    /// Returns `true` if a change was detected and reconciled.
+    /// No-ops when detached (no session).
+    pub(crate) fn reconcile_text_set(&mut self, editor: &Gd<CodeEdit>) -> bool {
+        let session = match &mut self.phase {
+            ControllerPhase::Attached { session } => session,
+            ControllerPhase::Detached { .. } => return false,
+        };
+
+        let new_text = editor.get_text().to_string();
+        let old_text = session.host().text();
+
+        if old_text == new_text {
+            return false;
+        }
+
+        // ① Save the old cursor byte offset BEFORE any engine mutation.
+        //    The host's cached cursor_offset was set during the last
+        //    refresh_from_editor() call — still the pre-set_text() value
+        //    since no process_key() has run in this cycle. Godot has already
+        //    reset the live caret to (0,0) which would be useless for diff
+        //    quality.
+        let old_cursor_offset = session.host().cursor_offset();
+
+        // Clone old text before mutably borrowing the session.
+        let old_text_owned = old_text.to_owned();
+
+        // ② Force Normal mode if not already.
+        if !session.engine().mode().is_normal() {
+            session.engine_mut().emergency_reset();
+        }
+
+        // ③ Remap marks, jumplist, changelist through the diff.
+        //    Use the old cursor offset for better diff quality (Godot's 0,0
+        //    would clamp the common-prefix to zero, defeating suffix detection).
+        reconcile::reconcile_external_text_change(
+            session.engine_mut(),
+            &old_text_owned,
+            &new_text,
+            old_cursor_offset,
+            vim_core::execution::ExternalEditKind::HostNotified,
+        );
+
+        // ④ Clear changelist — entries reference pre-reload positions.
+        session.engine_mut().changelist_mut().clear();
+
+        // ⑤ Fence the engine undo tree — all existing nodes reference
+        //    pre-reload text and would produce garbage if replayed.
+        session.engine_mut().undo_tree_mut().fence();
+
+        // ⑥ Discard any force-committed or external-edit undo nodes that
+        //    reconcile created (they were just fenced away).
+        let _ = session.engine_mut().take_last_force_committed_node();
+        let _ = session.engine_mut().take_last_external_edit_node();
+
+        // ⑦ Clear UndoStore for this buffer.
+        {
+            let editor_id = session.host().editor().instance_id();
+            session
+                .host_mut()
+                .state_mut()
+                .buffer(editor_id)
+                .undo_store_mut()
+                .clear();
+        }
+
+        // ⑧ Update shadow document directly to new text.
+        session.engine_mut().set_shadow_text(&new_text);
+
+        // ⑨ Refresh the host text cache so it reflects the new text.
+        session.host_mut().invalidate_cache();
+
+        // ⑩ Restore cursor: clamp old line/col to new text bounds.
+        {
+            let old_index = crate::bridge::codec::LineIndex::new(&old_text_owned);
+            let old_lc = old_index.byte_to_line_col(&old_text_owned, old_cursor_offset);
+            let new_index = crate::bridge::codec::LineIndex::new(&new_text);
+
+            let max_line = new_index.line_count().saturating_sub(1);
+            let clamped_line = (old_lc.line as usize).min(max_line);
+            let clamped_line_i32 = crate::bridge::codec::usize_to_i32(clamped_line);
+
+            // Clamp column to the length of the new line.
+            let new_line_len = {
+                let line_byte_start = new_index.line_col_to_byte(
+                    &new_text,
+                    clamped_line_i32,
+                    0,
+                );
+                // Find end of line (next newline or end of text).
+                let rest = &new_text[line_byte_start..];
+                let line_byte_len = rest.find('\n').unwrap_or(rest.len());
+                // Count chars in the line for the column bound.
+                new_text[line_byte_start..line_byte_start + line_byte_len]
+                    .chars()
+                    .count()
+            };
+            let clamped_col = (old_lc.col as usize).min(new_line_len.saturating_sub(1));
+            let clamped_col_i32 = crate::bridge::codec::usize_to_i32(clamped_col);
+
+            editor.clone().set_caret_line(clamped_line_i32);
+            editor.clone().set_caret_column(clamped_col_i32);
+        }
+
+        // ⑪ Clear multi-cursor — positions are invalidated by full reload.
+        if session.engine().state().multi_cursor().is_active() {
+            use vim_core::execution::MultiCursorContext;
+            use vim_core::state::MultiCursorCommand;
+
+            let ctx = MultiCursorContext {
+                text: &new_text,
+                search_pattern: None,
+                line_count: 0,
+            };
+            let _ = session
+                .engine_mut()
+                .execute_multi_cursor(&MultiCursorCommand::ClearSecondary, &ctx);
+            editor.clone().remove_secondary_carets();
+        }
+
+        true
+    }
+
     /// Detect and reconcile an external text change (e.g. Find-and-Replace,
     /// external formatter, Godot refactoring) by diffing the host's cached
     /// text against the live editor text.
@@ -834,12 +977,19 @@ impl VimController {
         }
 
         // Compute cursor byte offset in the new text.
+        // When multi-cursor is active, use usize::MAX so decompose_multi_site_diff
+        // doesn't clamp the common-prefix at a single caret position — the diff
+        // envelope must cover all replacement sites.
         let new_index = crate::bridge::codec::LineIndex::new(&new_text);
-        let cursor_byte = new_index.line_col_to_byte(
-            &new_text,
-            editor.get_caret_line(),
-            editor.get_caret_column(),
-        );
+        let cursor_byte = if session.engine().state().multi_cursor().is_active() {
+            usize::MAX
+        } else {
+            new_index.line_col_to_byte(
+                &new_text,
+                editor.get_caret_line(),
+                editor.get_caret_column(),
+            )
+        };
 
         // Clone old text before mutably borrowing the session for the engine.
         let old_text_owned = old_text.to_owned();
@@ -856,32 +1006,7 @@ impl VimController {
         // reads text_cache for the post-edit text (T1). Without this, text_cache
         // still holds the pre-edit text, producing an identity changeset.
         session.host_mut().invalidate_cache();
-
-        // Sync internal undo nodes immediately with the correct T0 (old_text).
-        // reconcile_external_text_change calls engine.apply_external_edit_with_recording()
-        // which may create undo tree nodes that bypass the effect pipeline. Record
-        // them in UndoStore now — deferring to the next process_key would lose the
-        // correct pre-edit text (T0).
-        {
-            use vim_core::effects::Effect;
-            let fc_node = session.engine_mut().take_last_force_committed_node();
-            let ext_node = session.engine_mut().take_last_external_edit_node();
-            if let Some(fc_id) = fc_node {
-                session.host_mut().apply_effects(&[Effect::EndUndoGroup {
-                    node_id: Some(fc_id),
-                }]);
-            }
-            if let Some(ext_id) = ext_node {
-                session
-                    .host_mut()
-                    .record_internal_undo_node(ext_id, &old_text_owned);
-            }
-            if fc_node.is_some() && session.engine().mode().is_insert() {
-                session.host_mut().apply_effects(&[Effect::BeginUndoGroup {
-                    cursor_strategy: vim_core::primitives::UndoCursorStrategy::FirstEdit,
-                }]);
-            }
-        }
+        sync_undo_nodes_after_external_edit(session, &old_text_owned);
 
         // H1: Clear secondary cursors on external edit. External text changes
         // (Find-Replace, formatter, etc.) invalidate secondary cursor positions
@@ -902,7 +1027,55 @@ impl VimController {
 
         true
     }
+}
 
+/// Sync internal undo nodes created by engine operations that bypass the
+/// effect pipeline (force-committed groups, external-edit nodes). Must be
+/// called after any reconciliation that invokes apply_external_edit.
+pub(crate) fn sync_undo_nodes_after_external_edit(
+    session: &mut vim_core::execution::VimSession<GodotHost>,
+    pre_edit_text: &str,
+) {
+    use vim_core::effects::Effect;
+    let fc_node = session.engine_mut().take_last_force_committed_node();
+    let ext_node = session.engine_mut().take_last_external_edit_node();
+    if let Some(fc_id) = fc_node {
+        let editor_id = session.host().editor().instance_id();
+        let has_pending = session
+            .host()
+            .state()
+            .buffer_ref(editor_id)
+            .is_some_and(|b| b.undo_store().has_pending());
+        if has_pending {
+            session.host_mut().apply_effects(&[Effect::EndUndoGroup {
+                node_id: Some(fc_id),
+            }]);
+        }
+    }
+    if let Some(ext_id) = ext_node {
+        session
+            .host_mut()
+            .record_internal_undo_node(ext_id, pre_edit_text);
+    }
+    if fc_node.is_some() && session.engine().mode().is_insert() {
+        session.host_mut().apply_effects(&[Effect::BeginUndoGroup {
+            cursor_strategy: vim_core::primitives::UndoCursorStrategy::FirstEdit,
+        }]);
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        if let Some(shadow_text) = session.engine().shadow_text() {
+            let host_text = session.host().text();
+            debug_assert_eq!(
+                shadow_text, host_text,
+                "shadow document out of sync after undo node sync"
+            );
+        }
+    }
+}
+
+impl VimController {
     // ── Processing entry points ────────────────────────────────────────
 
     /// Single entry point for keystroke processing from `gui_input`.
@@ -951,7 +1124,6 @@ impl VimController {
         // Sync host state before processing.
         let current_mode = session.engine().mode();
         session.host_mut().refresh_from_editor();
-        session.host_mut().set_auto_brace_eligible(false); // entering Visual, not Insert
         session.host_mut().set_current_mode(current_mode);
 
         let result = session.process_mouse_selection(anchor_offset, head_offset, shape);

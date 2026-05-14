@@ -268,7 +268,7 @@ impl GodotVimCore {
         }
 
         if let Some(controller) = &mut self.controller {
-            if let Some(action) = controller.take_pending_ui_action() {
+            for action in controller.take_pending_ui_actions() {
                 self.handle_pending_ui_action(action);
             }
         }
@@ -335,7 +335,7 @@ impl GodotVimCore {
         }
 
         if let Some(controller) = &mut self.controller {
-            if let Some(action) = controller.take_pending_ui_action() {
+            for action in controller.take_pending_ui_actions() {
                 self.handle_pending_ui_action(action);
             }
         }

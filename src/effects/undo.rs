@@ -6,31 +6,36 @@
 
 use crate::bridge::codec::{DocumentView, LineIndex};
 use crate::bridge::port::TextEditorPort;
-use crate::state::undo_store::UndoApplyResult;
 
-/// Apply changeset changes to CodeEdit in REVERSE order.
+/// Apply a set of `(from, to, Option<replacement>)` changes to a CodeEdit
+/// in reverse order so byte offsets remain valid.
+///
+/// All offsets must be absolute byte positions in the document described
+/// by `doc` — they are not adjusted for prior changes in this loop.
+/// Reverse-order application ensures higher-offset mutations never shift
+/// lower-offset positions.
 ///
 /// Each `(from, to, replacement)` triple is processed back-to-front so that
 /// earlier byte offsets remain valid while later regions are modified.
 /// - `from < to` with `None` → pure deletion
 /// - `from == to` with `Some(text)` → pure insertion
 /// - `from < to` with `Some(text)` → replacement (delete then insert)
-pub(crate) fn apply_changes_to_editor(
+pub(crate) fn apply_changes(
     editor: &mut impl TextEditorPort,
     doc: &DocumentView,
-    result: &UndoApplyResult,
+    changes: &[(usize, usize, Option<String>)],
 ) {
     // Iterate in reverse so that mutations at higher offsets don't
     // invalidate the byte positions of earlier changes.
-    for &(from, to, ref replacement) in result.changes.iter().rev() {
+    for &(from, to, ref replacement) in changes.iter().rev() {
         if from < to {
             let from_pos = doc.line_index.byte_to_line_col(doc.text, from);
             let to_pos = doc.line_index.byte_to_line_col(doc.text, to);
             editor.remove_text(from_pos.line, from_pos.col, to_pos.line, to_pos.col);
         }
         if let Some(ref text) = replacement {
-            let insert_pos = doc.line_index.byte_to_line_col(doc.text, from);
-            editor.insert_text(text, insert_pos.line, insert_pos.col);
+            let pos = doc.line_index.byte_to_line_col(doc.text, from);
+            super::text::insert_at(editor, pos.line, pos.col, text);
         }
     }
 }

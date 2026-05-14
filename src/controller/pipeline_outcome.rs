@@ -1,13 +1,12 @@
 use vim_core::execution::host_api::ProcessResult;
 
-#[allow(dead_code)]
 pub(crate) enum PipelineOutcome {
     VimdebugStep,
     CompletionConsumed,
     CompletionDeferred,
     Passthrough,
-    EngineConsumed(ProcessResult),
-    EngineIgnored(ProcessResult),
+    EngineConsumed(#[allow(dead_code)] ProcessResult),
+    EngineIgnored(#[allow(dead_code)] ProcessResult),
 }
 
 impl PipelineOutcome {
@@ -19,7 +18,10 @@ impl PipelineOutcome {
     }
 
     pub(crate) fn may_have_moved_cursor(&self) -> bool {
-        matches!(self, Self::EngineConsumed(_))
+        // CompletionConsumed always moves the cursor (replaces prefix with
+        // full word). The deferred caret_changed must expect cursor movement
+        // so it isn't falsely treated as an external edit (Fix 4C).
+        matches!(self, Self::CompletionConsumed | Self::EngineConsumed(_))
     }
 
     pub(crate) fn log_label(&self) -> &'static str {
@@ -59,7 +61,7 @@ mod tests {
     #[test]
     fn may_have_moved_cursor_truth_table() {
         assert!(!PipelineOutcome::VimdebugStep.may_have_moved_cursor());
-        assert!(!PipelineOutcome::CompletionConsumed.may_have_moved_cursor());
+        assert!(PipelineOutcome::CompletionConsumed.may_have_moved_cursor());
         assert!(!PipelineOutcome::CompletionDeferred.may_have_moved_cursor());
         assert!(!PipelineOutcome::Passthrough.may_have_moved_cursor());
         assert!(PipelineOutcome::EngineConsumed(dummy_result()).may_have_moved_cursor());

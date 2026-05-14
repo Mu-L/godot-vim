@@ -132,7 +132,7 @@ impl UndoStore {
         let seq = self.next_sequence;
         self.next_sequence += 1;
 
-        let checkpoint = if seq > 0 && (seq % u64::from(self.checkpoint_interval)) == 0 {
+        let checkpoint = if seq > 0 && seq.is_multiple_of(u64::from(self.checkpoint_interval)) {
             Some(text_after.to_string())
         } else {
             None
@@ -231,6 +231,17 @@ impl UndoStore {
         self.pending_text.take()
     }
 
+    /// Discard all snapshots and pending state, resetting to empty.
+    ///
+    /// Called when `CodeEdit.set_text()` replaces the buffer wholesale
+    /// (file reload, VCS revert). All existing undo entries reference
+    /// pre-reload text and would produce garbage if replayed.
+    pub fn clear(&mut self) {
+        self.snapshots.clear();
+        self.pending_text = None;
+        self.next_sequence = 0;
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────
 
     /// Which direction the checkpoint fallback should target.
@@ -315,13 +326,8 @@ impl UndoStore {
         }
 
         // Fallback: nearest by absolute distance.
-        let nearest = checkpoints_with_cp().min_by_key(|s| {
-            if s.sequence > target_seq {
-                s.sequence - target_seq
-            } else {
-                target_seq - s.sequence
-            }
-        });
+        let nearest = checkpoints_with_cp()
+            .min_by_key(|s| s.sequence.abs_diff(target_seq));
 
         nearest.and_then(|s| s.checkpoint.clone())
     }
@@ -1093,5 +1099,58 @@ mod tests {
         // The newest checkpoint (nid(2)) must survive.
         assert!(store.snapshots.contains_key(&nid(2)));
         assert!(store.snapshots[&nid(2)].checkpoint.is_some());
+    }
+
+    // ── clear ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn clear_empties_snapshots_and_pending() {
+        let mut store = UndoStore::new();
+
+        store.begin_group("hello");
+        store.end_group(nid(1), "hello world");
+        store.begin_group("hello world");
+        store.end_group(nid(2), "hello world!");
+        store.begin_group("pending text");
+
+        assert_eq!(store.snapshots.len(), 2);
+        assert!(store.has_pending());
+        assert!(store.next_sequence > 0);
+
+        store.clear();
+
+        assert!(store.snapshots.is_empty());
+        assert!(!store.has_pending());
+        assert_eq!(store.next_sequence, 0);
+    }
+
+    #[test]
+    fn clear_then_reuse() {
+        let mut store = UndoStore::new();
+
+        store.begin_group("a");
+        store.end_group(nid(1), "b");
+
+        store.clear();
+
+        // Can add entries after clear.
+        store.begin_group("x");
+        store.end_group(nid(10), "y");
+
+        assert_eq!(store.snapshots.len(), 1);
+        assert!(store.snapshots.contains_key(&nid(10)));
+
+        // Undo works on the new entry.
+        let result = store.undo_step(nid(10), "y").unwrap();
+        assert_eq!(result.text, "x");
+    }
+
+    #[test]
+    fn clear_on_empty_store() {
+        let mut store = UndoStore::new();
+        store.clear();
+        assert!(store.snapshots.is_empty());
+        assert!(!store.has_pending());
+        assert_eq!(store.next_sequence, 0);
     }
 }

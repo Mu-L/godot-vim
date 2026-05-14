@@ -1,8 +1,14 @@
-//! Two-pass effect dispatcher: applies vim-core [`Effect`] values to CodeEdit.
+//! Three-phase effect dispatcher: applies vim-core [`Effect`] values to CodeEdit.
 //!
-//! Pass 1 processes text mutations (insert, delete, replace, undo/redo).
-//! Pass 2 processes everything else (cursor, selection, mode, scroll, messages)
-//! against the final document text.
+//! Phase 1 processes text mutations against the Cow<str> mirror only — no
+//! CodeEdit writes. A [`CommitStrategy`] tracks how to replay the mutations.
+//!
+//! Phase 2 atomically commits the accumulated mutations to CodeEdit using the
+//! [`CommitStrategy`], wrapped in [`ComplexOpGuard`] for deferred
+//! syntax/wrapping recomputation and unwind safety.
+//!
+//! Phase 3 (pass 2) processes everything else (cursor, selection, mode, scroll,
+//! messages) against the final document text.
 
 use std::borrow::Cow;
 
@@ -10,6 +16,7 @@ use godot::prelude::*;
 use vim_core::effects::Effect;
 #[cfg(test)]
 use vim_core::effects::EffectKind;
+use vim_core::primitives::Offset;
 
 use super::{
     auto_brace,
@@ -60,12 +67,75 @@ pub(crate) struct DispatchContext<'a> {
 
 /// Read-only environment for pass-2 effect dispatch. Separates immutable
 /// context from mutable targets to align with Rust's borrow model.
-#[allow(dead_code)]
 pub(crate) struct DispatchEnv<'a> {
     pub(crate) doc: &'a DocumentView<'a>,
     pub(crate) scrolloff: i32,
     pub(crate) highlight_yank_duration_ms: u32,
+    #[allow(dead_code)] // written by dispatch() and process.rs step mode; read access pending
     pub(crate) editor_id: InstanceId,
+}
+
+/// RAII guard for CodeEdit's begin/end_complex_operation. Calls
+/// end_complex_operation on Drop, including during unwind.
+pub(crate) struct ComplexOpGuard<'a, E: TextEditorPort + ?Sized> {
+    editor: &'a mut E,
+}
+
+impl<'a, E: TextEditorPort + ?Sized> ComplexOpGuard<'a, E> {
+    pub(crate) fn new(editor: &'a mut E) -> Self {
+        editor.begin_complex_operation();
+        Self { editor }
+    }
+}
+
+impl<E: TextEditorPort + ?Sized> Drop for ComplexOpGuard<'_, E> {
+    fn drop(&mut self) {
+        self.editor.end_complex_operation();
+    }
+}
+
+/// How accumulated Phase-1 mutations should be committed to CodeEdit in Phase 2.
+///
+/// The common case (single insert during typing) uses `Insert` which maps to a
+/// single `text::handle_insert` call — zero overhead vs. the old two-pass model.
+/// Multi-mutation batches (auto-brace InsertWithClose, auto-brace extended delete)
+/// fall back to `Diff` which diffs the Cow mirror against `text_ref` and applies
+/// the resulting changeset.
+enum CommitStrategy {
+    /// No text mutation occurred in Phase 1.
+    None,
+    /// A single insertion at a byte offset.
+    Insert { offset: usize, content: String },
+    /// A single deletion of a byte range.
+    Delete { start: usize, end: usize },
+    /// A single replacement of a byte range.
+    Replace {
+        start: usize,
+        end: usize,
+        content: String,
+    },
+    /// Undo/redo changes collected from `UndoApplyResult`.
+    UndoRedoChanges {
+        changes: Vec<(usize, usize, Option<String>)>,
+    },
+    /// Fallback: diff `text_ref` against the Cow mirror to produce changes.
+    /// Used when multiple mutations or complex auto-brace sequences make it
+    /// impossible to track a single operation.
+    Diff,
+}
+
+impl CommitStrategy {
+    /// Merge a new mutation into the current strategy.
+    ///
+    /// If this is the first mutation (`None`), adopt the new strategy directly.
+    /// Otherwise, fall back to `Diff` since we can't express multiple mutations
+    /// as a single operation.
+    fn add_mutation(self, new: CommitStrategy) -> CommitStrategy {
+        match self {
+            CommitStrategy::None => new,
+            _ => CommitStrategy::Diff,
+        }
+    }
 }
 
 /// State machine tracking SetSelection → SetCursor effect pairing.
@@ -268,17 +338,23 @@ const HANDLED_EFFECTS: &[EffectKind] = &[
 
 /// Translate a list of vim-core `Effect`s into Godot CodeEdit API calls.
 ///
-/// # Effect Ordering Contract
+/// # Three-Phase Architecture
 ///
-/// **Pass 1** (text mutations): `Insert`, `Delete`, `Replace`, `Undo`, `Redo`,
-/// `BeginUndoGroup`, `EndUndoGroup`. Applied in order. Text cache invalidated
-/// after each mutation.
+/// **Phase 1** (mirror-only): Text mutations (`Insert`, `Delete`, `Replace`,
+/// `Undo`, `Redo`, `BeginUndoGroup`, `EndUndoGroup`) are applied to the
+/// `Cow<str>` mirror only. A [`CommitStrategy`] tracks how to replay them.
+/// No CodeEdit writes occur during this phase.
 ///
-/// **Pass 2** (everything else): Applied against the final document text from
-/// pass 1. `SetSelection` MUST appear before its matching `SetCursor` in the
-/// effect list — the engine guarantees this. If `SetSelection` is present,
-/// `SetCursor` is suppressed (Godot's `select()` already positions the caret).
-/// Validated at runtime by `SelectionPairing` state machine + `debug_assert!`.
+/// **Phase 2** (atomic commit): After all Phase-1 effects are processed, the
+/// accumulated mutations are committed to CodeEdit in a single
+/// [`ComplexOpGuard`] scope using the [`CommitStrategy`]. This eliminates the
+/// class of "partially mutated CodeEdit" bugs.
+///
+/// **Phase 3** (pass 2): Everything else (cursor, selection, mode, scroll,
+/// messages) against the final document text. `SetSelection` MUST appear
+/// before its matching `SetCursor` — the engine guarantees this. If
+/// `SetSelection` is present, `SetCursor` is suppressed (Godot's `select()`
+/// already positions the caret). Validated by `SelectionPairing` state machine.
 ///
 /// Returns any [`CompoundAction`]s (e.g., `:norm`) that require the caller
 /// to re-drive the engine. The controller processes these in
@@ -313,14 +389,18 @@ pub(crate) fn dispatch(
     }
     editor.deselect();
 
-    // Pass 1: text mutations and undo. The Cow starts as a zero-copy borrow;
-    // any mutation transitions it to Owned via editor.get_text() or in-place splice.
+    // ── Phase 1: mirror-only text mutations ──────────────────────────────
+    // The Cow starts as a zero-copy borrow; any mutation transitions it to
+    // Owned via in-place splice. NO CodeEdit writes occur here — mutations
+    // are tracked in `commit_strategy` for Phase 2.
     let mut text: Cow<str> = Cow::Borrowed(text_ref);
     let mut text_mutated = false;
-    let mut line_index = match line_index_hint {
-        Some(hint) => hint,
+    let mut line_index = match &line_index_hint {
+        Some(hint) => hint.clone(),
         None => LineIndex::new(&text),
     };
+    let mut commit_strategy = CommitStrategy::None;
+    let mut deferred_undo_cursors: Option<Vec<Offset>> = None;
 
     for effect in effects {
         match effect {
@@ -341,38 +421,77 @@ pub(crate) fn dispatch(
                 {
                     let Some(ch) = content.chars().next() else {
                         // Defensive: is_single_char guarantees at least one char.
-                        text::handle_insert(editor, &doc, offset.get(), &content);
-                        text = Cow::Owned(editor.get_text());
-                        line_index = LineIndex::new(&text);
+                        let byte_offset = offset.get();
+                        text.to_mut().insert_str(byte_offset, &content);
+                        line_index.apply_insert(byte_offset, &content);
+                        commit_strategy = commit_strategy.add_mutation(
+                            CommitStrategy::Insert {
+                                offset: byte_offset,
+                                content: content.to_string(),
+                            },
+                        );
                         text_mutated = true;
                         continue;
                     };
                     let lc = doc.line_index.byte_to_line_col(doc.text, offset.get());
                     let syntax = syntax_query(lc.line, lc.col);
-                    match auto_brace::handle_insert_with_auto_brace(
-                        editor,
+                    match auto_brace::compute_auto_brace_insert(
                         &doc,
                         offset.get(),
                         ch,
                         &auto_brace_snapshot,
                         &syntax,
                     ) {
-                        auto_brace::AutoBraceResult::Inserted => {
-                            // Auto-brace may have inserted a closing brace — we can't
-                            // predict the change, so re-fetch authoritatively.
-                            text = Cow::Owned(editor.get_text());
-                            line_index = LineIndex::new(&text);
+                        auto_brace::AutoBraceAction::InsertOnly => {
+                            // Insert the character into the Cow mirror only.
+                            let byte_offset = offset.get();
+                            text.to_mut().insert_str(byte_offset, &content);
+                            line_index.apply_insert(byte_offset, &content);
+                            commit_strategy = commit_strategy.add_mutation(
+                                CommitStrategy::Insert {
+                                    offset: byte_offset,
+                                    content: content.to_string(),
+                                },
+                            );
                             text_mutated = true;
                         }
-                        auto_brace::AutoBraceResult::SkippedOver => {
-                            // Skip-over only moves the caret; text unchanged.
+                        auto_brace::AutoBraceAction::InsertWithClose { close } => {
+                            // Insert open + close into the Cow mirror.
+                            let byte_offset = offset.get();
+                            text.to_mut().insert_str(byte_offset, &content);
+                            line_index.apply_insert(byte_offset, &content);
+                            let close_offset = byte_offset + content.len();
+                            text.to_mut().insert_str(close_offset, &close);
+                            line_index.apply_insert(close_offset, &close);
+                            // Two insertions → can't express as a single op.
+                            commit_strategy = CommitStrategy::Diff;
+                            text_mutated = true;
+                        }
+                        auto_brace::AutoBraceAction::SkipOver { move_cols } => {
+                            // No text change — push a synthetic SetCursor to
+                            // pass 2 to reposition the caret past the close brace.
+                            // Compute the target byte offset by advancing
+                            // `move_cols` characters from the current offset.
+                            let target_byte = text[offset.get()..]
+                                .chars()
+                                .take(move_cols as usize)
+                                .map(char::len_utf8)
+                                .sum::<usize>()
+                                + offset.get();
+                            pass2.push(Effect::SetCursor {
+                                offset: Offset::new(target_byte),
+                            });
                         }
                     }
                 } else {
-                    text::handle_insert(editor, &doc, offset.get(), &content);
+                    // Non-auto-brace: splice Cow only, track CommitStrategy::Insert.
                     let byte_offset = offset.get();
                     text.to_mut().insert_str(byte_offset, &content);
                     line_index.apply_insert(byte_offset, &content);
+                    commit_strategy = commit_strategy.add_mutation(CommitStrategy::Insert {
+                        offset: byte_offset,
+                        content: content.to_string(),
+                    });
                     text_mutated = true;
                 }
             }
@@ -380,24 +499,29 @@ pub(crate) fn dispatch(
                 let doc = DocumentView::new(&text, &line_index);
                 let start = range.start().get();
                 let end = range.end().get();
-                text::handle_delete(editor, &doc, start, end);
-                // Auto-brace backspace: if the deleted range was an opening brace
-                // with an adjacent close brace, delete the close brace too. The
-                // Cow still holds pre-delete text (handle_delete only read it).
                 let has_auto_brace = auto_brace_eligible && auto_brace_snapshot.enabled;
                 if has_auto_brace {
-                    auto_brace::handle_delete_with_auto_brace(
-                        editor,
-                        &doc,
-                        start,
-                        end,
-                        &auto_brace_snapshot,
-                    );
-                    text = Cow::Owned(editor.get_text());
-                    line_index = LineIndex::new(&text);
+                    let extra =
+                        auto_brace::compute_auto_brace_delete_extra(&doc, start, end, &auto_brace_snapshot);
+                    if extra > 0 {
+                        // Delete the open brace range AND the adjacent close brace.
+                        let extended_end = end + extra;
+                        text.to_mut().drain(start..extended_end);
+                        line_index = LineIndex::new(&text);
+                        commit_strategy = CommitStrategy::Diff;
+                    } else {
+                        text.to_mut().drain(start..end);
+                        line_index.apply_delete(start, end);
+                        commit_strategy = commit_strategy.add_mutation(CommitStrategy::Delete {
+                            start,
+                            end,
+                        });
+                    }
                 } else {
                     text.to_mut().drain(start..end);
                     line_index.apply_delete(start, end);
+                    commit_strategy =
+                        commit_strategy.add_mutation(CommitStrategy::Delete { start, end });
                 }
                 text_mutated = true;
             }
@@ -405,13 +529,16 @@ pub(crate) fn dispatch(
                 range,
                 text: content,
             } => {
-                let doc = DocumentView::new(&text, &line_index);
                 let start = range.start().get();
                 let end = range.end().get();
-                text::handle_replace(editor, &doc, start, end, &content);
                 text.to_mut().replace_range(start..end, &content);
                 line_index.apply_delete(start, end);
                 line_index.apply_insert(start, &content);
+                commit_strategy = commit_strategy.add_mutation(CommitStrategy::Replace {
+                    start,
+                    end,
+                    content: content.to_string(),
+                });
                 text_mutated = true;
             }
             Effect::BeginUndoGroup { .. } => {
@@ -435,6 +562,8 @@ pub(crate) fn dispatch(
             }
             Effect::Undo { steps, .. } => {
                 let mut any_applied = false;
+                let mut all_changes = Vec::new();
+                let mut last_cursors = None;
                 for step in &steps {
                     let current_text: &str = &text;
                     let result = state
@@ -442,9 +571,8 @@ pub(crate) fn dispatch(
                         .undo_store_mut()
                         .undo_step(step.node_id, current_text);
                     if let Some(result) = result {
-                        let doc = DocumentView::new(&text, &line_index);
-                        undo::apply_changes_to_editor(editor, &doc, &result);
-                        undo::restore_cursors(editor, &result.text, &step.cursors);
+                        all_changes.extend(result.changes);
+                        last_cursors = Some(step.cursors.to_vec());
                         text = Cow::Owned(result.text);
                         line_index = LineIndex::new(&text);
                         any_applied = true;
@@ -456,6 +584,10 @@ pub(crate) fn dispatch(
                     }
                 }
                 if any_applied {
+                    commit_strategy = CommitStrategy::UndoRedoChanges {
+                        changes: all_changes,
+                    };
+                    deferred_undo_cursors = last_cursors;
                     text_mutated = true;
                 }
             }
@@ -464,6 +596,8 @@ pub(crate) fn dispatch(
             }
             Effect::Redo { steps, .. } => {
                 let mut any_applied = false;
+                let mut all_changes = Vec::new();
+                let mut last_cursors = None;
                 for step in &steps {
                     let current_text: &str = &text;
                     let result = state
@@ -471,9 +605,8 @@ pub(crate) fn dispatch(
                         .undo_store_mut()
                         .redo_step(step.node_id, current_text);
                     if let Some(result) = result {
-                        let doc = DocumentView::new(&text, &line_index);
-                        undo::apply_changes_to_editor(editor, &doc, &result);
-                        undo::restore_cursors(editor, &result.text, &step.cursors);
+                        all_changes.extend(result.changes);
+                        last_cursors = Some(step.cursors.to_vec());
                         text = Cow::Owned(result.text);
                         line_index = LineIndex::new(&text);
                         any_applied = true;
@@ -485,6 +618,10 @@ pub(crate) fn dispatch(
                     }
                 }
                 if any_applied {
+                    commit_strategy = CommitStrategy::UndoRedoChanges {
+                        changes: all_changes,
+                    };
+                    deferred_undo_cursors = last_cursors;
                     text_mutated = true;
                 }
             }
@@ -492,21 +629,68 @@ pub(crate) fn dispatch(
         }
     }
 
-    // Debug-only: verify our incremental text mirror matches the editor's
-    // authoritative state. Catches splice divergence bugs early.
-    #[cfg(debug_assertions)]
+    // ── Phase 2: atomic commit to CodeEdit ─────────────────────────────
+    // Apply accumulated mutations using the CommitStrategy, wrapped in
+    // ComplexOpGuard for deferred syntax/wrapping recomputation.
     if text_mutated {
-        let editor_text = editor.get_text();
-        debug_assert_eq!(
-            text.as_ref(),
-            editor_text.as_str(),
-            "text mirror out of sync with editor after pass 1"
-        );
+        let original_line_index = match &line_index_hint {
+            Some(hint) => hint.clone(),
+            None => LineIndex::new(text_ref),
+        };
+        let original_doc = DocumentView::new(text_ref, &original_line_index);
+
+        {
+            let _guard = ComplexOpGuard::new(editor);
+            match &commit_strategy {
+                CommitStrategy::None => {}
+                CommitStrategy::Insert { offset, content } => {
+                    text::handle_insert(_guard.editor, &original_doc, *offset, content);
+                }
+                CommitStrategy::Delete { start, end } => {
+                    text::handle_delete(_guard.editor, &original_doc, *start, *end);
+                }
+                CommitStrategy::Replace {
+                    start,
+                    end,
+                    content,
+                } => {
+                    text::handle_replace(_guard.editor, &original_doc, *start, *end, content);
+                }
+                CommitStrategy::UndoRedoChanges { changes } => {
+                    undo::apply_changes(_guard.editor, &original_doc, changes);
+                }
+                CommitStrategy::Diff => {
+                    use vim_core::primitives::changeset::ChangeSet;
+                    let cs = ChangeSet::from_diff(text_ref, &text);
+                    let diff_changes: Vec<(usize, usize, Option<String>)> = cs
+                        .changes()
+                        .map(|(from, to, repl)| (from, to, repl.map(String::from)))
+                        .collect();
+                    undo::apply_changes(_guard.editor, &original_doc, &diff_changes);
+                }
+            }
+        } // _guard drops here, calling end_complex_operation()
+
+        // Restore undo cursors deferred from Phase 1.
+        if let Some(ref cursors) = deferred_undo_cursors {
+            undo::restore_cursors(editor, &text, cursors);
+        }
+
+        // Debug-only: verify the Cow mirror matches CodeEdit after Phase 2.
+        #[cfg(debug_assertions)]
+        {
+            let editor_text = editor.get_text();
+            debug_assert_eq!(
+                text.as_ref(),
+                editor_text.as_str(),
+                "text mirror out of sync with editor after Phase 2 commit"
+            );
+        }
     }
 
-    // Pass 2: cursor, selection, mode, scroll, messages, etc. against
-    // the final document text. The line_index is either the reused hint
-    // (no pass-1 mutations) or incrementally updated through splices.
+    // ── Phase 3 (pass 2): cursor, selection, mode, scroll, etc. ────────
+    // Applied against the final document text from Phase 1/2. The line_index
+    // is either the reused hint (no Phase-1 mutations) or rebuilt through splices.
     let mut compound_actions = Vec::new();
     let doc = DocumentView::new(&text, &line_index);
     let env = DispatchEnv {

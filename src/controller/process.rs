@@ -50,16 +50,16 @@ pub(super) fn process_cycle_impl(
     }
 
     if let Some(consumed) =
-        completion::try_handle_completion(session.engine_mut(), key, editor)
+        completion::try_handle_completion(session, key, editor)
     {
         log::debug!(
             "process_cycle: completion intercepted key={} consumed={}",
             key,
             consumed
         );
-        if consumed {
-            session.host_mut().invalidate_cache();
-        }
+        // Note: invalidate_cache() for consumed completions is now called
+        // inside confirm_and_reconcile_completion (Fix 4B), before
+        // reconciliation, so host.text() reflects post-completion state.
         let mode = session.engine().mode();
         session.host_mut().ensure_undo_balanced(mode);
         return if consumed {
@@ -240,7 +240,7 @@ fn handle_host_pending_ui_action(
         PendingUiAction::OpenMappingDialog
         | PendingUiAction::SourceConfigFile
         | PendingUiAction::ShowTooltip { .. } => {
-            ctx.transient.pending_ui_action = Some(action);
+            ctx.transient.pending_ui_actions.push(action);
         }
         PendingUiAction::ShowUndoTree => {
             // The undo tree is now engine-owned. Use `:undotree` which
@@ -742,7 +742,7 @@ fn import_godot_carets_into_engine(session: &mut vim_core::execution::VimSession
 ///
 /// Only activates when cursor_count > 1 (multi-cursor is active). When only
 /// one cursor exists, the normal single-cursor path handles positioning.
-pub(super) fn sync_multi_cursors_to_godot(
+pub(crate) fn sync_multi_cursors_to_godot(
     session: &mut vim_core::execution::VimSession<GodotHost>,
 ) {
     let cursor_count = session.engine().state().multi_cursor().selections().len();
@@ -756,7 +756,7 @@ pub(super) fn sync_multi_cursors_to_godot(
             .host()
             .state()
             .buffer_ref(editor_id)
-            .map_or(false, |b| b.last_caret_count() > 1);
+            .is_some_and(|b| b.last_caret_count() > 1);
 
         // MC→single transition: dispatch may have skipped SetCursor effects
         // (it used Godot's stale pre-command cursor_count > 1). Reposition the
@@ -768,7 +768,7 @@ pub(super) fn sync_multi_cursors_to_godot(
             let offset = selections.primary().head().get();
             let lc = line_index.byte_to_line_col(text, offset);
             let scrolloff = usize_to_i32(session.engine().options().scrolloff());
-            Some((lc.line as i32, lc.col as i32, scrolloff))
+            Some((lc.line, lc.col, scrolloff))
         } else {
             None
         };

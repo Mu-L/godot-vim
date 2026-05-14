@@ -79,9 +79,10 @@ impl GodotVimCore {
         connect_deferred(&mut editor, SIG_TEXT_CHANGED, &text_changed_callable);
 
         // text_set fires when CodeEdit.set_text() is called programmatically
-        // (e.g. external script reload). Reuses the same handler -- it diffs
-        // cached vs current text, which is correct for both signals.
-        let text_set_callable = self.base().callable("on_text_changed");
+        // (e.g. external script reload, VCS revert). Uses a dedicated handler
+        // because set_text() has different semantics: Godot destroys its undo
+        // stack, resets the caret to (0,0), and clears selections.
+        let text_set_callable = self.base().callable("on_text_set");
         connect_deferred(&mut editor, SIG_TEXT_SET, &text_set_callable);
 
         if let Some(controller) = &mut self.controller {
@@ -214,7 +215,7 @@ impl GodotVimCore {
         let text_changed_callable = self.base().callable("on_text_changed");
         safe_disconnect(&mut editor, SIG_TEXT_CHANGED, &text_changed_callable);
 
-        let text_set_callable = self.base().callable("on_text_changed");
+        let text_set_callable = self.base().callable("on_text_set");
         safe_disconnect(&mut editor, SIG_TEXT_SET, &text_set_callable);
 
         let scrollbar_callable = self.base().callable("on_scrollbar_changed");

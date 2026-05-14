@@ -581,6 +581,41 @@ impl GodotVimCore {
         }
     }
 
+    /// Signal handler for `text_set`. Fired when `CodeEdit.set_text()` is
+    /// called programmatically (file reload, VCS revert). Differs from
+    /// `text_changed`: Godot destroys its undo stack, resets the caret to
+    /// (0,0), and clears selections. We fence our undo tree, clear the
+    /// UndoStore, remap marks through the diff, and restore the cursor.
+    #[func]
+    fn on_text_set(&mut self) {
+        if self.processing_key {
+            return;
+        }
+        if self.controller.is_none() {
+            return;
+        }
+        let ok = panic_guard(
+            "on_text_set",
+            || {
+                let Some(editor) = &self.attached_editor else {
+                    return true;
+                };
+                if !editor.is_instance_valid() {
+                    return true;
+                }
+                let controller = self.controller.as_mut().unwrap();
+                if controller.reconcile_text_set(editor) {
+                    log::info!("on_text_set: buffer replaced externally, undo cleared, marks remapped");
+                }
+                true
+            },
+            false,
+        );
+        if !ok {
+            self.recover_controller_from_panic();
+        }
+    }
+
     /// Signal handler for `text_changed`. Detects external text changes
     /// (Find-and-Replace, refactoring, external formatters) and reconciles
     /// them with the engine for undo/dot-repeat tracking.
@@ -605,6 +640,10 @@ impl GodotVimCore {
                 let controller = self.controller.as_mut().unwrap();
                 if controller.reconcile_external_edit(editor) {
                     log::debug!("on_text_changed: reconciled external text change");
+                    self.caret_reconciler.expect_vim_move(
+                        editor.get_caret_line(),
+                        editor.get_caret_column(),
+                    );
                 }
                 true
             },
@@ -705,6 +744,17 @@ impl GodotVimCore {
 
                 if let Some(controller) = &mut self.controller {
                     controller.apply_settings(&snapshot);
+                }
+
+                // Re-sync indent settings from the attached CodeEdit.
+                // EditorSettings changes can affect indent_size / tab_size,
+                // so the engine must pick up the new values.
+                if let Some(ref editor) = self.attached_editor {
+                    if editor.is_instance_valid() {
+                        if let Some(controller) = &mut self.controller {
+                            attach::sync_indent_from_editor(editor, controller);
+                        }
+                    }
                 }
 
                 let mode = self
