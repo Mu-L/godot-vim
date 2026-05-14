@@ -16,28 +16,12 @@ use godot::classes::{
 };
 use godot::prelude::*;
 
-use vim_core::primitives::Mode;
+use vim_core::primitives::{CursorShape, CursorStyle, Mode, Operator};
 
 use crate::bridge::code_edit_ext::CodeEditExt;
 use crate::bridge::codec;
 use crate::safety::panic_guard;
 use crate::types::CharLineCol;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CursorShapeMode — which cursor shape to display
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Cursor shape, derived from Vim mode. Each variant maps to a distinct
-/// geometry in [`VimCursor::update_visual_shape`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CursorShapeMode {
-    /// Full-cell block (Normal, Visual, Operator-Pending).
-    Block,
-    /// Thin vertical beam at the left edge of the cell (Insert).
-    Beam,
-    /// Thin horizontal underline at the bottom of the cell (Replace).
-    Underline,
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CursorGeometry — pixel-perfect cursor placement
@@ -75,6 +59,7 @@ pub(crate) struct CursorGeometry {
 /// non-first lines), which happens during editor initialization or when the
 /// target line is folded/off-screen.
 pub(crate) fn compute_cursor_geometry(
+    shaped_cache: &mut ShapedTextCache,
     editor: &Gd<CodeEdit>,
     override_pos: Option<CharLineCol>,
 ) -> Option<CursorGeometry> {
@@ -127,30 +112,21 @@ pub(crate) fn compute_cursor_geometry(
     // get_caret_column()'s semantics (not byte or grapheme count).
     let line_len = editor.get_line(line).chars().len();
 
+    let mut ctx = ShapingContext {
+        shaped_cache,
+        editor,
+        font: &font,
+        font_size,
+    };
+
     let (target_x, width) = if override_pos.is_some() {
         // Override path: shapes the line once for both x and width.
-        compute_override_x_and_width(
-            editor,
-            &font,
-            font_size,
-            line,
-            col,
-            line_len,
-            fallback_char_width,
-        )
+        compute_override_x_and_width(&mut ctx, line, col, line_len, fallback_char_width)
     } else {
         // Native caret path: x from Godot's built-in draw_pos (free),
         // width from a shaped-text measurement (cached per line).
         let x = editor.get_caret_draw_pos().x;
-        let w = compute_char_width_ts(
-            editor,
-            &font,
-            font_size,
-            line,
-            col,
-            line_len,
-            fallback_char_width,
-        );
+        let w = compute_char_width_ts(&mut ctx, line, col, line_len, fallback_char_width);
         (x, w)
     };
 
@@ -159,6 +135,15 @@ pub(crate) fn compute_cursor_geometry(
         height,
         width,
     })
+}
+
+/// Shared context for shaped-text operations, reducing repeated parameter
+/// passing through the cursor geometry pipeline.
+struct ShapingContext<'a> {
+    shaped_cache: &'a mut ShapedTextCache,
+    editor: &'a Gd<CodeEdit>,
+    font: &'a Gd<Font>,
+    font_size: i32,
 }
 
 /// Compute x-coordinate and character width for an override position using a
@@ -173,62 +158,35 @@ pub(crate) fn compute_cursor_geometry(
 ///   base + shaped offset from col 0. Less accurate but the only option when
 ///   the native caret is on another line.
 fn compute_override_x_and_width(
-    editor: &Gd<CodeEdit>,
-    font: &Gd<Font>,
-    font_size: i32,
+    ctx: &mut ShapingContext,
     line: i32,
     col: i32,
     line_len: usize,
     fallback_char_width: f32,
 ) -> (f32, f32) {
+    let editor = ctx.editor;
     let draw_pos = editor.get_caret_draw_pos();
     let caret_line = editor.get_caret_line();
     let caret_col = editor.get_caret_column();
 
     // Fast path: override matches native caret, so draw_pos is exact.
     if caret_line == line && caret_col == col {
-        let w = compute_char_width_ts(
-            editor,
-            font,
-            font_size,
-            line,
-            col,
-            line_len,
-            fallback_char_width,
-        );
+        let w = compute_char_width_ts(ctx, line, col, line_len, fallback_char_width);
         return (draw_pos.x, w);
     }
 
-    let result = with_shaped_text(editor, font, font_size, line, |ts, rid| {
-        let x = if caret_line == line {
-            // Same line: shaped delta from native caret col to target col,
-            // anchored to draw_pos.x which already accounts for gutter/scroll.
-            let target_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
-            let caret_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, caret_col as i64));
-            match (target_x, caret_x) {
-                (Some(tx), Some(cx)) => {
-                    let result = draw_pos.x + (tx - cx);
-                    if is_sane_coord(result) {
-                        Some(result)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            // Different line: col-0 rect provides the pixel base, then
-            // shaped offset from col 0 to target col gives the x delta.
-            let base_rect = editor.get_rect_at_line_column(line, 0);
-            if is_invalid_rect(base_rect) || is_empty_doc_rect(base_rect) {
-                None
-            } else {
-                let base_x = base_rect.position.x as f32;
-                let col_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
-                let col0_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, 0));
-                match (col_x, col0_x) {
-                    (Some(cx), Some(c0)) => {
-                        let result = base_x + (cx - c0);
+    let result = ctx.shaped_cache
+        .get_or_shape(editor, ctx.font, ctx.font_size, line)
+        .map(|(rid, ts)| {
+            let x = if caret_line == line {
+                // Same line: shaped delta from native caret col to target col,
+                // anchored to draw_pos.x which already accounts for gutter/scroll.
+                let target_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
+                let caret_x =
+                    caret_x_from_dict(&ts.shaped_text_get_carets(rid, caret_col as i64));
+                match (target_x, caret_x) {
+                    (Some(tx), Some(cx)) => {
+                        let result = draw_pos.x + (tx - cx);
                         if is_sane_coord(result) {
                             Some(result)
                         } else {
@@ -237,30 +195,52 @@ fn compute_override_x_and_width(
                     }
                     _ => None,
                 }
-            }
-        };
-
-        // Width: shaped delta between col and col+1.
-        let width = if codec::i32_to_usize(col) < line_len {
-            let col_next = caret_x_from_dict(&ts.shaped_text_get_carets(rid, (col + 1) as i64));
-            let col_cur = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
-            match (col_next, col_cur) {
-                (Some(nx), Some(cx)) => {
-                    let w = (nx - cx).abs();
-                    if is_sane_coord(w) && w >= MIN_CURSOR_WIDTH {
-                        w
-                    } else {
-                        fallback_char_width
+            } else {
+                // Different line: col-0 rect provides the pixel base, then
+                // shaped offset from col 0 to target col gives the x delta.
+                let base_rect = editor.get_rect_at_line_column(line, 0);
+                if is_invalid_rect(base_rect) || is_empty_doc_rect(base_rect) {
+                    None
+                } else {
+                    let base_x = base_rect.position.x as f32;
+                    let col_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
+                    let col0_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, 0));
+                    match (col_x, col0_x) {
+                        (Some(cx), Some(c0)) => {
+                            let result = base_x + (cx - c0);
+                            if is_sane_coord(result) {
+                                Some(result)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
                     }
                 }
-                _ => fallback_char_width,
-            }
-        } else {
-            fallback_char_width
-        };
+            };
 
-        Some((x, width))
-    });
+            // Width: shaped delta between col and col+1.
+            let width = if codec::i32_to_usize(col) < line_len {
+                let col_next =
+                    caret_x_from_dict(&ts.shaped_text_get_carets(rid, (col + 1) as i64));
+                let col_cur = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
+                match (col_next, col_cur) {
+                    (Some(nx), Some(cx)) => {
+                        let w = (nx - cx).abs();
+                        if is_sane_coord(w) && w >= MIN_CURSOR_WIDTH {
+                            w
+                        } else {
+                            fallback_char_width
+                        }
+                    }
+                    _ => fallback_char_width,
+                }
+            } else {
+                fallback_char_width
+            };
+
+            (x, width)
+        });
 
     let fallback_x = || -> f32 {
         let rect = editor.get_rect_at_line_column(line, col);
@@ -284,7 +264,7 @@ fn compute_override_x_and_width(
 /// moves to a different line, the old RID is freed and a new one shaped.
 /// The TextServer `Gd` reference is kept alive to ensure the RID remains
 /// valid and can be freed on invalidation or drop.
-struct ShapedTextCache {
+pub(crate) struct ShapedTextCache {
     /// -1 = no cached line.
     line: i32,
     rid: Rid,
@@ -293,7 +273,7 @@ struct ShapedTextCache {
 }
 
 impl ShapedTextCache {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             line: -1,
             rid: Rid::new(0),
@@ -301,7 +281,7 @@ impl ShapedTextCache {
         }
     }
 
-    fn get_or_shape(
+    pub(crate) fn get_or_shape(
         &mut self,
         editor: &Gd<CodeEdit>,
         font: &Gd<Font>,
@@ -338,7 +318,7 @@ impl ShapedTextCache {
         Some((self.rid, ts_ref))
     }
 
-    fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
         // Guard: only free when Godot is still running, otherwise the
         // TextServer singleton is already destroyed and the call would crash.
         if self.line >= 0 && godot::sys::is_initialized() {
@@ -358,35 +338,8 @@ impl Drop for ShapedTextCache {
     }
 }
 
-// Thread-local: Godot is single-threaded, and multiple `with_shaped_text`
-// calls in the same frame (x + width) reuse the cached RID.
-thread_local! {
-    static SHAPED_CACHE: std::cell::RefCell<ShapedTextCache> =
-        std::cell::RefCell::new(ShapedTextCache::new());
-}
-
-fn with_shaped_text<T>(
-    editor: &Gd<CodeEdit>,
-    font: &Gd<Font>,
-    font_size: i32,
-    line: i32,
-    f: impl FnOnce(&mut Gd<godot::classes::TextServer>, Rid) -> Option<T>,
-) -> Option<T> {
-    SHAPED_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let (rid, ts) = cache.get_or_shape(editor, font, font_size, line)?;
-        f(ts, rid)
-    })
-}
-
-/// Must be called after any text mutation to prevent stale glyph measurements.
-pub(crate) fn invalidate_shaped_cache() {
-    SHAPED_CACHE.with(|cache| {
-        cache.borrow_mut().invalidate();
-    });
-}
-
 fn shaped_text_caret_delta(
+    shaped_cache: &mut ShapedTextCache,
     editor: &Gd<CodeEdit>,
     font: &Gd<Font>,
     font_size: i32,
@@ -394,11 +347,10 @@ fn shaped_text_caret_delta(
     target_col: i32,
     caret_col: i32,
 ) -> Option<f32> {
-    with_shaped_text(editor, font, font_size, line, |ts, rid| {
-        let target_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, target_col as i64));
-        let caret_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, caret_col as i64));
-        Some(target_x? - caret_x?)
-    })
+    let (rid, ts) = shaped_cache.get_or_shape(editor, font, font_size, line)?;
+    let target_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, target_col as i64));
+    let caret_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, caret_col as i64));
+    Some(target_x? - caret_x?)
 }
 
 /// Extract the leading caret x from `shaped_text_get_carets()`.
@@ -428,9 +380,7 @@ fn caret_x_from_dict(dict: &VarDictionary) -> Option<f32> {
 /// Only used on the non-override (native caret) path; the override path
 /// computes width inside `compute_override_x_and_width` to share the RID.
 fn compute_char_width_ts(
-    editor: &Gd<CodeEdit>,
-    font: &Gd<Font>,
-    font_size: i32,
+    ctx: &mut ShapingContext,
     line: i32,
     col: i32,
     line_len: usize,
@@ -440,7 +390,7 @@ fn compute_char_width_ts(
         return fallback;
     }
 
-    if let Some(delta) = shaped_text_caret_delta(editor, font, font_size, line, col + 1, col) {
+    if let Some(delta) = shaped_text_caret_delta(ctx.shaped_cache, ctx.editor, ctx.font, ctx.font_size, line, col + 1, col) {
         let w = delta.abs();
         if is_sane_coord(w) && w >= MIN_CURSOR_WIDTH {
             return w;
@@ -494,6 +444,122 @@ impl Default for CursorColorMap {
             command: defaults::cursor_command(),
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Operator HSL tint — per-operator cursor color differentiation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the hue rotation in degrees for a given operator, used to
+/// visually differentiate the operator-pending cursor color.
+fn operator_hue_rotation(op: &Operator) -> f32 {
+    match op {
+        Operator::Delete => 0.0,
+        Operator::Change => 120.0,
+        Operator::Yank => 240.0,
+        Operator::Indent | Operator::Outdent | Operator::Reindent => 60.0,
+        Operator::ToggleCase
+        | Operator::Uppercase
+        | Operator::Lowercase
+        | Operator::Rot13
+        | Operator::Rot47 => 180.0,
+        Operator::Format | Operator::FormatKeepCursor | Operator::Filter => 300.0,
+        // Custom, Composed, CallOperatorFunc, and any future variants.
+        _ => 0.0,
+    }
+}
+
+/// Apply a per-operator hue shift to a base color. Converts RGB to HSL,
+/// rotates the hue by the operator's assigned rotation, and converts back.
+/// Alpha is preserved. Short-circuits when the rotation is zero.
+fn apply_operator_hue_shift(base: Color, op: &Operator) -> Color {
+    let rotation = operator_hue_rotation(op);
+    if rotation == 0.0 {
+        return base;
+    }
+
+    let (h, s, l) = rgb_to_hsl(base.r, base.g, base.b);
+    let new_h = (h + rotation) % 360.0;
+    let (r, g, b) = hsl_to_rgb(new_h, s, l);
+    Color::from_rgba(r, g, b, base.a)
+}
+
+/// Standard RGB to HSL conversion.
+/// R, G, B in [0, 1]. Returns H in [0, 360), S and L in [0, 1].
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+
+    if (max - min).abs() < f32::EPSILON {
+        // Achromatic (gray/black/white).
+        return (0.0, 0.0, l);
+    }
+
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+
+    let h = if (max - r).abs() < f32::EPSILON {
+        let mut h = (g - b) / d;
+        if g < b {
+            h += 6.0;
+        }
+        h
+    } else if (max - g).abs() < f32::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+
+    (h * 60.0, s, l)
+}
+
+/// Standard HSL to RGB conversion.
+/// H in [0, 360), S and L in [0, 1]. Returns R, G, B in [0, 1].
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s.abs() < f32::EPSILON {
+        // Achromatic.
+        return (l, l, l);
+    }
+
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let h_norm = h / 360.0;
+
+    let r = hue_to_rgb(p, q, h_norm + 1.0 / 3.0);
+    let g = hue_to_rgb(p, q, h_norm);
+    let b = hue_to_rgb(p, q, h_norm - 1.0 / 3.0);
+
+    (r, g, b)
+}
+
+/// Helper for `hsl_to_rgb`: converts a single hue sector to an RGB channel.
+fn hue_to_rgb(p: f32, q: f32, t: f32) -> f32 {
+    let mut t = t;
+    if t < 0.0 {
+        t += 1.0;
+    }
+    if t > 1.0 {
+        t -= 1.0;
+    }
+    if t < 1.0 / 6.0 {
+        return p + (q - p) * 6.0 * t;
+    }
+    if t < 1.0 / 2.0 {
+        return q;
+    }
+    if t < 2.0 / 3.0 {
+        return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+    }
+    p
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -590,7 +656,8 @@ pub struct VimCursor {
     /// Alpha ceiling from the current mode's color. The blink cycle
     /// oscillates between 0 and this value.
     base_alpha: f32,
-    shape_mode: CursorShapeMode,
+    cursor_shape: CursorShape,
+    blink_enabled: bool,
 
     /// Reused across mode changes to avoid StyleBoxFlat allocation churn.
     cached_style: Option<Gd<StyleBoxFlat>>,
@@ -613,7 +680,8 @@ impl IControl for VimCursor {
             font_height: 20.0,
             char_width: 10.0,
             base_alpha: 0.5,
-            shape_mode: CursorShapeMode::Block,
+            cursor_shape: CursorShape::Block,
+            blink_enabled: false,
             cached_style: None,
             color_map: CursorColorMap::default(),
             beam_width: BEAM_CURSOR_WIDTH,
@@ -692,14 +760,15 @@ impl IControl for VimCursor {
                         self.base_mut().set_position(target);
                     }
 
-                    // Square-wave blink: sin(t) >= 0 -> visible, < 0 -> hidden.
-                    self.animation.blink_time += delta * self.animation.blink_speed;
-                    let blink_factor = if self.animation.blink_time.sin() >= 0.0 {
-                        1.0
-                    } else {
-                        0.0
-                    };
-                    self.update_alpha(self.base_alpha * blink_factor);
+                    if self.blink_enabled {
+                        self.animation.blink_time += delta * self.animation.blink_speed;
+                        let blink_factor = if self.animation.blink_time.sin() >= 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        self.update_alpha(self.base_alpha * blink_factor);
+                    }
                 }
 
                 // Manual clip: the screen_texture shader bypasses Godot's
@@ -759,21 +828,16 @@ impl VimCursor {
         }
     }
 
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.shape_mode = if mode.is_insert() {
-            CursorShapeMode::Beam
-        } else if mode.is_replace() {
-            CursorShapeMode::Underline
-        } else {
-            CursorShapeMode::Block
-        };
+    pub fn set_style(&mut self, style: CursorStyle, mode: Mode) {
+        self.cursor_shape = style.shape;
+        self.blink_enabled = style.blink;
         self.animation.blink_time = 0.0;
         self.update_alpha(1.0);
         self.update_visual_style(mode);
         self.update_visual_shape();
     }
 
-    /// Takes effect on the next `set_mode` call.
+    /// Takes effect on the next `set_style` call.
     pub fn set_color_map(&mut self, map: CursorColorMap) {
         self.color_map = map;
     }
@@ -825,11 +889,19 @@ impl VimCursor {
             Mode::Normal => self.color_map.normal,
             Mode::Insert => self.color_map.insert,
             Mode::Visual(_) => self.color_map.visual,
+            Mode::Select(_) => self.color_map.visual,
             Mode::Replace | Mode::VirtualReplace => self.color_map.replace,
-            Mode::OperatorPending(_) => self.color_map.operator,
+            Mode::OperatorPending(ref op) => {
+                apply_operator_hue_shift(self.color_map.operator, op)
+            }
             Mode::CommandLine => self.color_map.command,
-            // Mode is #[non_exhaustive] in vim-core.
-            _ => self.color_map.normal,
+            _ => {
+                log::warn!(
+                    "VimCursor: unrecognized Mode variant {:?}, falling back to normal color",
+                    mode
+                );
+                self.color_map.normal
+            }
         };
 
         if let Some(ref mut style) = self.cached_style {
@@ -855,19 +927,215 @@ impl VimCursor {
             return;
         };
 
-        match self.shape_mode {
-            CursorShapeMode::Beam => {
+        match self.cursor_shape {
+            CursorShape::VerticalBar => {
                 visual.set_size(Vector2::new(self.beam_width, self.font_height));
                 visual.set_position(Vector2::new(0.0, 0.0));
             }
-            CursorShapeMode::Underline => {
+            CursorShape::HorizontalBar => {
                 visual.set_size(Vector2::new(self.char_width, self.underline_height));
                 visual.set_position(Vector2::new(0.0, self.font_height - self.underline_height));
             }
-            CursorShapeMode::Block => {
+            CursorShape::HalfBlock => {
+                let half = self.font_height / 2.0;
+                visual.set_size(Vector2::new(self.char_width, half));
+                visual.set_position(Vector2::new(0.0, half));
+            }
+            CursorShape::Block => {
                 visual.set_size(Vector2::new(self.char_width, self.font_height));
                 visual.set_position(Vector2::new(0.0, 0.0));
             }
+            _ => {
+                log::warn!(
+                    "VimCursor: unrecognized CursorShape {:?}, falling back to Block",
+                    self.cursor_shape
+                );
+                visual.set_size(Vector2::new(self.char_width, self.font_height));
+                visual.set_position(Vector2::new(0.0, 0.0));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.02
+    }
+
+    #[test]
+    fn delete_has_zero_rotation() {
+        let base = Color::from_rgba(0.8, 0.2, 0.3, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Delete);
+        assert_eq!(result.r, base.r);
+        assert_eq!(result.g, base.g);
+        assert_eq!(result.b, base.b);
+        assert_eq!(result.a, base.a);
+    }
+
+    #[test]
+    fn alpha_preserved() {
+        let base = Color::from_rgba(1.0, 0.0, 0.0, 0.7);
+        let result = apply_operator_hue_shift(base, &Operator::Yank);
+        assert!(approx_eq(result.a, 0.7), "alpha was {}, expected 0.7", result.a);
+    }
+
+    #[test]
+    fn change_rotates_120_degrees() {
+        // Pure red + 120 degrees = pure green.
+        let base = Color::from_rgba(1.0, 0.0, 0.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Change);
+        assert!(approx_eq(result.r, 0.0), "r was {}, expected 0.0", result.r);
+        assert!(approx_eq(result.g, 1.0), "g was {}, expected 1.0", result.g);
+        assert!(approx_eq(result.b, 0.0), "b was {}, expected 0.0", result.b);
+    }
+
+    #[test]
+    fn yank_rotates_240_degrees() {
+        // Pure red + 240 degrees = pure blue.
+        let base = Color::from_rgba(1.0, 0.0, 0.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Yank);
+        assert!(approx_eq(result.r, 0.0), "r was {}, expected 0.0", result.r);
+        assert!(approx_eq(result.g, 0.0), "g was {}, expected 0.0", result.g);
+        assert!(approx_eq(result.b, 1.0), "b was {}, expected 1.0", result.b);
+    }
+
+    #[test]
+    fn gray_unchanged_by_rotation() {
+        let base = Color::from_rgba(0.5, 0.5, 0.5, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Change);
+        assert!(approx_eq(result.r, 0.5), "r was {}, expected 0.5", result.r);
+        assert!(approx_eq(result.g, 0.5), "g was {}, expected 0.5", result.g);
+        assert!(approx_eq(result.b, 0.5), "b was {}, expected 0.5", result.b);
+    }
+
+    #[test]
+    fn black_unchanged_by_rotation() {
+        let base = Color::from_rgba(0.0, 0.0, 0.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Yank);
+        assert!(approx_eq(result.r, 0.0), "r was {}, expected 0.0", result.r);
+        assert!(approx_eq(result.g, 0.0), "g was {}, expected 0.0", result.g);
+        assert!(approx_eq(result.b, 0.0), "b was {}, expected 0.0", result.b);
+    }
+
+    #[test]
+    fn white_unchanged_by_rotation() {
+        let base = Color::from_rgba(1.0, 1.0, 1.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::ToggleCase);
+        assert!(approx_eq(result.r, 1.0), "r was {}, expected 1.0", result.r);
+        assert!(approx_eq(result.g, 1.0), "g was {}, expected 1.0", result.g);
+        assert!(approx_eq(result.b, 1.0), "b was {}, expected 1.0", result.b);
+    }
+
+    #[test]
+    fn indent_rotates_60_degrees() {
+        // Pure red + 60 degrees = yellow (1, 1, 0).
+        let base = Color::from_rgba(1.0, 0.0, 0.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Indent);
+        assert!(approx_eq(result.r, 1.0), "r was {}, expected 1.0", result.r);
+        assert!(approx_eq(result.g, 1.0), "g was {}, expected 1.0", result.g);
+        assert!(approx_eq(result.b, 0.0), "b was {}, expected 0.0", result.b);
+    }
+
+    #[test]
+    fn unknown_operator_no_rotation() {
+        let base = Color::from_rgba(0.4, 0.6, 0.8, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Custom(42));
+        assert_eq!(result.r, base.r);
+        assert_eq!(result.g, base.g);
+        assert_eq!(result.b, base.b);
+        assert_eq!(result.a, base.a);
+    }
+}
+
+#[cfg(test)]
+const HANDLED_CURSOR_SHAPES: &[vim_core::primitives::CursorShape] = &[
+    vim_core::primitives::CursorShape::Block,
+    vim_core::primitives::CursorShape::VerticalBar,
+    vim_core::primitives::CursorShape::HorizontalBar,
+    vim_core::primitives::CursorShape::HalfBlock,
+];
+
+#[cfg(test)]
+mod cursor_shape_coverage_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn cursor_shape_dispatch_covers_all_variants() {
+        let handled: HashSet<_> = HANDLED_CURSOR_SHAPES.iter().copied().collect();
+        let all: HashSet<_> = CursorShape::ALL.iter().copied().collect();
+        let missing: Vec<_> = all.difference(&handled).collect();
+        assert!(
+            missing.is_empty(),
+            "Unhandled CursorShape variants: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn handled_cursor_shapes_has_no_duplicates() {
+        let mut seen = HashSet::new();
+        for kind in HANDLED_CURSOR_SHAPES {
+            assert!(
+                seen.insert(kind),
+                "Duplicate in HANDLED_CURSOR_SHAPES: {:?}",
+                kind
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+const HANDLED_OPERATORS: &[vim_core::primitives::OperatorKind] = &[
+    vim_core::primitives::OperatorKind::Delete,
+    vim_core::primitives::OperatorKind::Change,
+    vim_core::primitives::OperatorKind::Yank,
+    vim_core::primitives::OperatorKind::Indent,
+    vim_core::primitives::OperatorKind::Outdent,
+    vim_core::primitives::OperatorKind::ToggleCase,
+    vim_core::primitives::OperatorKind::Uppercase,
+    vim_core::primitives::OperatorKind::Lowercase,
+    vim_core::primitives::OperatorKind::Format,
+    vim_core::primitives::OperatorKind::FormatKeepCursor,
+    vim_core::primitives::OperatorKind::CallOperatorFunc,
+    vim_core::primitives::OperatorKind::Filter,
+    vim_core::primitives::OperatorKind::Reindent,
+    vim_core::primitives::OperatorKind::Rot13,
+    vim_core::primitives::OperatorKind::Rot47,
+    vim_core::primitives::OperatorKind::Custom,
+    vim_core::primitives::OperatorKind::Composed,
+];
+
+#[cfg(test)]
+mod operator_coverage_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use vim_core::primitives::OperatorKind;
+
+    #[test]
+    fn operator_dispatch_covers_all_variants() {
+        let handled: HashSet<_> = HANDLED_OPERATORS.iter().copied().collect();
+        let all: HashSet<_> = OperatorKind::ALL.iter().copied().collect();
+        let missing: Vec<_> = all.difference(&handled).collect();
+        assert!(
+            missing.is_empty(),
+            "Unhandled OperatorKind variants: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn handled_operators_has_no_duplicates() {
+        let mut seen = HashSet::new();
+        for kind in HANDLED_OPERATORS {
+            assert!(
+                seen.insert(kind),
+                "Duplicate in HANDLED_OPERATORS: {:?}",
+                kind
+            );
         }
     }
 }

@@ -13,11 +13,12 @@
 
 use godot::classes::CodeEdit;
 use godot::prelude::*;
-use vim_core::execution::VimEngine;
+use vim_core::execution::{VimEngine, VimSession};
 use vim_core::keymap::{Key, KeyEvent, Modifiers};
 
 use crate::bridge;
 use crate::bridge::codec::usize_to_i32;
+use crate::bridge::godot_host::GodotHost;
 
 /// Godot returns -1 when no completion popup is visible.
 fn is_completion_active(editor: &Gd<CodeEdit>) -> bool {
@@ -29,11 +30,11 @@ fn is_completion_active(editor: &Gd<CodeEdit>) -> bool {
 /// Returns `Some(consumed)` if the key was handled here (skip engine).
 /// Returns `None` if the engine should process the key normally.
 pub(crate) fn try_handle_completion(
-    engine: &mut VimEngine,
+    session: &mut VimSession<GodotHost>,
     key: KeyEvent,
     editor: &mut Gd<CodeEdit>,
 ) -> Option<bool> {
-    let mode = engine.mode();
+    let mode = session.engine().mode();
     let in_insert = mode.is_insert() || mode.is_replace();
 
     // Ctrl+Space → Ctrl+@ after bridge translation: force-trigger completion.
@@ -89,7 +90,7 @@ pub(crate) fn try_handle_completion(
         // Tab / Enter: confirm and reconcile the text delta with the engine
         // so dot-repeat and macro recording capture the completed text.
         Key::Tab | Key::Enter => {
-            confirm_and_reconcile_completion(engine, editor);
+            confirm_and_reconcile_completion(session, editor);
             Some(true)
         }
 
@@ -182,12 +183,19 @@ fn is_completion_prefix(editor: &Gd<CodeEdit>, ch: char) -> bool {
 /// contiguous diff (common-prefix / common-suffix), and feed it to the
 /// engine as an `ExternalEdit`. The engine records the net-new text
 /// internally for dot-repeat.
-fn confirm_and_reconcile_completion(engine: &mut VimEngine, editor: &mut Gd<CodeEdit>) {
+fn confirm_and_reconcile_completion(
+    session: &mut VimSession<GodotHost>,
+    editor: &mut Gd<CodeEdit>,
+) {
     let before_text = editor.get_text().to_string();
 
     // CodeEdit replaces `code_completion_base` (the typed prefix) with the
     // selected item's `insert_text`. This is the only mutation.
     editor.confirm_code_completion_ex().replace(false).done();
+
+    // Fix 4B: Invalidate cache IMMEDIATELY after confirm so that
+    // host.text() reflects post-completion state for undo node sync.
+    session.host_mut().invalidate_cache();
 
     let after_text = editor.get_text().to_string();
     let after_index = bridge::codec::LineIndex::new(&after_text);
@@ -198,10 +206,15 @@ fn confirm_and_reconcile_completion(engine: &mut VimEngine, editor: &mut Gd<Code
     );
 
     super::reconcile::reconcile_external_text_change(
-        engine,
+        session.engine_mut(),
         &before_text,
         &after_text,
         after_byte,
         vim_core::execution::ExternalEditKind::Completion,
     );
+
+    // Fix 4A: Sync undo nodes so pressing `u` past a completion doesn't
+    // silently skip it. The engine created an undo node during
+    // reconciliation; we must create a matching UndoStore snapshot.
+    super::sync_undo_nodes_after_external_edit(session, &before_text);
 }

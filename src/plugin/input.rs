@@ -2,6 +2,10 @@
 //! `input()` (cross-panel/dock navigation) and per-editor `gui_input()`
 //! (keystroke processing through the Vim engine).
 
+// Promote #[must_use] warnings to errors so that dropping an EngineOutcome
+// without calling .apply_ui_update() or .discard() is a compile-time error.
+#![deny(unused_must_use)]
+
 use godot::classes::{CodeEdit, EditorInterface, InputEvent, InputEventKey};
 use godot::global::Key;
 use godot::prelude::*;
@@ -11,6 +15,7 @@ use crate::controller::VimController;
 use crate::navigation::{self, classify_focus, FocusContext};
 use crate::ui::UiCoordinator;
 
+use super::outcome::EngineOutcome;
 use super::processing_guard::ProcessingKeyGuard;
 use super::GodotVimCore;
 
@@ -119,13 +124,9 @@ impl GodotVimCore {
             FocusContext::Editor | FocusContext::Foreign | FocusContext::Unknown => false,
             FocusContext::Dock(kind, control) => {
                 let result = if navigation::is_in_filesystem_dock(&control) {
-                    let fs_result =
-                        self.fs_explorer.handle_key(&key_event, &control, kind);
+                    let fs_result = self.fs_explorer.handle_key(&key_event, &control, kind);
                     if fs_result.is_consumed() {
-                        log::trace!(
-                            "input: filesystem explorer consumed key={:?}",
-                            keycode
-                        );
+                        log::trace!("input: filesystem explorer consumed key={:?}", keycode);
                         fs_result
                     } else {
                         navigation::handle_dock_input(control, &key_event, kind)
@@ -166,6 +167,9 @@ impl GodotVimCore {
         if !editor.is_instance_valid() || !editor.has_focus() {
             return;
         }
+
+        // ── Mouse wheel interception ─────────────────────────────────────
+        // Route mouse wheel through the vim engine as Ctrl-Y (scroll up) /
         let Ok(key_event) = event.try_cast::<InputEventKey>() else {
             return;
         };
@@ -234,11 +238,7 @@ impl GodotVimCore {
         };
         let mut ed = editor.clone();
 
-        // Capture caret position BEFORE processing so we can detect whether
-        // the keystroke actually moved the cursor (see suppression below).
-        let pos_before = (ed.get_caret_line(), ed.get_caret_column());
-
-        let consumed = {
+        let outcome = {
             let _guard = ProcessingKeyGuard::new(&mut self.processing_key);
             let Some(controller) = &mut self.controller else {
                 return;
@@ -253,55 +253,23 @@ impl GodotVimCore {
             controller.ui_snapshot(ed.instance_id())
         };
 
-        // UI updates unconditionally -- non-consumed keys (e.g. mouse clicks
-        // propagated through) can still change cursor position or visual state.
-        self.ui.update(&snap, &mut ed);
+        let applied = EngineOutcome::with_snapshot(snap, outcome)
+            .apply_ui_update(&mut self.ui, &mut ed, &mut self.caret_reconciler);
 
-        // Suppress the deferred caret_changed that will fire from Vim-driven
-        // cursor moves. Only increment when the cursor actually moved —
-        // Godot only emits caret_changed on position change, so incrementing
-        // without movement causes the counter to drift upward and swallow
-        // subsequent mouse clicks (Round 14 audit finding).
-        if consumed {
-            let pos_after = (ed.get_caret_line(), ed.get_caret_column());
-            if pos_before != pos_after {
-                self.pending_caret_suppressions += 1;
-            }
-        }
-        self.pending_caret_suppressions = self.pending_caret_suppressions.min(4);
-
-        log::trace!("gui_input: key={} consumed={}", key, consumed);
-        if consumed {
+        log::trace!(
+            "gui_input: key={} outcome={}",
+            key,
+            applied.pipeline.log_label()
+        );
+        if applied.pipeline.should_mark_handled() {
             if let Some(mut vp) = editor.get_viewport() {
                 vp.set_input_as_handled();
             }
         }
 
         if let Some(controller) = &mut self.controller {
-            if let Some(action) = controller.take_pending_ui_action() {
+            for action in controller.take_pending_ui_actions() {
                 self.handle_pending_ui_action(action);
-            }
-        }
-
-        // Drain deferred tooltip request from Tier 2 of show_documentation_tooltip.
-        if let Some(data) = crate::bridge::port_impl::take_pending_tooltip_data() {
-            if let Some(editor) = &self.attached_editor {
-                let editor_id = editor.instance_id();
-                let now = godot::classes::Time::singleton().get_ticks_usec();
-                self.pending_tooltip = Some(super::PendingTooltip {
-                    symbol: data.symbol,
-                    line: data.line,
-                    col: data.col,
-                    warp_pos: data.warp_pos,
-                    editor_id,
-                    created_at_usec: now,
-                    phase: super::TooltipPhase::WaitingForRelease,
-                });
-                self.base_mut().set_process(true);
-                log::debug!(
-                    "handle_gui_input: queued deferred tooltip for '{}'",
-                    self.pending_tooltip.as_ref().unwrap().symbol
-                );
             }
         }
 
@@ -334,10 +302,6 @@ impl GodotVimCore {
         }
         let mut ed = editor.clone();
 
-        // Capture caret position BEFORE timeout resolution so we can detect
-        // whether the resolved keys actually moved the cursor.
-        let pos_before = (ed.get_caret_line(), ed.get_caret_column());
-
         let had_operations = {
             let _guard = ProcessingKeyGuard::new(&mut self.processing_key);
             if let Some(controller) = &mut self.controller {
@@ -349,25 +313,29 @@ impl GodotVimCore {
         };
 
         let editor_id = ed.instance_id();
-        let snap = self.controller.as_mut().map(|c| c.ui_snapshot(editor_id));
-        if let Some(snap) = snap {
-            self.ui.update(&snap, &mut ed);
+        if let Some(controller) = &mut self.controller {
+            let snap = controller.ui_snapshot(editor_id);
+            // Use EngineConsumed when operations happened so apply_ui_update
+            // sets a caret expectation; Passthrough otherwise so it does not.
+            let pipeline = if had_operations {
+                // Dummy ProcessResult -- only may_have_moved_cursor() matters,
+                // which is true for EngineConsumed regardless of the payload.
+                crate::controller::PipelineOutcome::EngineConsumed(
+                    vim_core::execution::host_api::ProcessResult {
+                        consumed: true,
+                        host_requests: Vec::new(),
+                        deferred_actions: Vec::new(),
+                    },
+                )
+            } else {
+                crate::controller::PipelineOutcome::Passthrough
+            };
+            EngineOutcome::with_snapshot(snap, pipeline)
+                .apply_ui_update(&mut self.ui, &mut ed, &mut self.caret_reconciler);
         }
-
-        // Only suppress if keys were actually processed AND the cursor moved.
-        // A spurious timeout with no pending keys must not eat a legitimate
-        // external caret change, and a timeout that resolved keys without
-        // moving the cursor must not drift the counter (Round 14 audit finding).
-        if had_operations {
-            let pos_after = (ed.get_caret_line(), ed.get_caret_column());
-            if pos_before != pos_after {
-                self.pending_caret_suppressions += 1;
-            }
-        }
-        self.pending_caret_suppressions = self.pending_caret_suppressions.min(4);
 
         if let Some(controller) = &mut self.controller {
-            if let Some(action) = controller.take_pending_ui_action() {
+            for action in controller.take_pending_ui_actions() {
                 self.handle_pending_ui_action(action);
             }
         }
@@ -385,6 +353,11 @@ impl GodotVimCore {
         }
     }
 
+    /// Route a mouse-wheel event through the vim engine.
+    ///
+    /// Feeds Ctrl-Y (scroll up) or Ctrl-E (scroll down) through the normal
+    /// `process_cycle` pipeline, repeating 3 times to match Godot's default
+    /// scroll speed. Consumes the event so Godot's native scroll doesn't fire.
     /// Reconcile external cursor/selection changes with Vim engine state.
     /// Connected DEFERRED to avoid re-entrancy during text edits.
     ///
@@ -394,9 +367,22 @@ impl GodotVimCore {
     /// 3. No selection + Visual -- click deselected; exit Visual
     /// 4. Selection + Visual  -- mouse extending; update Visual extents
     pub(super) fn on_caret_changed_impl(&mut self) {
-        if self.pending_caret_suppressions > 0 {
-            self.pending_caret_suppressions = self.pending_caret_suppressions.saturating_sub(1);
-            return;
+        // Read caret position and check reconciler BEFORE any mutable borrows.
+        // Uses a block to drop the immutable borrow of attached_editor before
+        // cancel_pending_tooltip borrows &mut self.
+        let (line, col) = {
+            let Some(editor) = &self.attached_editor else {
+                return;
+            };
+            if !editor.is_instance_valid() {
+                return;
+            }
+            (editor.get_caret_line(), editor.get_caret_column())
+        };
+
+        match self.caret_reconciler.check_and_consume(line, col) {
+            super::caret_reconcile::CaretOrigin::VimDriven => return,
+            super::caret_reconcile::CaretOrigin::External => {}
         }
 
         self.cancel_pending_tooltip();
@@ -411,7 +397,6 @@ impl GodotVimCore {
         if !editor.is_instance_valid() {
             return;
         }
-
         let mut ed = editor.clone();
         let has_selection = ed.has_selection();
         let mode = controller.mode();
@@ -421,7 +406,7 @@ impl GodotVimCore {
             apply_mouse_selection(
                 controller,
                 &mut ed,
-                &mut self.pending_caret_suppressions,
+                &mut self.caret_reconciler,
                 &mut self.ui,
             );
         } else if !has_selection && mode.is_visual_or_select() {
@@ -436,13 +421,14 @@ impl GodotVimCore {
             controller.set_engine_sticky_column(grapheme_col);
 
             let snap = controller.ui_snapshot(editor_id);
-            self.ui.update(&snap, &mut ed);
+            EngineOutcome::with_snapshot(snap, crate::controller::PipelineOutcome::Passthrough)
+                .apply_ui_update(&mut self.ui, &mut ed, &mut self.caret_reconciler);
         } else if has_selection && mode.is_visual_or_select() {
             log::trace!("on_caret_changed: visual selection updated");
             apply_mouse_selection(
                 controller,
                 &mut ed,
-                &mut self.pending_caret_suppressions,
+                &mut self.caret_reconciler,
                 &mut self.ui,
             );
         } else {
@@ -460,7 +446,7 @@ impl GodotVimCore {
 fn apply_mouse_selection(
     controller: &mut VimController,
     ed: &mut Gd<CodeEdit>,
-    pending_caret_suppressions: &mut u32,
+    reconciler: &mut super::caret_reconcile::CaretReconciler,
     ui: &mut UiCoordinator,
 ) {
     let shape = detect_selection_shape(ed);
@@ -495,12 +481,21 @@ fn apply_mouse_selection(
         controller.process_mouse_selection(ed, anchor_line, anchor_col, head_line, head_col, shape);
 
     if did_change {
-        *pending_caret_suppressions += 1;
-        *pending_caret_suppressions = (*pending_caret_suppressions).min(4);
-
         let editor_id = ed.instance_id();
         let snap = controller.ui_snapshot(editor_id);
-        ui.update(&snap, ed);
+        // Use EngineConsumed so apply_ui_update sets a caret expectation
+        // (mouse selection moves the cursor from the engine's perspective).
+        EngineOutcome::with_snapshot(
+            snap,
+            crate::controller::PipelineOutcome::EngineConsumed(
+                vim_core::execution::host_api::ProcessResult {
+                    consumed: true,
+                    host_requests: Vec::new(),
+                    deferred_actions: Vec::new(),
+                },
+            ),
+        )
+        .apply_ui_update(ui, ed, reconciler);
     }
 }
 

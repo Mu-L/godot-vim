@@ -1,6 +1,6 @@
 //! [`GodotHost`]: Godot-side host adapter implementing `Document + VimHost`.
 //!
-//! Owns the `Gd<CodeEdit>`, text cache, cursor state, shell state, undo depth,
+//! Owns the `Gd<CodeEdit>`, text cache, cursor state, shell state,
 //! and providers. Delegates effect application to [`crate::effects::dispatch`]
 //! and host request handling to [`crate::host::execute`].
 //!
@@ -22,7 +22,6 @@ use super::codec::{self, LineIndex};
 use super::context::{OwnedGodotFoldProvider, OwnedGodotIndentProvider};
 use super::port_impl::{AutoBraceSnapshot, SyntaxRegion};
 use crate::effects::dispatch::{AutoBraceMode, DispatchContext};
-use crate::effects::UndoDepth;
 use crate::host::SecurityPolicy;
 use crate::settings::{FileAccessScope, ProjectVimrc, ShellExecution};
 use crate::state::ShellState;
@@ -44,6 +43,12 @@ pub(crate) enum PendingUiAction {
     Vimdebug(compact_str::CompactString),
     PerfReport,
     PerfReset,
+    ShowTooltip {
+        symbol: String,
+        line: i32,
+        col: i32,
+        warp_pos: Option<Vector2i>,
+    },
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -53,7 +58,7 @@ pub(crate) enum PendingUiAction {
 /// Godot-side host adapter implementing [`Document`] + [`VimHost`].
 ///
 /// Wraps a `Gd<CodeEdit>` and provides the document cache, cursor state,
-/// selection, viewport, shell state, undo depth, and fold/indent providers
+/// selection, viewport, shell state, and fold/indent providers
 /// that `VimSession<GodotHost>` needs.
 pub(crate) struct GodotHost {
     // ── Document backing ────────────────────────────────────────────────
@@ -65,12 +70,10 @@ pub(crate) struct GodotHost {
 
     // ── VimHost state ───────────────────────────────────────────────────
     cursor_offset: usize,
-    visual_selection: Option<crate::state::buffer::VisualSelectionState>,
     viewport: ViewportInfo,
 
     // ── Effect dispatch state ───────────────────────────────────────────
     state: ShellState,
-    undo_depth: UndoDepth,
 
     // ── Providers (own Gd<CodeEdit> clones) ─────────────────────────────
     fold_provider: OwnedGodotFoldProvider,
@@ -87,6 +90,8 @@ pub(crate) struct GodotHost {
     highlight_yank_duration_ms: u32,
     auto_brace_eligible: bool,
     engine_auto_pairs_active: bool,
+    #[allow(clippy::type_complexity)]
+    brace_pair_cache: Option<(InstanceId, std::rc::Rc<Vec<(String, String)>>)>,
 
     // ── Deferred actions for controller ─────────────────────────────────
     pending_ui_actions: Vec<PendingUiAction>,
@@ -151,7 +156,10 @@ impl VimHost for GodotHost {
     }
 
     fn selection(&self) -> Option<SelectionRange> {
-        self.visual_selection
+        let editor_id = self.editor.instance_id();
+        self.state
+            .buffer_ref(editor_id)
+            .and_then(|b| b.visual())
             .map(|vs| SelectionRange::new(vs.anchor, vs.head))
     }
 
@@ -191,7 +199,7 @@ impl VimHost for GodotHost {
         };
 
         let mut auto_brace_snapshot = if self.auto_brace_eligible {
-            AutoBraceSnapshot::from_editor(&self.editor)
+            AutoBraceSnapshot::from_editor(&self.editor, &mut self.brace_pair_cache)
         } else {
             AutoBraceSnapshot::disabled()
         };
@@ -205,25 +213,25 @@ impl VimHost for GodotHost {
 
         // Clone editor for syntax closure (Gd::clone is a cheap refcount bump).
         let editor_for_syntax = self.editor.clone();
+        let cursor_count = self.editor.get_caret_count().max(1) as usize;
 
         // Destructure to satisfy the borrow checker: we need &mut self.editor
-        // for CodeEditPort AND &mut self.state / &mut self.undo_depth for
-        // DispatchContext simultaneously. This works because Rust allows
-        // borrowing disjoint fields of a struct.
+        // for CodeEditPort AND &mut self.state for DispatchContext
+        // simultaneously. This works because Rust allows borrowing disjoint
+        // fields of a struct.
         let Self {
             editor,
             state,
-            undo_depth,
             clipboard,
             text_cache,
             line_index,
             cached_generation,
             cursor_offset,
-            visual_selection,
+            pending_ui_actions,
             ..
         } = self;
 
-        let mut port = crate::bridge::port_impl::CodeEditPort(editor);
+        let mut port = crate::bridge::port_impl::CodeEditPort(editor, pending_ui_actions);
 
         let _compound_actions = crate::effects::dispatch::dispatch(
             effects_vec,
@@ -231,7 +239,6 @@ impl VimHost for GodotHost {
             DispatchContext {
                 state,
                 editor_id,
-                undo_depth,
                 auto_brace,
                 auto_brace_snapshot,
                 line_index_hint,
@@ -241,6 +248,7 @@ impl VimHost for GodotHost {
                     SyntaxRegion::from_editor(&editor_for_syntax, line, col)
                 }),
                 clipboard,
+                cursor_count,
             },
             text_cache,
         );
@@ -263,12 +271,17 @@ impl VimHost for GodotHost {
             editor.get_caret_column(),
         );
 
-        // Sync visual selection from ShellState buffer to host field.
-        // VimSession::build_context calls host.selection() on every keystroke
-        // and drain iteration — this must reflect the live selection state.
-        *visual_selection = state
-            .buffer_ref(editor_id)
-            .and_then(|b| b.visual().cloned());
+    }
+
+    fn record_internal_undo_node(
+        &mut self,
+        node_id: vim_core::primitives::NodeId,
+        text_before: &str,
+    ) {
+        let editor_id = self.editor.instance_id();
+        let store = self.state.buffer(editor_id).undo_store_mut();
+        store.begin_group(text_before);
+        store.end_group(node_id, &self.text_cache);
     }
 
     fn handle_request(&mut self, request: &HostRequest) -> RequestDisposition {
@@ -359,6 +372,7 @@ impl GodotHost {
             &self.security_policy,
             mode_str,
             &self.clipboard,
+            &mut self.pending_ui_actions,
         );
 
         // Sandbox ReadConfigFile results to filter dangerous commands.
@@ -402,14 +416,12 @@ impl GodotHost {
             cache_editor_id: editor_id,
             cached_generation: generation,
             cursor_offset,
-            visual_selection: None,
             viewport: ViewportInfo {
                 first_line: 0,
                 height: 0,
                 width: 0,
             },
             state: ShellState::default(),
-            undo_depth: UndoDepth::new(),
             security_policy: SecurityPolicy {
                 shell_execution: ShellExecution::Disabled,
                 file_access_scope: FileAccessScope::ProjectOnly,
@@ -422,6 +434,7 @@ impl GodotHost {
             highlight_yank_duration_ms: 150,
             auto_brace_eligible: false,
             engine_auto_pairs_active: false,
+            brace_pair_cache: None,
             pending_ui_actions: Vec::new(),
             vimdebug_enabled: false,
         }
@@ -504,32 +517,32 @@ impl GodotHost {
 
     // ── Undo safety ─────────────────────────────────────────────────────
 
-    /// Close any orphaned `begin_complex_operation` calls left open by
-    /// a bug or panic. Insert/Replace legitimately hold depth=1 across
-    /// keystrokes (opened on mode entry, closed on Esc); depth>1 is a bug.
+    /// Check for orphaned `begin_group` calls left open by a bug or panic.
+    /// Insert/Replace legitimately hold a pending group across keystrokes
+    /// (opened on mode entry, closed on Esc); in other modes a pending
+    /// group indicates a bug.
     pub(crate) fn ensure_undo_balanced(&mut self, mode: Mode) {
         if mode.is_insert() || mode.is_replace() {
-            let depth = self.undo_depth.depth();
-            if depth > 1 {
-                log::error!(
-                    "Abnormal undo depth {} in {} mode (expected 1) editor=#{} -- engine bug?",
-                    depth,
-                    mode,
-                    self.editor.instance_id().to_i64(),
-                );
-            }
+            // Pending group is expected during insert/replace — the engine
+            // opens a group on mode entry and closes it on Esc.
             return;
         }
 
-        let godot_groups = self.undo_depth.drain();
-        if godot_groups > 0 {
-            self.state.globals_mut().set_error(
-                "Internal: orphaned undo group(s) recovered -- undo may be inconsistent",
+        let editor_id = self.editor.instance_id();
+        let has_pending = self.state.buffer(editor_id).undo_store().has_pending();
+        if has_pending {
+            log::warn!(
+                "ensure_undo_balanced: orphaned undo group in {} mode, editor=#{} — discarding pending text",
+                mode,
+                editor_id.to_i64(),
             );
-        }
-        for i in 0..godot_groups {
-            log::warn!("Closing orphaned undo group ({}/{})", i + 1, godot_groups);
-            self.editor.end_complex_operation();
+            self.state
+                .buffer(editor_id)
+                .undo_store_mut()
+                .take_pending_text();
+            self.state.globals_mut().set_error(
+                "Internal: orphaned undo group recovered -- undo may be inconsistent",
+            );
         }
     }
 
@@ -541,8 +554,21 @@ impl GodotHost {
 
     // ── Field accessors ─────────────────────────────────────────────────
 
+    pub(crate) fn state(&self) -> &ShellState {
+        &self.state
+    }
+
     pub(crate) fn state_mut(&mut self) -> &mut ShellState {
         &mut self.state
+    }
+
+    /// Split borrow: simultaneous mutable access to state and pending UI
+    /// actions, needed when a `CodeEditPort` is constructed from a separate
+    /// `&mut Gd<CodeEdit>` (e.g. in step-mode effect application).
+    pub(crate) fn state_and_pending_ui_actions_mut(
+        &mut self,
+    ) -> (&mut ShellState, &mut Vec<PendingUiAction>) {
+        (&mut self.state, &mut self.pending_ui_actions)
     }
 
     pub(crate) fn take_state(&mut self) -> ShellState {
@@ -553,12 +579,43 @@ impl GodotHost {
         self.state = state;
     }
 
-    pub(crate) fn undo_depth_mut(&mut self) -> &mut UndoDepth {
-        &mut self.undo_depth
-    }
-
     pub(crate) fn highlight_yank_duration_ms(&self) -> u32 {
         self.highlight_yank_duration_ms
+    }
+
+    // ── Multi-cursor sync accessors ────────────────────────────────────
+
+    /// Access the cached text for multi-cursor position computation.
+    pub(crate) fn text_cache(&self) -> &str {
+        &self.text_cache
+    }
+
+    /// Access the line index for byte→line/col conversion.
+    pub(crate) fn line_index(&self) -> &LineIndex {
+        &self.line_index
+    }
+
+    /// Mutable access to the editor for multi-cursor sync operations.
+    #[allow(dead_code)]
+    pub(crate) fn editor_mut(&mut self) -> &mut Gd<CodeEdit> {
+        &mut self.editor
+    }
+
+    /// Immutable access to the editor (for multi-cursor import).
+    pub(crate) fn editor(&self) -> &Gd<CodeEdit> {
+        &self.editor
+    }
+
+    /// Split borrow: simultaneous mutable access to editor, state, and
+    /// pending UI actions.
+    ///
+    /// Required by multi-cursor sync which needs `CodeEditPort` (from editor)
+    /// and `BufferState` (from shell state) simultaneously, and by any path
+    /// that constructs a `CodeEditPort` (which carries `&mut Vec<PendingUiAction>`).
+    pub(crate) fn editor_and_state_mut(
+        &mut self,
+    ) -> (&mut Gd<CodeEdit>, &mut ShellState, &mut Vec<PendingUiAction>) {
+        (&mut self.editor, &mut self.state, &mut self.pending_ui_actions)
     }
 }
 
@@ -623,6 +680,44 @@ fn mode_to_vim_string(mode: Mode) -> &'static str {
                 mode
             );
             "n"
+        }
+    }
+}
+
+#[cfg(test)]
+const HANDLED_MODES: &[vim_core::primitives::ModeKind] = &[
+    vim_core::primitives::ModeKind::Normal,
+    vim_core::primitives::ModeKind::Insert,
+    vim_core::primitives::ModeKind::Visual,
+    vim_core::primitives::ModeKind::Select,
+    vim_core::primitives::ModeKind::Replace,
+    vim_core::primitives::ModeKind::VirtualReplace,
+    vim_core::primitives::ModeKind::CommandLine,
+    vim_core::primitives::ModeKind::OperatorPending,
+];
+
+#[cfg(test)]
+mod mode_coverage_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn mode_dispatch_covers_all_variants() {
+        let handled: HashSet<_> = HANDLED_MODES.iter().copied().collect();
+        let all: HashSet<_> = vim_core::primitives::ModeKind::ALL.iter().copied().collect();
+        let missing: Vec<_> = all.difference(&handled).collect();
+        assert!(
+            missing.is_empty(),
+            "Unhandled ModeKind variants: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn handled_modes_has_no_duplicates() {
+        let mut seen = HashSet::new();
+        for kind in HANDLED_MODES {
+            assert!(seen.insert(kind), "Duplicate in HANDLED_MODES: {:?}", kind);
         }
     }
 }

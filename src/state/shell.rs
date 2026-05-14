@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use godot::prelude::InstanceId;
+use vim_core::primitives::CursorStyle;
 
 use super::buffer::BufferState;
 use super::globals::GlobalState;
@@ -13,7 +14,7 @@ use crate::types::{HighlightYank, MatchRange};
 /// Top-level shell state. Keyed by Godot `InstanceId` rather than an abstract
 /// buffer ID -- couples us to Godot's type system, but `InstanceId` is a
 /// lightweight `Copy` type and avoids an extra ID-mapping indirection.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ShellState {
     buffers: HashMap<InstanceId, BufferState>,
     globals: GlobalState,
@@ -22,6 +23,23 @@ pub(crate) struct ShellState {
     substitute_preview: Option<Vec<MatchRange>>,
     /// Transient per-dispatch-cycle yank highlight, consumed by the controller.
     highlight_yank: Option<HighlightYank>,
+    /// Current cursor style from the engine's `SetCursorStyle` effect.
+    cursor_style: CursorStyle,
+}
+
+impl Default for ShellState {
+    fn default() -> Self {
+        Self {
+            buffers: HashMap::default(),
+            globals: GlobalState::default(),
+            substitute_preview: None,
+            highlight_yank: None,
+            cursor_style: CursorStyle {
+                shape: vim_core::primitives::CursorShape::Block,
+                blink: false,
+            },
+        }
+    }
 }
 
 impl ShellState {
@@ -81,13 +99,23 @@ impl ShellState {
 
     // ── Highlight yank ─────────────────────────────────────────────────
 
-    #[allow(dead_code)] // Setter for yank highlight — currently unused after vim-core removed HighlightYank effect
     pub(crate) fn set_highlight_yank(&mut self, yank: HighlightYank) {
         self.highlight_yank = Some(yank);
     }
 
     pub(crate) fn take_highlight_yank(&mut self) -> Option<HighlightYank> {
         self.highlight_yank.take()
+    }
+
+    // ── Cursor style ──────────────────────────────────────────────────
+
+    #[must_use]
+    pub(crate) fn cursor_style(&self) -> CursorStyle {
+        self.cursor_style
+    }
+
+    pub(crate) fn set_cursor_style(&mut self, style: CursorStyle) {
+        self.cursor_style = style;
     }
 }
 

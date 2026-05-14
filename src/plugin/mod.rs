@@ -12,10 +12,12 @@
 //! plain `extends EditorPlugin` instead.
 
 mod attach;
+mod caret_reconcile;
 mod discovery;
 mod floating;
 mod input;
 mod lifecycle;
+mod outcome;
 mod processing_guard;
 mod signals;
 
@@ -66,10 +68,9 @@ pub struct GodotVimCore {
     settings: Option<crate::settings::SettingsSnapshot>,
     /// Lazily created on first `:mappings` invocation.
     mapping_dialog: Option<Gd<crate::ui::mapping_dialog::MappingDialog>>,
-    /// Counter (not bool) because fast typing queues multiple deferred
-    /// `caret_changed` callbacks per frame. Each suppressed callback
-    /// decrements by 1.
-    pending_caret_suppressions: u32,
+    /// Tracks whether a pending `caret_changed` signal was caused by the
+    /// Vim engine (suppress) or an external source like a mouse click (process).
+    caret_reconciler: caret_reconcile::CaretReconciler,
     pending_tooltip: Option<PendingTooltip>,
     tracked_windows: Vec<TrackedWindow>,
     /// True while the engine is actively processing a keystroke.
@@ -91,7 +92,7 @@ impl INode for GodotVimCore {
             mapping_timer: None,
             settings: None,
             mapping_dialog: None,
-            pending_caret_suppressions: 0,
+            caret_reconciler: caret_reconcile::CaretReconciler::new(),
             pending_tooltip: None,
             tracked_windows: Vec::new(),
             processing_key: false,
@@ -156,11 +157,7 @@ impl INode for GodotVimCore {
             },
             (),
         );
-        panic_guard(
-            "exit_tree:fs_explorer",
-            || self.fs_explorer.cleanup(),
-            (),
-        );
+        panic_guard("exit_tree:fs_explorer", || self.fs_explorer.cleanup(), ());
         // Unconditional: even if a guard above caught a panic, null the
         // controller so enter_tree can reinitialize cleanly. Orphaned signals
         // from a panicking teardown step fire into handlers that check
@@ -509,7 +506,7 @@ impl GodotVimCore {
 
                 // Sweep stale buffer entries now that we've detached.
                 // Without this, closing all tabs leaves stale BufferState
-                // (including UndoTree with text snapshots) in the HashMap
+                // (including UndoStore with text snapshots) in the HashMap
                 // until the next attach() call.
                 if let Some(controller) = &mut self.controller {
                     controller.sweep_stale_buffers();
@@ -584,6 +581,41 @@ impl GodotVimCore {
         }
     }
 
+    /// Signal handler for `text_set`. Fired when `CodeEdit.set_text()` is
+    /// called programmatically (file reload, VCS revert). Differs from
+    /// `text_changed`: Godot destroys its undo stack, resets the caret to
+    /// (0,0), and clears selections. We fence our undo tree, clear the
+    /// UndoStore, remap marks through the diff, and restore the cursor.
+    #[func]
+    fn on_text_set(&mut self) {
+        if self.processing_key {
+            return;
+        }
+        if self.controller.is_none() {
+            return;
+        }
+        let ok = panic_guard(
+            "on_text_set",
+            || {
+                let Some(editor) = &self.attached_editor else {
+                    return true;
+                };
+                if !editor.is_instance_valid() {
+                    return true;
+                }
+                let controller = self.controller.as_mut().unwrap();
+                if controller.reconcile_text_set(editor) {
+                    log::info!("on_text_set: buffer replaced externally, undo cleared, marks remapped");
+                }
+                true
+            },
+            false,
+        );
+        if !ok {
+            self.recover_controller_from_panic();
+        }
+    }
+
     /// Signal handler for `text_changed`. Detects external text changes
     /// (Find-and-Replace, refactoring, external formatters) and reconciles
     /// them with the engine for undo/dot-repeat tracking.
@@ -608,6 +640,10 @@ impl GodotVimCore {
                 let controller = self.controller.as_mut().unwrap();
                 if controller.reconcile_external_edit(editor) {
                     log::debug!("on_text_changed: reconciled external text change");
+                    self.caret_reconciler.expect_vim_move(
+                        editor.get_caret_line(),
+                        editor.get_caret_column(),
+                    );
                 }
                 true
             },
@@ -625,7 +661,9 @@ impl GodotVimCore {
         }
         panic_guard(
             "on_scrollbar_changed",
-            || self.update_cursor_if_attached(),
+            || {
+                self.update_cursor_if_attached();
+            },
             (),
         );
     }
@@ -708,6 +746,17 @@ impl GodotVimCore {
                     controller.apply_settings(&snapshot);
                 }
 
+                // Re-sync indent settings from the attached CodeEdit.
+                // EditorSettings changes can affect indent_size / tab_size,
+                // so the engine must pick up the new values.
+                if let Some(ref editor) = self.attached_editor {
+                    if editor.is_instance_valid() {
+                        if let Some(controller) = &mut self.controller {
+                            attach::sync_indent_from_editor(editor, controller);
+                        }
+                    }
+                }
+
                 let mode = self
                     .controller
                     .as_ref()
@@ -742,9 +791,9 @@ impl GodotVimCore {
     /// Execute a pending UI action that requires plugin-level access (scene tree,
     /// settings snapshot) which the controller cannot reach directly.
     ///
-    /// Only `OpenMappingDialog` and `SourceConfigFile` reach the plugin layer;
-    /// the controller handles all other variants inline before storing. The
-    /// catch-all arm is defense-in-depth.
+    /// `OpenMappingDialog`, `SourceConfigFile`, and `ShowTooltip` reach the
+    /// plugin layer; the controller handles all other variants inline before
+    /// storing. The catch-all arm is defense-in-depth.
     pub(super) fn handle_pending_ui_action(
         &mut self,
         action: crate::bridge::godot_host::PendingUiAction,
@@ -771,6 +820,31 @@ impl GodotVimCore {
                 if !self.source_config_from_disk("pending_ui_action") {
                     let path = self.resolve_config_path().path;
                     log::warn!("pending_ui_action: SourceConfigFile — file not found at '{path}'",);
+                }
+            }
+            PendingUiAction::ShowTooltip {
+                symbol,
+                line,
+                col,
+                warp_pos,
+            } => {
+                if let Some(editor) = &self.attached_editor {
+                    let editor_id = editor.instance_id();
+                    let now = godot::classes::Time::singleton().get_ticks_usec();
+                    self.pending_tooltip = Some(PendingTooltip {
+                        symbol,
+                        line,
+                        col,
+                        warp_pos,
+                        editor_id,
+                        created_at_usec: now,
+                        phase: TooltipPhase::WaitingForRelease,
+                    });
+                    self.base_mut().set_process(true);
+                    log::debug!(
+                        "handle_pending_ui_action: queued deferred tooltip for '{}'",
+                        self.pending_tooltip.as_ref().unwrap().symbol
+                    );
                 }
             }
             other => {
@@ -805,13 +879,13 @@ impl GodotVimCore {
                         let mut editor = self.attached_editor.as_ref().unwrap().clone();
                         controller.recover_from_panic(&mut editor);
 
-                        // Invalidate thread-local caches that may hold stale
-                        // pre-panic data (shaped glyphs, auto-brace pairs).
-                        crate::ui::cursor_shape::invalidate_shaped_cache();
-                        crate::bridge::port_impl::invalidate_brace_pair_cache();
-
                         // Refresh UI so the user sees Normal mode + error message
                         // immediately, not stale pre-panic state.
+                        //
+                        // Intentional exception to EngineOutcome: panic recovery
+                        // is defense-in-depth with unconditional-reset semantics,
+                        // not the conditional-update pattern that EngineOutcome
+                        // enforces. Using ui.update() directly is correct here.
                         let editor_id = editor.instance_id();
                         let snap = controller.ui_snapshot(editor_id);
                         self.ui.update(&snap, &mut editor);
@@ -832,9 +906,9 @@ impl GodotVimCore {
         if let Some(timer) = self.mapping_timer.as_mut() {
             timer.stop();
         }
-        // Always reset — trivially infallible (u32 assignment), must happen
-        // regardless of whether recovery itself panicked.
-        self.pending_caret_suppressions = 0;
+        // Always reset — trivially infallible, must happen regardless of
+        // whether recovery itself panicked.
+        self.caret_reconciler.reset();
         self.processing_key = false;
         // Clear pending tooltip directly rather than via cancel_pending_tooltip()
         // because set_process(false) is safe here (poll_pending_tooltip won't
@@ -932,6 +1006,7 @@ impl GodotVimCore {
         // Scroll and resize change the viewport, making cached pixel
         // coordinates from `get_rect_at_line_column` stale.
         self.ui.recompute_inccommand_rects(editor);
+        self.ui.recompute_block_visual_rects(editor);
     }
 
     fn resolve_config_path(&self) -> crate::config::path::ResolvedConfig {

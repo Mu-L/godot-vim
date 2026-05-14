@@ -9,17 +9,10 @@
 //!
 //! ## Undo model
 //!
-//! Godot's native undo uses chain-linked operations (`chain_forward`/
-//! `chain_backward`) designed for its ACTION system where consecutive
-//! same-action edits auto-chain. The vim plugin instead uses bare
-//! `begin/end_complex_operation` calls where each outermost pair must
-//! form one atomic undo step.
-//!
-//! This mock simplifies to a group-based model: each outermost `begin/end`
-//! pair creates one `UndoGroup` containing all text operations within.
-//! `undo()` reverts the most recent group, `redo()` replays it. This is
-//! semantically equivalent for the vim plugin's usage pattern, though it
-//! skips Godot's chain-linking internals that are irrelevant to us.
+//! The mock tracks `begin/end_complex_operation` nesting and records
+//! whether any text operations occurred within each outermost pair.
+//! Actual undo/redo replay is handled by the changeset-based `UndoStore`,
+//! not by the mock's undo stack.
 //!
 //! Reference: `/reference/godot/scene/gui/text_edit.{h,cpp}`
 
@@ -50,30 +43,13 @@ struct Caret {
     selection: Selection,
 }
 
-#[derive(Clone, Debug)]
-struct TextOperation {
-    op_type: OpType,
-    from_line: i32,
-    from_column: i32,
-    to_line: i32,
-    to_column: i32,
-    text: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum OpType {
-    Insert,
-    Remove,
-}
-
 /// One atomic undo step. Corresponds to one outermost `begin/end_complex_operation`
-/// pair. Captures caret snapshots at both boundaries so undo restores the caret
-/// to its pre-edit position (matching Godot's behavior).
+/// pair. Tracks the number of text operations so `end_complex_operation` can
+/// distinguish no-op groups from real edits. The actual undo/redo replay is
+/// handled by UndoStore (changeset-based), not by the mock's undo stack.
 #[derive(Clone, Debug)]
 struct UndoGroup {
-    ops: Vec<TextOperation>,
-    start_carets: Vec<Caret>,
-    end_carets: Vec<Caret>,
+    op_count: usize,
 }
 
 // ─── MockTextEdit ───────────────────────────────────────────────────────────
@@ -102,6 +78,10 @@ pub(crate) struct MockTextEdit {
     /// Nesting depth — only the outermost `end` finalizes the group.
     complex_operation_count: u32,
 
+    /// Multicaret edit nesting depth. `merge_overlapping_carets` is deferred
+    /// to the outermost `end_multicaret_edit`.
+    multicaret_edit_count: u32,
+
     // ── Scroll state (simplified: no wrap, no minimap) ──
     v_scroll: f64,
     h_scroll: i32,
@@ -125,6 +105,7 @@ impl MockTextEdit {
             undo_pos: 0,
             current_group: None,
             complex_operation_count: 0,
+            multicaret_edit_count: 0,
             v_scroll: 0.0,
             h_scroll: 0,
             visible_line_count: 25,
@@ -137,6 +118,23 @@ impl MockTextEdit {
 
     pub(crate) fn set_visible_line_count(&mut self, count: i32) {
         self.visible_line_count = count;
+    }
+
+    fn merge_overlapping_carets(&mut self) {
+        let mut i = 0;
+        while i < self.carets.len() {
+            let mut j = i + 1;
+            while j < self.carets.len() {
+                if self.carets[i].line == self.carets[j].line
+                    && self.carets[i].column == self.carets[j].column
+                {
+                    self.carets.remove(j);
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
     }
 
     // ── Core text operations ─────────────────────────────────────────────
@@ -251,41 +249,20 @@ impl MockTextEdit {
         self.clear_redo();
 
         let (end_line, end_col) = self.base_insert_text(p_line, p_col, p_text);
-
-        let op = TextOperation {
-            op_type: OpType::Insert,
-            from_line: p_line,
-            from_column: p_col,
-            to_line: end_line,
-            to_column: end_col,
-            text: p_text.to_string(),
-        };
-
-        self.record_op(op);
+        self.record_op();
         (end_line, end_col)
     }
 
     fn remove_text_record(&mut self, from_line: i32, from_col: i32, to_line: i32, to_col: i32) {
         self.clear_redo();
 
-        let removed_text = self.base_get_text(from_line, from_col, to_line, to_col);
         self.base_remove_text(from_line, from_col, to_line, to_col);
-
-        let op = TextOperation {
-            op_type: OpType::Remove,
-            from_line,
-            from_column: from_col,
-            to_line,
-            to_column: to_col,
-            text: removed_text,
-        };
-
-        self.record_op(op);
+        self.record_op();
     }
 
-    fn record_op(&mut self, op: TextOperation) {
+    fn record_op(&mut self) {
         if let Some(group) = &mut self.current_group {
-            group.ops.push(op);
+            group.op_count += 1;
         }
         // Ops outside a begin/end pair are silently dropped from undo history.
         // Godot would record them in `current_op` and push on next `begin`, but
@@ -297,29 +274,6 @@ impl MockTextEdit {
     fn clear_redo(&mut self) {
         if self.undo_pos < self.undo_stack.len() {
             self.undo_stack.truncate(self.undo_pos);
-        }
-    }
-
-    /// Replay or reverse a recorded operation. Undo passes `reverse=true`,
-    /// which flips Insert<->Remove so the same `TextOperation` struct serves
-    /// both directions without storing separate forward/backward data.
-    fn do_text_op(&mut self, op: &TextOperation, reverse: bool) {
-        let effective_type = if reverse {
-            match op.op_type {
-                OpType::Insert => OpType::Remove,
-                OpType::Remove => OpType::Insert,
-            }
-        } else {
-            op.op_type
-        };
-
-        match effective_type {
-            OpType::Insert => {
-                self.base_insert_text(op.from_line, op.from_column, &op.text);
-            }
-            OpType::Remove => {
-                self.base_remove_text(op.from_line, op.from_column, op.to_line, op.to_column);
-            }
         }
     }
 
@@ -584,20 +538,64 @@ impl TextEditorPort for MockTextEdit {
         (self.carets.len() - 1) as i32
     }
 
+    fn remove_caret(&mut self, caret_idx: i32) {
+        let idx = caret_idx as usize;
+        if idx < self.carets.len() {
+            self.carets.remove(idx);
+        }
+    }
+
     fn remove_secondary_carets(&mut self) {
         self.carets.truncate(1);
+    }
+
+    fn get_caret_count(&self) -> i32 {
+        self.carets.len() as i32
+    }
+
+    fn get_caret_line_for(&self, caret_idx: i32) -> i32 {
+        let idx = caret_idx as usize;
+        if idx < self.carets.len() {
+            self.carets[idx].line
+        } else {
+            0
+        }
+    }
+
+    fn get_caret_column_for(&self, caret_idx: i32) -> i32 {
+        let idx = caret_idx as usize;
+        if idx < self.carets.len() {
+            self.carets[idx].column
+        } else {
+            0
+        }
+    }
+
+    fn set_caret_line_for(&mut self, line: i32, caret_idx: i32) {
+        let idx = caret_idx as usize;
+        if idx < self.carets.len() {
+            let clamped = self.clamp_line(line);
+            self.carets[idx].line = clamped;
+            let col = self.carets[idx].column;
+            self.carets[idx].column = self.clamp_column(clamped, col);
+        }
+    }
+
+    fn set_caret_column_for(&mut self, col: i32, caret_idx: i32) {
+        let idx = caret_idx as usize;
+        if idx < self.carets.len() {
+            let line = self.carets[idx].line;
+            let clamped = self.clamp_column(line, col);
+            self.carets[idx].column = clamped;
+            self.carets[idx].last_fit_x = clamped;
+        }
     }
 
     // ── Undo ────────────────────────────────────────────────────────────
 
     fn begin_complex_operation(&mut self) {
         if self.complex_operation_count == 0 {
-            // Snapshot carets now — undo will restore to this state.
-            self.current_group = Some(UndoGroup {
-                ops: Vec::new(),
-                start_carets: self.carets.clone(),
-                end_carets: Vec::new(),
-            });
+            self.current_group = Some(UndoGroup { op_count: 0 });
         }
         self.complex_operation_count += 1;
     }
@@ -609,11 +607,10 @@ impl TextEditorPort for MockTextEdit {
         self.complex_operation_count -= 1;
 
         if self.complex_operation_count == 0 {
-            if let Some(mut group) = self.current_group.take() {
+            if let Some(group) = self.current_group.take() {
                 // Only push groups that actually modified text — empty groups
                 // (e.g., a begin/end pair around a no-op command) are discarded.
-                if !group.ops.is_empty() {
-                    group.end_carets = self.carets.clone();
+                if group.op_count > 0 {
                     self.undo_stack.truncate(self.undo_pos);
                     self.undo_stack.push(group);
                     self.undo_pos = self.undo_stack.len();
@@ -622,55 +619,17 @@ impl TextEditorPort for MockTextEdit {
         }
     }
 
-    fn undo(&mut self) {
-        // Force-close any open group so partial operations don't leak.
-        while self.complex_operation_count > 0 {
-            self.end_complex_operation();
-        }
-
-        if self.undo_pos == 0 {
-            return;
-        }
-
-        self.undo_pos -= 1;
-        let group = self.undo_stack[self.undo_pos].clone();
-
-        for caret in &mut self.carets {
-            caret.selection.active = false;
-        }
-
-        // Reverse order: last-applied op is undone first.
-        for op in group.ops.iter().rev() {
-            self.do_text_op(op, true);
-        }
-
-        self.carets = group.start_carets;
-        if self.carets.is_empty() {
-            self.carets = vec![Caret::default()];
-        }
+    fn begin_multicaret_edit(&mut self) {
+        self.multicaret_edit_count += 1;
     }
 
-    fn redo(&mut self) {
-        if self.undo_pos >= self.undo_stack.len() {
-            return;
+    fn end_multicaret_edit(&mut self) {
+        if self.multicaret_edit_count > 0 {
+            self.multicaret_edit_count -= 1;
         }
-
-        let group = self.undo_stack[self.undo_pos].clone();
-
-        for caret in &mut self.carets {
-            caret.selection.active = false;
+        if self.multicaret_edit_count == 0 {
+            self.merge_overlapping_carets();
         }
-
-        for op in &group.ops {
-            self.do_text_op(op, false);
-        }
-
-        self.carets = group.end_carets;
-        if self.carets.is_empty() {
-            self.carets = vec![Caret::default()];
-        }
-
-        self.undo_pos += 1;
     }
 
     // ── Scroll ──────────────────────────────────────────────────────────

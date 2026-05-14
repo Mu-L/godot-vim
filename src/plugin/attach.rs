@@ -2,11 +2,16 @@
 //! per-buffer engine state save/restore, indent/commentstring sync, and UI
 //! lifecycle management.
 
+// Promote #[must_use] warnings to errors so that dropping an EngineOutcome
+// without calling .apply_ui_update() or .discard() is a compile-time error.
+#![deny(unused_must_use)]
+
 use godot::classes::CodeEdit;
 use godot::prelude::*;
 
 use crate::bridge::code_edit_ext::CodeEditExt;
 
+use super::outcome::EngineOutcome;
 use super::signals::{connect_deferred, connect_immediate, safe_disconnect};
 use super::GodotVimCore;
 
@@ -53,7 +58,7 @@ impl GodotVimCore {
 
         // Create the VimSession by pairing the detached engine with a new
         // GodotHost wrapping this editor. Must happen before any method
-        // that accesses host state (restore_buffer, init_undo_tree, etc.).
+        // that accesses host state (restore_buffer, etc.).
         if let Some(controller) = &mut self.controller {
             controller.attach_session(editor.clone());
         }
@@ -74,20 +79,14 @@ impl GodotVimCore {
         connect_deferred(&mut editor, SIG_TEXT_CHANGED, &text_changed_callable);
 
         // text_set fires when CodeEdit.set_text() is called programmatically
-        // (e.g. external script reload). Reuses the same handler -- it diffs
-        // cached vs current text, which is correct for both signals.
-        let text_set_callable = self.base().callable("on_text_changed");
+        // (e.g. external script reload, VCS revert). Uses a dedicated handler
+        // because set_text() has different semantics: Godot destroys its undo
+        // stack, resets the caret to (0,0), and clears selections.
+        let text_set_callable = self.base().callable("on_text_set");
         connect_deferred(&mut editor, SIG_TEXT_SET, &text_set_callable);
 
         if let Some(controller) = &mut self.controller {
             controller.restore_buffer_engine_state(new_id);
-        }
-
-        // Seed the undo tree with the editor's current text so that the first
-        // undo operation has a base snapshot to diff against.
-        if let Some(controller) = &mut self.controller {
-            let text = editor.get_text().to_string();
-            controller.init_undo_tree(new_id, &text);
         }
 
         // Comment delimiters are language-specific (# for GDScript, // for C#/shaders).
@@ -124,7 +123,8 @@ impl GodotVimCore {
         // (search highlights, status bar mode label, cursor shape, etc.).
         if let Some(controller) = &mut self.controller {
             let snap = controller.ui_snapshot(new_id);
-            self.ui.update(&snap, &mut editor);
+            EngineOutcome::with_snapshot(snap, crate::controller::PipelineOutcome::Passthrough)
+                .apply_ui_update(&mut self.ui, &mut editor, &mut self.caret_reconciler);
         }
 
         // Scrollbar instances are stable across attach/detach -- Godot does not
@@ -156,13 +156,9 @@ impl GodotVimCore {
 
         self.cancel_pending_tooltip();
 
-        // Brace pair cache is per-language; stale pairs from the old editor's
-        // language would produce wrong results in the new editor.
-        crate::bridge::port_impl::invalidate_brace_pair_cache();
-
-        // Reset so outstanding suppressions from this editor don't swallow
+        // Reset so outstanding expectations from this editor don't suppress
         // legitimate caret_changed events on the next editor.
-        self.pending_caret_suppressions = 0;
+        self.caret_reconciler.reset();
 
         // Discard any unconsumed yank highlight so it doesn't flash on the
         // next editor's first ui_snapshot(). Matches the substitute_preview
@@ -174,6 +170,7 @@ impl GodotVimCore {
         if !editor.is_instance_valid() {
             log::warn!("detach: editor no longer valid, skipping cleanup");
             if let Some(controller) = &mut self.controller {
+                controller.clear_multi_cursor_on_detach();
                 controller.force_cleanup_without_editor();
                 controller.detach_session();
             }
@@ -188,7 +185,7 @@ impl GodotVimCore {
         // CRITICAL: Deferred signals (caret_changed, text_changed, draw,
         // scrollbar value_changed) must be disconnected BEFORE any operation
         // that could trigger them (exit_mode_via_pipeline, cleanup_visual_-
-        // artifacts, drain_remaining_undo_depth, etc.).
+        // artifacts, etc.).
         //
         // Godot's DEFERRED connection flag enqueues callbacks into the
         // frame's deferred-call queue when the signal is emitted. Crucially,
@@ -218,7 +215,7 @@ impl GodotVimCore {
         let text_changed_callable = self.base().callable("on_text_changed");
         safe_disconnect(&mut editor, SIG_TEXT_CHANGED, &text_changed_callable);
 
-        let text_set_callable = self.base().callable("on_text_changed");
+        let text_set_callable = self.base().callable("on_text_set");
         safe_disconnect(&mut editor, SIG_TEXT_SET, &text_set_callable);
 
         let scrollbar_callable = self.base().callable("on_scrollbar_changed");
@@ -252,6 +249,7 @@ impl GodotVimCore {
 
             if !editor.is_instance_valid() {
                 log::warn!("detach: editor freed during mapping timeout resolution");
+                controller.clear_multi_cursor_on_detach();
                 controller.force_cleanup_without_editor();
                 controller.detach_session();
                 self.ui.reset_cached_state();
@@ -266,6 +264,7 @@ impl GodotVimCore {
 
             if !editor.is_instance_valid() {
                 log::warn!("detach: editor freed during exit_mode_via_pipeline");
+                controller.clear_multi_cursor_on_detach();
                 controller.force_cleanup_without_editor();
                 controller.detach_session();
                 self.ui.reset_cached_state();
@@ -276,10 +275,6 @@ impl GodotVimCore {
             // the pipeline exit left stale selection highlights.
             controller.cleanup_visual_artifacts(editor_id, &mut editor);
 
-            // Defense-in-depth: drain any remaining undo depth in case
-            // the pipeline's EndUndo didn't close all open groups.
-            controller.drain_remaining_undo_depth(&mut editor);
-
             // Clear parser state (pending operator like `d`) so it doesn't
             // leak to the next editor. Macro recording is NOT aborted here --
             // it is a session-level concept that survives buffer switches.
@@ -287,6 +282,10 @@ impl GodotVimCore {
 
             // Reset transient shell state (vimdebug, pending effects, caches).
             controller.reset_transients();
+
+            // Clear multi-cursor on buffer leave — multi-cursor state is per-buffer,
+            // not persisted across buffer switches.
+            controller.clear_multi_cursor_on_detach();
         }
 
         self.ui.detach(&mut editor);

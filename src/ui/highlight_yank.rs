@@ -9,6 +9,8 @@
 use godot::classes::{CodeEdit, Control, IControl};
 use godot::prelude::*;
 
+use vim_core::primitives::SelectionShape;
+
 use crate::safety::panic_guard;
 use crate::types::CharLineCol;
 
@@ -41,6 +43,7 @@ pub(crate) struct HighlightYankOverlay {
     base: Base<Control>,
     start: CharLineCol,
     end: CharLineCol,
+    shape: SelectionShape,
     alpha: f32,
     fade_duration: f32,
     elapsed: f32,
@@ -59,6 +62,7 @@ impl IControl for HighlightYankOverlay {
             base,
             start: CharLineCol::new(0, 0),
             end: CharLineCol::new(0, 0),
+            shape: SelectionShape::Char,
             alpha: 0.0,
             fade_duration: 0.15,
             elapsed: 0.0,
@@ -115,6 +119,7 @@ impl IControl for HighlightYankOverlay {
                         &self.start,
                         &self.end,
                         MAX_HIGHLIGHT_RECTS,
+                        self.shape,
                     );
                 }
 
@@ -140,10 +145,12 @@ impl HighlightYankOverlay {
         start: CharLineCol,
         end: CharLineCol,
         duration_ms: u32,
+        shape: SelectionShape,
         _editor: &Gd<CodeEdit>,
     ) {
         self.start = start;
         self.end = end;
+        self.shape = shape;
         self.fade_duration = (duration_ms as f32 / 1000.0).max(0.01);
         self.elapsed = 0.0;
         self.alpha = HIGHLIGHT_ALPHA;

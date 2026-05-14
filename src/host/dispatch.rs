@@ -71,6 +71,7 @@ pub(crate) fn execute(
     policy: &SecurityPolicy,
     mode_str: &str,
     clipboard: &dyn crate::bridge::clipboard::ClipboardPort,
+    pending_ui_actions: &mut Vec<crate::bridge::godot_host::PendingUiAction>,
 ) -> HostResult {
     log::debug!("host::execute: {:?}", request.kind());
 
@@ -389,12 +390,12 @@ pub(crate) fn execute(
 
         // ── LSP / Navigation ────────────────────────────────────────────
         HostRequest::GotoDefinition { .. } => {
-            let mut port = crate::bridge::port_impl::CodeEditPort(editor);
+            let mut port = crate::bridge::port_impl::CodeEditPort(editor, pending_ui_actions);
             crate::effects::navigation::handle_goto_definition(&mut port);
             host_success(request.id())
         }
         HostRequest::ShowDocumentation { .. } => {
-            let mut port = crate::bridge::port_impl::CodeEditPort(editor);
+            let mut port = crate::bridge::port_impl::CodeEditPort(editor, pending_ui_actions);
             crate::effects::navigation::handle_show_documentation(&mut port);
             host_success(request.id())
         }
@@ -434,9 +435,7 @@ pub(crate) fn execute(
             buffer_id,
         ),
         HostRequest::RunAction {
-            ref name,
-            count,
-            ..
+            ref name, count, ..
         } => {
             log::debug!("RunAction: {} (count={:?})", name, count);
             let repeat = count.unwrap_or(1).max(1);
@@ -487,9 +486,7 @@ pub(crate) fn execute(
             }
         }
         HostRequest::RequestCmdlineCompletion {
-            kind,
-            ref prefix,
-            ..
+            kind, ref prefix, ..
         } => match kind {
             CmdlineCompletionKind::Action => {
                 // Collect action names matching the prefix.
@@ -542,11 +539,138 @@ pub(crate) fn execute(
             }
         },
 
+        // ── :mkvimrc — generate .godot-vimrc template ─────────────────
+        HostRequest::MkVimrc { meta: _, force } => {
+            let path = "res://.godot-vimrc";
+            let gpath = GString::from(path);
+
+            if !force && godot::classes::FileAccess::file_exists(&gpath) {
+                return host_failure(
+                    request.id(),
+                    ".godot-vimrc already exists (use :mkvimrc! to overwrite)",
+                );
+            }
+
+            let presets = &crate::config::presets::PRESETS;
+            let content = crate::config::writer::generate_default_config(presets);
+            match crate::config::writer::write_text_to_file(path, &content) {
+                Ok(()) => HostResult::Success {
+                    id: request.id(),
+                    message: Some(CompactString::from(format!("Wrote {path}"))),
+                },
+                Err(e) => host_failure(request.id(), e),
+            }
+        }
+
         // ── Forward compatibility for #[non_exhaustive] ─────────────────
         _ => {
             let kind = format!("{:?}", request.kind());
             log::debug!("Unknown host request variant from newer vim-core: {kind}");
             host_failure(request.id(), format!("Unsupported host request: {kind}"))
+        }
+    }
+}
+
+#[cfg(test)]
+const HANDLED_HOST_REQUESTS: &[vim_core::execution::HostRequestKind] = &[
+    vim_core::execution::HostRequestKind::WriteFile,
+    vim_core::execution::HostRequestKind::Quit,
+    vim_core::execution::HostRequestKind::WriteQuit,
+    vim_core::execution::HostRequestKind::EditFile,
+    vim_core::execution::HostRequestKind::ReadFile,
+    vim_core::execution::HostRequestKind::FilterDocumentRange,
+    vim_core::execution::HostRequestKind::ReindentRange,
+    vim_core::execution::HostRequestKind::ReadClipboard,
+    vim_core::execution::HostRequestKind::ExternalCommand,
+    vim_core::execution::HostRequestKind::CustomExCommand,
+    vim_core::execution::HostRequestKind::SyncCommandLine,
+    vim_core::execution::HostRequestKind::SwitchBuffer,
+    vim_core::execution::HostRequestKind::BufferNext,
+    vim_core::execution::HostRequestKind::BufferPrev,
+    vim_core::execution::HostRequestKind::BufferFirst,
+    vim_core::execution::HostRequestKind::BufferLast,
+    vim_core::execution::HostRequestKind::BufferList,
+    vim_core::execution::HostRequestKind::TabNew,
+    vim_core::execution::HostRequestKind::TabNext,
+    vim_core::execution::HostRequestKind::TabPrev,
+    vim_core::execution::HostRequestKind::TabClose,
+    vim_core::execution::HostRequestKind::ReadConfigFile,
+    vim_core::execution::HostRequestKind::EvaluateExpression,
+    vim_core::execution::HostRequestKind::EvaluateMapping,
+    vim_core::execution::HostRequestKind::RequestCompletion,
+    vim_core::execution::HostRequestKind::ShowMessageHistory,
+    vim_core::execution::HostRequestKind::JumpToBuffer,
+    vim_core::execution::HostRequestKind::ListActions,
+    vim_core::execution::HostRequestKind::SplitWindow,
+    vim_core::execution::HostRequestKind::CloseWindow,
+    vim_core::execution::HostRequestKind::CloseOtherWindows,
+    vim_core::execution::HostRequestKind::WriteAll,
+    vim_core::execution::HostRequestKind::QuitAll,
+    vim_core::execution::HostRequestKind::WriteQuitAll,
+    vim_core::execution::HostRequestKind::CloseBuffer,
+    vim_core::execution::HostRequestKind::WindowNext,
+    vim_core::execution::HostRequestKind::WindowPrev,
+    vim_core::execution::HostRequestKind::WindowMoveLeft,
+    vim_core::execution::HostRequestKind::WindowMoveRight,
+    vim_core::execution::HostRequestKind::WindowMoveUp,
+    vim_core::execution::HostRequestKind::WindowMoveDown,
+    vim_core::execution::HostRequestKind::WindowRotateDown,
+    vim_core::execution::HostRequestKind::WindowRotateUp,
+    vim_core::execution::HostRequestKind::WindowEqualSize,
+    vim_core::execution::HostRequestKind::WindowIncreaseHeight,
+    vim_core::execution::HostRequestKind::WindowDecreaseHeight,
+    vim_core::execution::HostRequestKind::WindowIncreaseWidth,
+    vim_core::execution::HostRequestKind::WindowDecreaseWidth,
+    vim_core::execution::HostRequestKind::GotoDefinition,
+    vim_core::execution::HostRequestKind::ShowDocumentation,
+    vim_core::execution::HostRequestKind::OpenCommandWindow,
+    vim_core::execution::HostRequestKind::CallOperatorFunc,
+    vim_core::execution::HostRequestKind::ExecuteNorm,
+    vim_core::execution::HostRequestKind::JumpToGlobalMark,
+    vim_core::execution::HostRequestKind::RunAction,
+    vim_core::execution::HostRequestKind::RequestCmdlineCompletion,
+    vim_core::execution::HostRequestKind::MkVimrc,
+    // Variants handled by the forward-compatibility wildcard (`_ =>`).
+    // Listed here so the test detects NEW vim-core variants that need
+    // explicit match arms rather than silent wildcard degradation.
+    vim_core::execution::HostRequestKind::DiagnosticNext,
+    vim_core::execution::HostRequestKind::DiagnosticPrev,
+    vim_core::execution::HostRequestKind::DiagnosticList,
+    vim_core::execution::HostRequestKind::DiagnosticGoto,
+    vim_core::execution::HostRequestKind::CQuit,
+    vim_core::execution::HostRequestKind::UpdateFile,
+    vim_core::execution::HostRequestKind::FoldRange,
+    vim_core::execution::HostRequestKind::FoldOpenRange,
+    vim_core::execution::HostRequestKind::FoldCloseRange,
+];
+
+#[cfg(test)]
+mod host_request_coverage_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use vim_core::execution::HostRequestKind;
+
+    #[test]
+    fn host_request_dispatch_covers_all_variants() {
+        let handled: HashSet<_> = HANDLED_HOST_REQUESTS.iter().copied().collect();
+        let all: HashSet<_> = HostRequestKind::ALL.iter().copied().collect();
+        let missing: Vec<_> = all.difference(&handled).collect();
+        assert!(
+            missing.is_empty(),
+            "Unhandled HostRequestKind variants: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn handled_host_requests_has_no_duplicates() {
+        let mut seen = HashSet::new();
+        for kind in HANDLED_HOST_REQUESTS {
+            assert!(
+                seen.insert(kind),
+                "Duplicate in HANDLED_HOST_REQUESTS: {:?}",
+                kind
+            );
         }
     }
 }

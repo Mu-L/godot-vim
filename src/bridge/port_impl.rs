@@ -6,7 +6,6 @@
 //! calls the trait method instead of the Godot FFI method. The newtype
 //! breaks this ambiguity — `self.0.get_text()` always resolves to Godot.
 
-use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use godot::classes::{CodeEdit, EditorInterface, InputEventShortcut};
@@ -14,42 +13,6 @@ use godot::prelude::*;
 
 use super::port::{FoldCapable, IdeCapable, NavigationCapable, TextEditorPort, ViewportAdjust};
 use crate::bridge::godot_calls;
-
-// Brace-pair cache: thread-local rather than a VimController field because
-// TextEditorPort is intentionally stateless (enabling MockTextEdit in tests).
-//
-// Keyed by `InstanceId` (never recycled by Godot within a session).
-// Invalidated on editor detach via `invalidate_brace_pair_cache`.
-// Only two access paths: `AutoBraceSnapshot::from_editor` and `invalidate_brace_pair_cache`.
-thread_local! {
-    #[allow(clippy::type_complexity)]
-    static BRACE_PAIR_CACHE: RefCell<Option<(InstanceId, Rc<Vec<(String, String)>>)>> =
-        const { RefCell::new(None) };
-}
-
-pub(crate) fn invalidate_brace_pair_cache() {
-    BRACE_PAIR_CACHE.with(|c| *c.borrow_mut() = None);
-}
-
-// ── Pending tooltip data ────────────────────────────────────────────────
-//
-// Thread-local store for deferred tooltip emission. `show_documentation_tooltip`
-// (Tier 2 path) deposits data here; the plugin layer drains it after dispatch.
-
-pub(crate) struct PendingTooltipData {
-    pub symbol: String,
-    pub line: i32,
-    pub col: i32,
-    pub warp_pos: Option<Vector2i>,
-}
-
-thread_local! {
-    static PENDING_TOOLTIP_DATA: Cell<Option<PendingTooltipData>> = const { Cell::new(None) };
-}
-
-pub(crate) fn take_pending_tooltip_data() -> Option<PendingTooltipData> {
-    PENDING_TOOLTIP_DATA.take()
-}
 
 // ── Pre-dispatch snapshots ───────────────────────────────────────────────
 //
@@ -74,29 +37,42 @@ pub(crate) struct AutoBraceSnapshot {
 
 impl AutoBraceSnapshot {
     /// Capture auto-brace state from the live editor (3 FFI calls, cached pairs).
-    pub(crate) fn from_editor(editor: &Gd<CodeEdit>) -> Self {
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn from_editor(
+        editor: &Gd<CodeEdit>,
+        cache: &mut Option<(InstanceId, Rc<Vec<(String, String)>>)>,
+    ) -> Self {
         let enabled = editor.is_auto_brace_completion_enabled();
 
         let pairs = {
             let editor_id = editor.instance_id();
-            BRACE_PAIR_CACHE.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                if let Some((id, ref pairs)) = *cache {
-                    if id == editor_id {
-                        return Rc::clone(pairs);
-                    }
+            if let Some((id, ref pairs)) = *cache {
+                if id == editor_id {
+                    Rc::clone(pairs)
+                } else {
+                    let dict = editor.get_auto_brace_completion_pairs();
+                    let mut pairs: Vec<(String, String)> = dict
+                        .iter_shared()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    // Longest-match-first: e.g. `/*` must match before `*`.
+                    pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+                    let rc = Rc::new(pairs);
+                    *cache = Some((editor_id, Rc::clone(&rc)));
+                    rc
                 }
+            } else {
                 let dict = editor.get_auto_brace_completion_pairs();
                 let mut pairs: Vec<(String, String)> = dict
                     .iter_shared()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect();
                 // Longest-match-first: e.g. `/*` must match before `*`.
-                pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
                 let rc = Rc::new(pairs);
                 *cache = Some((editor_id, Rc::clone(&rc)));
                 rc
-            })
+            }
         };
 
         // Godot returns delimiters as "start_key end_key" (space-separated).
@@ -185,7 +161,10 @@ impl SyntaxRegion {
     }
 }
 
-pub(crate) struct CodeEditPort<'a>(pub(crate) &'a mut Gd<CodeEdit>);
+pub(crate) struct CodeEditPort<'a>(
+    pub(crate) &'a mut Gd<CodeEdit>,
+    pub(crate) &'a mut Vec<super::godot_host::PendingUiAction>,
+);
 
 // All TextEditorPort methods are 1:1 delegations to `self.0` (the Godot FFI).
 // No comments on individual methods — see `port.rs` for the trait-level docs.
@@ -267,8 +246,40 @@ impl TextEditorPort for CodeEditPort<'_> {
         self.0.add_caret(line, col)
     }
 
+    fn remove_caret(&mut self, caret_idx: i32) {
+        self.0.remove_caret(caret_idx);
+    }
+
     fn remove_secondary_carets(&mut self) {
         self.0.remove_secondary_carets();
+    }
+
+    fn get_caret_count(&self) -> i32 {
+        self.0.get_caret_count()
+    }
+
+    fn get_caret_line_for(&self, caret_idx: i32) -> i32 {
+        self.0.get_caret_line_ex().caret_index(caret_idx).done()
+    }
+
+    fn get_caret_column_for(&self, caret_idx: i32) -> i32 {
+        self.0.get_caret_column_ex().caret_index(caret_idx).done()
+    }
+
+    fn set_caret_line_for(&mut self, line: i32, caret_idx: i32) {
+        self.0
+            .set_caret_line_ex(line)
+            .adjust_viewport(false)
+            .caret_index(caret_idx)
+            .done();
+    }
+
+    fn set_caret_column_for(&mut self, col: i32, caret_idx: i32) {
+        self.0
+            .set_caret_column_ex(col)
+            .adjust_viewport(false)
+            .caret_index(caret_idx)
+            .done();
     }
 
     fn begin_complex_operation(&mut self) {
@@ -279,12 +290,12 @@ impl TextEditorPort for CodeEditPort<'_> {
         self.0.end_complex_operation();
     }
 
-    fn undo(&mut self) {
-        self.0.undo();
+    fn begin_multicaret_edit(&mut self) {
+        self.0.begin_multicaret_edit();
     }
 
-    fn redo(&mut self) {
-        self.0.redo();
+    fn end_multicaret_edit(&mut self) {
+        self.0.end_multicaret_edit();
     }
 
     fn set_v_scroll(&mut self, value: f64) {
@@ -383,8 +394,8 @@ impl NavigationCapable for CodeEditPort<'_> {
 
         // Tier 2 (Godot ≤4.6): Deferred tooltip emission.
         // Compute the warp position but do NOT warp or emit a signal here.
-        // Instead, store the data in a thread-local for the plugin layer to
-        // pick up after dispatch completes.
+        // Instead, push a PendingUiAction::ShowTooltip for the plugin layer
+        // to pick up after dispatch completes.
         let rect_local = self.0.get_rect_at_line_column(line, col);
 
         let warp_pos = if rect_local.position.x == -1 && rect_local.position.y == -1 {
@@ -406,12 +417,12 @@ impl NavigationCapable for CodeEditPort<'_> {
             }
         };
 
-        PENDING_TOOLTIP_DATA.set(Some(PendingTooltipData {
+        self.1.push(super::godot_host::PendingUiAction::ShowTooltip {
             symbol: symbol.to_string(),
             line,
             col,
             warp_pos,
-        }));
+        });
 
         log::debug!(
             "show_documentation_tooltip: stored pending tooltip for '{symbol}' \
