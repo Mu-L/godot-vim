@@ -12,10 +12,12 @@
 //! plain `extends EditorPlugin` instead.
 
 mod attach;
+mod caret_reconcile;
 mod discovery;
 mod floating;
 mod input;
 mod lifecycle;
+mod outcome;
 mod processing_guard;
 mod signals;
 
@@ -66,10 +68,9 @@ pub struct GodotVimCore {
     settings: Option<crate::settings::SettingsSnapshot>,
     /// Lazily created on first `:mappings` invocation.
     mapping_dialog: Option<Gd<crate::ui::mapping_dialog::MappingDialog>>,
-    /// Counter (not bool) because fast typing queues multiple deferred
-    /// `caret_changed` callbacks per frame. Each suppressed callback
-    /// decrements by 1.
-    pending_caret_suppressions: u32,
+    /// Tracks whether a pending `caret_changed` signal was caused by the
+    /// Vim engine (suppress) or an external source like a mouse click (process).
+    caret_reconciler: caret_reconcile::CaretReconciler,
     pending_tooltip: Option<PendingTooltip>,
     tracked_windows: Vec<TrackedWindow>,
     /// True while the engine is actively processing a keystroke.
@@ -91,7 +92,7 @@ impl INode for GodotVimCore {
             mapping_timer: None,
             settings: None,
             mapping_dialog: None,
-            pending_caret_suppressions: 0,
+            caret_reconciler: caret_reconcile::CaretReconciler::new(),
             pending_tooltip: None,
             tracked_windows: Vec::new(),
             processing_key: false,
@@ -810,6 +811,11 @@ impl GodotVimCore {
 
                         // Refresh UI so the user sees Normal mode + error message
                         // immediately, not stale pre-panic state.
+                        //
+                        // Intentional exception to EngineOutcome: panic recovery
+                        // is defense-in-depth with unconditional-reset semantics,
+                        // not the conditional-update pattern that EngineOutcome
+                        // enforces. Using ui.update() directly is correct here.
                         let editor_id = editor.instance_id();
                         let snap = controller.ui_snapshot(editor_id);
                         self.ui.update(&snap, &mut editor);
@@ -830,9 +836,9 @@ impl GodotVimCore {
         if let Some(timer) = self.mapping_timer.as_mut() {
             timer.stop();
         }
-        // Always reset — trivially infallible (u32 assignment), must happen
-        // regardless of whether recovery itself panicked.
-        self.pending_caret_suppressions = 0;
+        // Always reset — trivially infallible, must happen regardless of
+        // whether recovery itself panicked.
+        self.caret_reconciler.reset();
         self.processing_key = false;
         // Clear pending tooltip directly rather than via cancel_pending_tooltip()
         // because set_process(false) is safe here (poll_pending_tooltip won't

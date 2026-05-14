@@ -11,16 +11,19 @@
 //! Sub-modules:
 //! - [`process`] -- keystroke pipeline (`process_cycle`, `resolve_mapping_timeout`)
 //! - [`completion`] -- CodeEdit autocomplete popup interception
-//! - [`passthrough`] -- key bypass classification (F-keys, Alt/Meta, user overrides)
+//! - [`passthrough`] -- key bypass chain-of-responsibility (F-keys, Meta, user overrides, engine query)
 //! - [`perf`] -- per-keystroke latency tracking (`:perf`)
 //! - [`vimdebug`] -- effect inspector (`:vimdebug watch/step`)
 
 mod completion;
 mod passthrough;
 pub(crate) mod perf;
+mod pipeline_outcome;
 mod process;
 pub(crate) mod reconcile;
 pub(crate) mod vimdebug;
+
+pub(crate) use pipeline_outcome::PipelineOutcome;
 
 use std::collections::HashSet;
 
@@ -47,7 +50,7 @@ const PERF_BUDGET_US: perf::Microseconds = perf::Microseconds(2000);
 /// Grouping these fields into a single struct with a [`reset()`](Self::reset)
 /// method ensures that all cleanup call-sites stay in sync — adding a new
 /// transient field automatically gets cleaned up everywhere.
-struct TransientShellState {
+pub(crate) struct TransientShellState {
     /// Cross-drain runaway guard: catches `:norm` calling back into `drain_pending`.
     operations_this_cycle: u32,
     /// Deferred for the plugin layer (scene tree owner) after `process_cycle`.
@@ -86,6 +89,24 @@ impl TransientShellState {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ControllerPhase {
+    Attached { session: VimSession<GodotHost> },
+    Detached { engine: VimEngine, state: ShellState },
+}
+
+pub(crate) struct ControllerContext {
+    pub(crate) transient: TransientShellState,
+    pub(crate) passthrough_keys: HashSet<KeyEvent>,
+    pub(crate) security_policy: SecurityPolicy,
+    pub(crate) perf: perf::PerfTracker,
+    /// 0 = disabled.
+    pub(crate) highlight_yank_duration_ms: u32,
+    /// Whether Godot's native code completion should auto-trigger on typing.
+    /// Mirrors `text_editor/completion/code_complete_enabled` from EditorSettings.
+    pub(crate) code_complete_enabled: bool,
+}
+
 /// Per-editor orchestrator that bridges Godot's event-driven input to
 /// vim-core's synchronous command model.
 ///
@@ -93,32 +114,14 @@ impl TransientShellState {
 /// persists across attach/detach cycles; the host (`GodotHost`) is created
 /// on attach and destroyed on detach. Between attach and detach, the engine
 /// and host live together in a [`VimSession`]. When detached, the engine is
-/// stored bare in `detached_engine`.
+/// stored bare in [`ControllerPhase::Detached`].
 ///
-/// Invariant: exactly one of `session` or `detached_engine` is `Some` at all
-/// times. Helper methods [`engine()`](Self::engine) / [`engine_mut()`](Self::engine_mut)
-/// abstract over this.
+/// Split into `phase` + `ctx` so that methods can borrow the session (via
+/// `phase`) and transient/config state (via `ctx`) simultaneously without
+/// conflicting `&mut self` borrows.
 pub(crate) struct VimController {
-    /// Active session (engine + host). `Some` when an editor is attached.
-    session: Option<VimSession<GodotHost>>,
-    /// Bare engine stored between detach and the next attach.
-    /// `Some` when no editor is attached.
-    detached_engine: Option<VimEngine>,
-    /// Per-buffer persistent state (marks, undo trees, visual selections) and
-    /// global shell state (messages, hlsearch). Held here between sessions;
-    /// transferred into GodotHost on attach, taken back on detach.
-    detached_state: Option<ShellState>,
-    /// Per-cycle / per-keystroke state that must be reset on every cleanup path.
-    /// See [`TransientShellState::reset()`] for the canonical reset logic.
-    transient: TransientShellState,
-    passthrough_keys: HashSet<KeyEvent>,
-    security_policy: SecurityPolicy,
-    perf: perf::PerfTracker,
-    /// 0 = disabled.
-    highlight_yank_duration_ms: u32,
-    /// Whether Godot's native code completion should auto-trigger on typing.
-    /// Mirrors `text_editor/completion/code_complete_enabled` from EditorSettings.
-    code_complete_enabled: bool,
+    pub(crate) phase: ControllerPhase,
+    pub(crate) ctx: ControllerContext,
 }
 
 impl VimController {
@@ -127,50 +130,51 @@ impl VimController {
         let mut engine = VimEngine::new();
         engine.set_shadow_execution(true);
         Self {
-            session: None,
-            detached_engine: Some(engine),
-            detached_state: Some(ShellState::default()),
-            transient: TransientShellState::new(),
-            passthrough_keys: HashSet::new(),
-            security_policy: SecurityPolicy {
-                shell_execution: ShellExecution::Disabled,
-                file_access_scope: FileAccessScope::ProjectOnly,
-                project_vimrc: crate::settings::ProjectVimrc::Sandbox,
+            phase: ControllerPhase::Detached {
+                engine,
+                state: ShellState::default(),
             },
-            perf: perf::PerfTracker::new(PERF_RING_CAPACITY, PERF_BUDGET_US),
-            highlight_yank_duration_ms: u32::try_from(
-                crate::settings::defaults::HIGHLIGHT_YANK_DURATION,
-            )
-            .unwrap_or(150),
-            code_complete_enabled: true,
+            ctx: ControllerContext {
+                transient: TransientShellState::new(),
+                passthrough_keys: HashSet::new(),
+                security_policy: SecurityPolicy {
+                    shell_execution: ShellExecution::Disabled,
+                    file_access_scope: FileAccessScope::ProjectOnly,
+                    project_vimrc: crate::settings::ProjectVimrc::Sandbox,
+                },
+                perf: perf::PerfTracker::new(PERF_RING_CAPACITY, PERF_BUDGET_US),
+                highlight_yank_duration_ms: u32::try_from(
+                    crate::settings::defaults::HIGHLIGHT_YANK_DURATION,
+                )
+                .unwrap_or(150),
+                code_complete_enabled: true,
+            },
         }
     }
 
     // ── Engine accessors (work in both attached and detached state) ───
 
-    /// Immutable access to the engine, regardless of attach state.
-    fn engine(&self) -> &VimEngine {
-        self.session
-            .as_ref()
-            .map(|s| s.engine())
-            .or(self.detached_engine.as_ref())
-            .expect("VimController invariant: engine always available")
+    pub(crate) fn engine(&self) -> &VimEngine {
+        match &self.phase {
+            ControllerPhase::Attached { session } => session.engine(),
+            ControllerPhase::Detached { engine, .. } => engine,
+        }
     }
 
-    /// Mutable access to the engine, regardless of attach state.
-    fn engine_mut(&mut self) -> &mut VimEngine {
-        if let Some(ref mut session) = self.session {
-            return session.engine_mut();
+    pub(crate) fn engine_mut(&mut self) -> &mut VimEngine {
+        match &mut self.phase {
+            ControllerPhase::Attached { session } => session.engine_mut(),
+            ControllerPhase::Detached { engine, .. } => engine,
         }
-        self.detached_engine
-            .as_mut()
-            .expect("VimController invariant: engine always available")
     }
 
     // ── Session accessors (only valid when attached) ─────────────────
 
     fn session_mut(&mut self) -> &mut VimSession<GodotHost> {
-        self.session.as_mut().expect("VimController: not attached")
+        match &mut self.phase {
+            ControllerPhase::Attached { session } => session,
+            ControllerPhase::Detached { .. } => panic!("VimController: not attached"),
+        }
     }
 
     /// Number of active cursors (1 = single cursor, >1 = multi-cursor active).
@@ -195,24 +199,29 @@ impl VimController {
     /// Create a `VimSession<GodotHost>` by taking the detached engine and
     /// pairing it with a new `GodotHost` wrapping the given editor.
     ///
-    /// Must only be called when detached (i.e., `detached_engine` is `Some`).
+    /// Must only be called when detached.
     /// Syncs controller-level config (security policy, highlight yank duration)
     /// into the new host.
     pub(crate) fn attach_session(&mut self, editor: Gd<CodeEdit>) {
-        let engine = self
-            .detached_engine
-            .take()
-            .expect("attach_session: must be in detached state");
+        let old_phase = std::mem::replace(
+            &mut self.phase,
+            // Temporary placeholder; overwritten below.
+            ControllerPhase::Detached {
+                engine: VimEngine::new(),
+                state: ShellState::default(),
+            },
+        );
+        let ControllerPhase::Detached { engine, state } = old_phase else {
+            panic!("attach_session: must be in detached state");
+        };
         let mut host = GodotHost::new(editor);
-        if let Some(state) = self.detached_state.take() {
-            host.set_state(state);
-        }
-        host.set_security_policy(self.security_policy.clone());
-        host.set_highlight_yank_duration_ms(self.highlight_yank_duration_ms);
+        host.set_state(state);
+        host.set_security_policy(self.ctx.security_policy.clone());
+        host.set_highlight_yank_duration_ms(self.ctx.highlight_yank_duration_ms);
         let mut session = VimSession::from_parts(engine, host);
         let initial_text = session.host().text().to_owned();
         session.engine_mut().set_shadow_text(initial_text);
-        self.session = Some(session);
+        self.phase = ControllerPhase::Attached { session };
     }
 
     /// Decompose the active session: drop the host, reclaim the engine.
@@ -220,31 +229,45 @@ impl VimController {
     /// Returns the `GodotHost` for any final cleanup the caller needs.
     /// No-ops if already detached.
     pub(crate) fn detach_session(&mut self) -> Option<GodotHost> {
-        let session = self.session.take()?;
-        let (engine, mut host) = session.into_parts();
-        self.detached_engine = Some(engine);
-        self.detached_state = Some(host.take_state());
-        Some(host)
+        let old_phase = std::mem::replace(
+            &mut self.phase,
+            ControllerPhase::Detached {
+                engine: VimEngine::new(),
+                state: ShellState::default(),
+            },
+        );
+        match old_phase {
+            ControllerPhase::Attached { session } => {
+                let (engine, mut host) = session.into_parts();
+                let state = host.take_state();
+                self.phase = ControllerPhase::Detached { engine, state };
+                Some(host)
+            }
+            detached @ ControllerPhase::Detached { .. } => {
+                self.phase = detached;
+                None
+            }
+        }
     }
 
     /// Whether a session is currently active (editor attached).
     #[must_use]
     pub(crate) fn is_attached(&self) -> bool {
-        self.session.is_some()
+        matches!(self.phase, ControllerPhase::Attached { .. })
     }
 
     // ── Configuration setters ─────────────────────────────────────────
 
     pub(crate) fn set_passthrough_keys(&mut self, keys: &[KeyEvent]) {
-        self.passthrough_keys = keys.iter().copied().collect();
+        self.ctx.passthrough_keys = keys.iter().copied().collect();
     }
 
     pub(crate) fn set_security_policy(&mut self, policy: SecurityPolicy) {
-        self.security_policy = policy;
+        self.ctx.security_policy = policy;
     }
 
     pub(crate) fn set_highlight_yank_duration(&mut self, ms: u32) {
-        self.highlight_yank_duration_ms = ms;
+        self.ctx.highlight_yank_duration_ms = ms;
     }
 
     pub(crate) fn apply_settings(&mut self, snapshot: &crate::settings::SettingsSnapshot) {
@@ -256,7 +279,7 @@ impl VimController {
             project_vimrc: snapshot.project_vimrc,
         });
         self.set_highlight_yank_duration(snapshot.highlight_yank_duration);
-        self.code_complete_enabled = snapshot.code_complete_enabled;
+        self.ctx.code_complete_enabled = snapshot.code_complete_enabled;
     }
 
     // ── Public accessors ─────────────────────────────────────────────
@@ -318,20 +341,20 @@ impl VimController {
         let highlight_yank = state.take_highlight_yank();
 
         let vimdebug = match (
-            self.transient.vimdebug.provenance().cloned(),
-            self.transient.vimdebug.effects_summary().cloned(),
+            self.ctx.transient.vimdebug.provenance().cloned(),
+            self.ctx.transient.vimdebug.effects_summary().cloned(),
         ) {
-            (Some(provenance), Some(effects)) => match self.transient.vimdebug.step_status_line() {
+            (Some(provenance), Some(effects)) => match self.ctx.transient.vimdebug.step_status_line() {
                 Some(step_status) => crate::types::VimdebugSnapshot::Step {
                     provenance,
                     effects,
-                    range: self.transient.vimdebug.range(),
+                    range: self.ctx.transient.vimdebug.range(),
                     step_status,
                 },
                 None => crate::types::VimdebugSnapshot::Watch {
                     provenance,
                     effects,
-                    range: self.transient.vimdebug.range(),
+                    range: self.ctx.transient.vimdebug.range(),
                 },
             },
             _ => crate::types::VimdebugSnapshot::Inactive,
@@ -355,7 +378,7 @@ impl VimController {
             vimdebug,
             highlight_yank,
             block_visual,
-            cursor_count: self.cursor_count(),
+            cursor_count,
         }
     }
 
@@ -442,7 +465,7 @@ impl VimController {
     /// since every editor lifecycle transition passes through them. Uses
     /// Godot's ObjectDB to probe liveness.
     pub(crate) fn sweep_stale_buffers(&mut self) {
-        let Some(ref mut session) = self.session else {
+        let ControllerPhase::Attached { ref mut session } = self.phase else {
             return;
         };
         let removed = session.host_mut().state_mut().sweep_invalid_buffers(|id| {
@@ -479,7 +502,7 @@ impl VimController {
     pub(crate) fn force_cleanup_without_editor(&mut self) -> u32 {
         log::debug!("force_cleanup_without_editor: canonical Tier 1 reset");
         self.engine_mut().emergency_reset();
-        let godot_groups = if let Some(ref mut session) = self.session {
+        let godot_groups = if let ControllerPhase::Attached { ref mut session } = self.phase {
             let host = session.host_mut();
             let groups = host.undo_depth_mut().drain();
             host.state_mut().clear_substitute_preview();
@@ -488,7 +511,7 @@ impl VimController {
         } else {
             0
         };
-        self.transient.reset();
+        self.ctx.transient.reset();
         godot_groups
     }
 
@@ -507,7 +530,7 @@ impl VimController {
     /// the engine or undo depth. Used by cleanup paths that handle engine
     /// reset separately (e.g., the normal detach path).
     pub(crate) fn reset_transients(&mut self) {
-        self.transient.reset();
+        self.ctx.transient.reset();
     }
 
     /// Clear multi-cursor state on buffer leave. Multi-cursor is per-buffer
@@ -535,7 +558,7 @@ impl VimController {
 
     /// Discard any unconsumed yank highlight to prevent cross-editor flash.
     pub(crate) fn clear_highlight_yank(&mut self) {
-        if let Some(ref mut session) = self.session {
+        if let ControllerPhase::Attached { ref mut session } = self.phase {
             session.host_mut().state_mut().take_highlight_yank();
         }
     }
@@ -589,7 +612,7 @@ impl VimController {
         const MAX_ESC: usize = 5;
 
         // Pre-process setup for session.process_key().
-        if let Some(ref mut session) = self.session {
+        if let ControllerPhase::Attached { ref mut session } = self.phase {
             let engine_mode = session.engine().mode();
             let auto_pairs_active = session.engine().options().auto_pairs().is_some();
             let scrolloff =
@@ -614,7 +637,7 @@ impl VimController {
                 i + 1,
                 self.engine().mode()
             );
-            if let Some(ref mut session) = self.session {
+            if let ControllerPhase::Attached { ref mut session } = self.phase {
                 let _ = session.process_key(KeyEvent::escape());
             }
         }
@@ -647,7 +670,7 @@ impl VimController {
     /// The pipeline's `EndUndo` effect handles the normal case; this catches
     /// edge cases where undo groups are still open.
     pub(crate) fn drain_remaining_undo_depth(&mut self, editor: &mut Gd<CodeEdit>) {
-        let remaining = if let Some(ref mut session) = self.session {
+        let remaining = if let ControllerPhase::Attached { ref mut session } = self.phase {
             session.host_mut().undo_depth_mut().drain()
         } else {
             0
@@ -682,7 +705,7 @@ impl VimController {
     /// resolution produced any effects this cycle.
     #[must_use]
     pub(crate) fn operations_this_cycle(&self) -> u32 {
-        self.transient.operations_this_cycle
+        self.ctx.transient.operations_this_cycle
     }
 
     // ── Config file sourcing ─────────────────────────────────────────
@@ -700,7 +723,7 @@ impl VimController {
         // When detached (no session), config effects are logged but cannot
         // be routed to shell state. This happens during initial enter_tree
         // before any editor is attached.
-        let has_session = self.session.is_some();
+        let has_session = self.is_attached();
         for effect in effects {
             match effect {
                 vim_core::effects::Effect::ShowInfo { info } => {
@@ -750,7 +773,7 @@ impl VimController {
     // ── Pending UI actions ───────────────────────────────────────────
 
     pub(crate) fn take_pending_ui_action(&mut self) -> Option<PendingUiAction> {
-        self.transient.pending_ui_action.take()
+        self.ctx.transient.pending_ui_action.take()
     }
 
     /// Panic recovery composed from the canonical Tier 1 cleanup.
@@ -774,7 +797,7 @@ impl VimController {
         editor.deselect();
         editor.remove_secondary_carets();
         let editor_id = editor.instance_id();
-        if let Some(ref mut session) = self.session {
+        if let ControllerPhase::Attached { ref mut session } = self.phase {
             session
                 .host_mut()
                 .state_mut()
@@ -797,11 +820,9 @@ impl VimController {
     /// Returns `true` if a change was detected and reconciled.
     /// No-ops when detached (no session).
     pub(crate) fn reconcile_external_edit(&mut self, editor: &Gd<CodeEdit>) -> bool {
-        use vim_core::document::Document;
-
-        let session = match self.session.as_mut() {
-            Some(s) => s,
-            None => return false,
+        let session = match &mut self.phase {
+            ControllerPhase::Attached { session } => session,
+            ControllerPhase::Detached { .. } => return false,
         };
 
         let new_text = editor.get_text().to_string();
@@ -856,7 +877,11 @@ impl VimController {
     // ── Processing entry points ────────────────────────────────────────
 
     /// Single entry point for keystroke processing from `gui_input`.
-    pub(crate) fn process_cycle(&mut self, key: KeyEvent, editor: &mut Gd<CodeEdit>) -> bool {
+    pub(crate) fn process_cycle(
+        &mut self,
+        key: KeyEvent,
+        editor: &mut Gd<CodeEdit>,
+    ) -> PipelineOutcome {
         self.process_cycle_impl(key, editor)
     }
 
@@ -876,10 +901,9 @@ impl VimController {
         head_col: i32,
         shape: vim_core::primitives::SelectionShape,
     ) -> bool {
-        let session = self
-            .session
-            .as_mut()
-            .expect("process_mouse_selection: requires active session");
+        let ControllerPhase::Attached { ref mut session } = self.phase else {
+            panic!("process_mouse_selection: requires active session");
+        };
 
         // Compute byte offsets from line/col using the host's document.
         let text = editor.get_text().to_string();
@@ -927,7 +951,7 @@ impl VimController {
     /// (e.g., keybinding-triggered actions). Delegates to the same
     /// `sync_multi_cursors_to_godot` used by the process_cycle path.
     pub(crate) fn sync_multi_cursors_after_action(&mut self) {
-        if let Some(ref mut session) = self.session {
+        if let ControllerPhase::Attached { ref mut session } = self.phase {
             process::sync_multi_cursors_to_godot(session);
         }
     }
@@ -945,9 +969,9 @@ impl VimController {
         use vim_core::primitives::Direction;
         use vim_core::state::MultiCursorCommand;
 
-        let session = match self.session.as_mut() {
-            Some(s) => s,
-            None => {
+        let session = match &mut self.phase {
+            ControllerPhase::Attached { session } => session,
+            ControllerPhase::Detached { .. } => {
                 log::warn!("execute_multi_cursor_action: no active session");
                 return;
             }
@@ -1021,9 +1045,9 @@ impl VimController {
     /// position from Godot (immune to text edits between presses). The
     /// session auto-invalidates when the word under cursor changes.
     fn execute_add_next_match(&mut self, text: &str) {
-        let session = match self.session.as_mut() {
-            Some(s) => s,
-            None => return,
+        let session = match &mut self.phase {
+            ControllerPhase::Attached { session } => session,
+            ControllerPhase::Detached { .. } => return,
         };
 
         let primary_offset = {
@@ -1238,7 +1262,8 @@ fn find_word_at_offset(text: &str, offset: usize) -> Option<&str> {
 mod tests {
     use super::*;
 
-    /// Exhaustive field inventory for [`VimController`].
+    /// Exhaustive field inventory for [`VimController`], [`ControllerPhase`],
+    /// and [`ControllerContext`].
     ///
     /// Adding a new field causes a compile error until it is categorized here.
     /// This is the compile-time guarantee that cleanup paths stay complete.
@@ -1255,16 +1280,28 @@ mod tests {
         #[allow(unused, unreachable_code)]
         fn check(c: VimController) {
             let VimController {
-                session: _,                    // engine+host: emergency_reset() + host cleanup
-                detached_engine: _,            // engine: emergency_reset() when detached
-                detached_state: _, // persistent: transferred to/from host on attach/detach
-                transient: _,      // transient: .reset()
-                passthrough_keys: _, // config
-                security_policy: _, // config
-                perf: _,           // persistent
-                highlight_yank_duration_ms: _, // config
-                code_complete_enabled: _, // config
+                phase,  // engine+host lifecycle (see phase inventory below)
+                ctx,    // config + transient (see ctx inventory below)
             } = c;
+
+            match phase {
+                ControllerPhase::Attached { session: _ } => {
+                    // engine+host: emergency_reset() + host cleanup
+                }
+                ControllerPhase::Detached {
+                    engine: _, // engine: emergency_reset() when detached
+                    state: _,  // persistent: transferred to/from host on attach/detach
+                } => {}
+            }
+
+            let ControllerContext {
+                transient: _,                  // transient: .reset()
+                passthrough_keys: _,           // config
+                security_policy: _,            // config
+                perf: _,                       // persistent
+                highlight_yank_duration_ms: _, // config
+                code_complete_enabled: _,      // config
+            } = ctx;
         }
     }
 }

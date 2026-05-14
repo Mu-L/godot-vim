@@ -26,39 +26,38 @@ use crate::bridge::port::TextEditorPort;
 
 use super::completion;
 use super::perf;
-use super::VimController;
+use super::{ControllerPhase, PipelineOutcome, VimController};
 use crate::bridge::codec::usize_to_i32;
 use crate::bridge::godot_host::GodotHost;
 
 impl VimController {
-    /// Single entry point from `gui_input`. Returns `true` if Vim consumed
-    /// the key (Godot should not process it), `false` to pass through.
-    ///
-    /// Guarantees undo group balance on return via `ensure_undo_balanced`.
-    pub(crate) fn process_cycle_impl(&mut self, key: KeyEvent, editor: &mut Gd<CodeEdit>) -> bool {
-        self.transient.operations_this_cycle = 0;
+    pub(crate) fn process_cycle_impl(
+        &mut self,
+        key: KeyEvent,
+        editor: &mut Gd<CodeEdit>,
+    ) -> PipelineOutcome {
+        self.ctx.transient.operations_this_cycle = 0;
 
         // Messages are one-shot: displayed after the producing keystroke,
         // cleared on the next. Mirrors vim-core's clear_transient().
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("process_cycle: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("process_cycle: requires active session");
+            };
             session.host_mut().state_mut().globals_mut().clear_message();
         }
 
-        // Step mode intercepts all keys for the effect inspector (n/p/c/q).
-        if self.transient.vimdebug.is_step_mode() && self.transient.pending_step_effects.is_some() {
-            return self.process_step_key(key, editor);
+        if self.ctx.transient.vimdebug.is_step_mode()
+            && self.ctx.transient.pending_step_effects.is_some()
+        {
+            self.process_step_key(key, editor);
+            return PipelineOutcome::VimdebugStep;
         }
 
-        // Completion interception (pre-engine): check if completion popup handles key.
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("process_cycle: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("process_cycle: requires active session");
+            };
             if let Some(consumed) =
                 completion::try_handle_completion(session.engine_mut(), key, editor)
             {
@@ -67,26 +66,26 @@ impl VimController {
                     key,
                     consumed
                 );
-                // When completion confirmed (consumed=true), the editor text changed
-                // but the host's text_cache is stale. Invalidate it so the next
-                // on_text_changed sees matching texts and skips double-reconciliation.
                 if consumed {
                     session.host_mut().invalidate_cache();
                 }
                 let mode = session.engine().mode();
                 session.host_mut().ensure_undo_balanced(mode);
-                return consumed;
+                return if consumed {
+                    PipelineOutcome::CompletionConsumed
+                } else {
+                    PipelineOutcome::CompletionDeferred
+                };
             }
         }
 
-        // Passthrough check: does this key bypass Vim entirely?
         if self.should_passthrough_key(key) {
             log::debug!(
                 "process_cycle: passthrough key={} mode={}",
                 key,
                 self.engine().mode()
             );
-            return false;
+            return PipelineOutcome::Passthrough;
         }
 
         // Capture pre-processing state for debug summary and IME lifecycle.
@@ -96,10 +95,9 @@ impl VimController {
 
         // ── Pre-processing setup ────────────────────────────────────────
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("process_cycle: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("process_cycle: requires active session");
+            };
             let engine_mode = session.engine().mode();
             let auto_pairs_active = session.engine().options().auto_pairs().is_some();
             let scrolloff = usize_to_i32(session.engine().options().scrolloff());
@@ -118,18 +116,17 @@ impl VimController {
             session.host_mut().set_current_mode(engine_mode);
             session
                 .host_mut()
-                .set_vimdebug_enabled(self.transient.vimdebug.is_enabled());
+                .set_vimdebug_enabled(self.ctx.transient.vimdebug.is_enabled());
         }
 
         // ── Vimdebug: capture provenance before engine process ──────────
-        self.transient.vimdebug.clear_captures();
+        self.ctx.transient.vimdebug.clear_captures();
 
         // ── Clipboard sync: pre-populate + register for clipboard=unnamedplus ──
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("process_cycle: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("process_cycle: requires active session");
+            };
             let opts = session.engine().resolved_options();
             if opts.clipboard_has_unnamedplus() || opts.clipboard_has_unnamed() {
                 let text = godot::classes::DisplayServer::singleton()
@@ -141,23 +138,21 @@ impl VimController {
 
         // ── CORE: session.process_key(key) ──────────────────────────────
         let result = {
-            let session = self
-                .session
-                .as_mut()
-                .expect("process_cycle: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("process_cycle: requires active session");
+            };
             session.process_key(key)
         };
         let consumed = result.consumed;
 
-        self.transient.operations_this_cycle =
-            self.transient.operations_this_cycle.saturating_add(1);
+        self.ctx.transient.operations_this_cycle =
+            self.ctx.transient.operations_this_cycle.saturating_add(1);
 
         // ── Gap 1 & 5: Sync multi-cursor positions to Godot ────────────
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("process_cycle: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("process_cycle: requires active session");
+            };
             sync_multi_cursors_to_godot(session);
         }
 
@@ -178,10 +173,9 @@ impl VimController {
 
         // ── Post-processing: drain pending UI actions from host ─────────
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("process_cycle: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("process_cycle: requires active session");
+            };
             let pending_actions = session.host_mut().take_pending_ui_actions();
             for action in pending_actions {
                 self.handle_host_pending_ui_action(action, editor);
@@ -190,43 +184,28 @@ impl VimController {
 
         // ── Post-processing: ensure undo balanced ───────────────────────
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("process_cycle: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("process_cycle: requires active session");
+            };
             let mode = session.engine().mode();
             session.host_mut().ensure_undo_balanced(mode);
         }
 
         // ── Post-processing: completion re-trigger ──────────────────────
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("process_cycle: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("process_cycle: requires active session");
+            };
             completion::maybe_retrigger_completion(
                 session.engine(),
                 key,
                 editor,
-                self.code_complete_enabled,
+                self.ctx.code_complete_enabled,
             );
         }
 
         let total_elapsed = total_start.elapsed();
 
-        // ── IME lifecycle ────────────────────────────────────────────────
-        // Godot's TextEdit unconditionally re-enables im_active on every redraw
-        // (text_edit.cpp: _update_ime_window_position → window_set_ime_active(true)).
-        // Any cursor movement triggers queue_redraw(), so by the next frame im_active
-        // is true again even though we set it false on mode exit.
-        //
-        // On macOS, im_active=true causes the keyDown handler to route through
-        // interpretKeyEvents, where the Press-and-Hold accent system can suppress
-        // insertText on key repeat — losing the unicode value entirely.
-        //
-        // Fix: re-assert deactivate_ime after every keystroke in non-insert modes,
-        // not just on mode transitions. This counteracts TextEdit's re-enablement.
-        // See: https://github.com/hmdfrds/godot-vim/issues/33
         let mode_after = self.engine().mode();
         let is_insert_like =
             mode_after.is_insert() || mode_after.is_replace() || mode_after.is_command_line();
@@ -242,16 +221,12 @@ impl VimController {
             }
             update_ime_position(editor);
         } else {
-            // Immediate deactivation — effective within this frame's input phase.
             deactivate_ime(editor);
-            // Deferred deactivation — runs AFTER the draw phase where TextEdit
-            // unconditionally re-enables im_active via _update_ime_window_position.
-            // This ensures im_active=false when the next frame's input arrives.
             deactivate_ime_deferred(editor);
         }
 
         // ── Perf metrics recording ──────────────────────────────────────
-        self.perf.record(perf::FrameMetrics {
+        self.ctx.perf.record(perf::FrameMetrics {
             context_build_us: perf::Microseconds(0),
             engine_process_us: perf::Microseconds(0),
             effects_dispatch_us: perf::Microseconds(0),
@@ -285,7 +260,11 @@ impl VimController {
             log::debug!(target: "key", "{}", summary);
         }
 
-        consumed
+        if consumed {
+            PipelineOutcome::EngineConsumed(result)
+        } else {
+            PipelineOutcome::EngineIgnored(result)
+        }
     }
 
     /// Handle pending UI actions from GodotHost (deferred commands that need
@@ -303,39 +282,42 @@ impl VimController {
         use crate::bridge::godot_host::PendingUiAction;
         match action {
             PendingUiAction::OpenMappingDialog | PendingUiAction::SourceConfigFile => {
-                self.transient.pending_ui_action = Some(action);
+                self.ctx.transient.pending_ui_action = Some(action);
             }
             PendingUiAction::ShowUndoTree => {
                 let editor_id = editor.instance_id();
-                let msg = {
-                    let session = self.session.as_mut().expect("requires active session");
-                    session
-                        .host_mut()
-                        .state_mut()
-                        .buffer(editor_id)
-                        .undo_tree()
-                        .map_or_else(
-                            || "No undo tree for this buffer".to_owned(),
-                            |tree| tree.format_tree(),
-                        )
+                let ControllerPhase::Attached { ref mut session } = self.phase else {
+                    panic!("handle_host_pending_ui_action: requires active session");
                 };
-                let session = self.session.as_mut().expect("requires active session");
+                let msg = session
+                    .host_mut()
+                    .state_mut()
+                    .buffer(editor_id)
+                    .undo_tree()
+                    .map_or_else(
+                        || "No undo tree for this buffer".to_owned(),
+                        |tree| tree.format_tree(),
+                    );
                 crate::effects::messages::handle_show_message(
                     session.host_mut().state_mut().globals_mut(),
                     &msg,
                 );
             }
             PendingUiAction::PerfReport => {
-                let msg = self.perf.format_report();
-                let session = self.session.as_mut().expect("requires active session");
+                let msg = self.ctx.perf.format_report();
+                let ControllerPhase::Attached { ref mut session } = self.phase else {
+                    panic!("handle_host_pending_ui_action: requires active session");
+                };
                 crate::effects::messages::handle_show_message(
                     session.host_mut().state_mut().globals_mut(),
                     &msg,
                 );
             }
             PendingUiAction::PerfReset => {
-                self.perf.reset();
-                let session = self.session.as_mut().expect("requires active session");
+                self.ctx.perf.reset();
+                let ControllerPhase::Attached { ref mut session } = self.phase else {
+                    panic!("handle_host_pending_ui_action: requires active session");
+                };
                 crate::effects::messages::handle_show_message(
                     session.host_mut().state_mut().globals_mut(),
                     ":perf reset",
@@ -353,7 +335,7 @@ impl VimController {
 
         let (mode, msg) = match cmd.trim() {
             "vimdebug" | "vimdebug on" => {
-                if self.transient.vimdebug.mode() == VimdebugMode::Off {
+                if self.ctx.transient.vimdebug.mode() == VimdebugMode::Off {
                     (VimdebugMode::Watch, ":vimdebug ON (watch)")
                 } else {
                     (VimdebugMode::Off, ":vimdebug OFF")
@@ -364,8 +346,10 @@ impl VimController {
             "vimdebug step" => (VimdebugMode::Step, ":vimdebug ON (step)"),
             _ => return,
         };
-        self.transient.vimdebug.set_mode(mode);
-        let session = self.session.as_mut().expect("requires active session");
+        self.ctx.transient.vimdebug.set_mode(mode);
+        let ControllerPhase::Attached { ref mut session } = self.phase else {
+            panic!("handle_vimdebug_command: requires active session");
+        };
         crate::effects::messages::handle_show_message(
             session.host_mut().state_mut().globals_mut(),
             msg,
@@ -375,13 +359,12 @@ impl VimController {
     /// Force-resolve a pending mapping after timeout, then drain expanded keys.
     pub(crate) fn resolve_mapping_timeout_impl(&mut self, editor: &mut Gd<CodeEdit>) {
         log::debug!("resolve_mapping_timeout: resolving pending mapping");
-        self.transient.operations_this_cycle = 0;
+        self.ctx.transient.operations_this_cycle = 0;
 
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("resolve_mapping_timeout: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("resolve_mapping_timeout: requires active session");
+            };
             let engine_mode = session.engine().mode();
             let auto_pairs_active = session.engine().options().auto_pairs().is_some();
             let scrolloff = usize_to_i32(session.engine().options().scrolloff());
@@ -401,34 +384,31 @@ impl VimController {
         }
 
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("resolve_mapping_timeout: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("resolve_mapping_timeout: requires active session");
+            };
             session.engine_mut().resolve_timeout();
             // drain_and_process_one calls build_context -> process -> deliver_effects
             // for each pending key, so effects are applied by GodotHost.
             while session.drain_and_process_one() {
-                self.transient.operations_this_cycle =
-                    self.transient.operations_this_cycle.saturating_add(1);
+                self.ctx.transient.operations_this_cycle =
+                    self.ctx.transient.operations_this_cycle.saturating_add(1);
             }
         }
 
         // Gaps 1 & 5: Sync multi-cursor positions after drain.
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("resolve_mapping_timeout: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("resolve_mapping_timeout: requires active session");
+            };
             sync_multi_cursors_to_godot(session);
         }
 
         // Handle any deferred actions produced during drain.
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("resolve_mapping_timeout: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("resolve_mapping_timeout: requires active session");
+            };
             let pending_actions = session.host_mut().take_pending_ui_actions();
             for action in pending_actions {
                 self.handle_host_pending_ui_action(action, editor);
@@ -436,10 +416,9 @@ impl VimController {
         }
 
         {
-            let session = self
-                .session
-                .as_mut()
-                .expect("resolve_mapping_timeout: requires active session");
+            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                panic!("resolve_mapping_timeout: requires active session");
+            };
             let mode = session.engine().mode();
             session.host_mut().ensure_undo_balanced(mode);
         }
@@ -447,48 +426,42 @@ impl VimController {
 
     // ── Key passthrough ──────────────────────────────────────────────
     //
-    // Decision order: mappings beat everything, then user overrides,
-    // then host policy (F-keys, Alt/Meta), then the engine's own judgment.
+    // Chain-of-responsibility: MappingPriority → UserOverride → HostPolicy → EngineQuery.
+    // See `controller/passthrough.rs` for filter definitions and chain runner.
 
     fn should_passthrough_key(&self, key: KeyEvent) -> bool {
+        use super::passthrough::{run_passthrough_chain, FilterContext};
+
         // Normalize non-Latin keys for mapping and passthrough lookup so that e.g.
         // Alt+Cyrillic-o matches a user's <A-j> mapping or passthrough entry.
-        let mapping_key = normalize_key_for_mapping(key);
+        let normalized_key = normalize_key_for_mapping(key);
 
-        // Mappings always take priority -- never passthrough mid-sequence.
-        if self.engine().has_pending_mapping() || self.engine().could_start_mapping(mapping_key) {
-            return false;
-        }
+        let ctx = FilterContext {
+            key,
+            normalized_key,
+            engine: self.engine(),
+            user_overrides: &self.ctx.passthrough_keys,
+        };
 
-        // User overrides: check both raw and normalized keys so that a passthrough
-        // entry for 'j' works on both Latin and non-Latin layouts.
-        if self.passthrough_keys.contains(&key) || self.passthrough_keys.contains(&mapping_key) {
-            return true;
-        }
-
-        if super::passthrough::is_always_passthrough(key) {
-            return true;
-        }
-
-        // Final arbiter: does the engine's built-in command set handle this key?
-        !self.engine().would_handle_key(key)
+        run_passthrough_chain(&ctx)
     }
 
-    /// Vimdebug step-mode key handler: n=next, p=prev, c=continue, q=quit.
-    /// All keys are consumed while stepping.
-    fn process_step_key(&mut self, key: KeyEvent, editor: &mut Gd<CodeEdit>) -> bool {
+    fn process_step_key(&mut self, key: KeyEvent, editor: &mut Gd<CodeEdit>) {
         let scrolloff = usize_to_i32(self.engine().options().scrolloff());
         let editor_id = editor.instance_id();
         let ch = key.as_char();
 
         match ch {
             Some('n') => {
-                if let Some(idx) = self.transient.vimdebug.step_next() {
-                    if let Some(ref effects) = self.transient.pending_step_effects {
+                if let Some(idx) = self.ctx.transient.vimdebug.step_next() {
+                    if let Some(ref effects) = self.ctx.transient.pending_step_effects {
                         if idx < effects.len() {
                             let effect = effects[idx].clone();
+                            let ControllerPhase::Attached { ref mut session } = self.phase else {
+                                panic!("process_step_key: requires active session");
+                            };
                             apply_step_effect_to_host(
-                                self.session.as_mut().expect("requires active session"),
+                                session,
                                 effect,
                                 editor,
                                 editor_id,
@@ -497,17 +470,18 @@ impl VimController {
                         }
                     }
                 }
-                if !self.transient.vimdebug.has_pending_steps() {
-                    self.transient.vimdebug.step_quit();
-                    self.transient.pending_step_effects = None;
+                if !self.ctx.transient.vimdebug.has_pending_steps() {
+                    self.ctx.transient.vimdebug.step_quit();
+                    self.ctx.transient.pending_step_effects = None;
                 }
             }
             Some('p') => {
-                self.transient.vimdebug.step_prev();
+                self.ctx.transient.vimdebug.step_prev();
             }
             Some('c') => {
-                let remaining = self.transient.vimdebug.step_continue();
+                let remaining = self.ctx.transient.vimdebug.step_continue();
                 let mut all_effects = self
+                    .ctx
                     .transient
                     .pending_step_effects
                     .take()
@@ -519,31 +493,31 @@ impl VimController {
                     .enumerate()
                     .filter_map(|(i, e)| remaining_set.contains(&i).then_some(e))
                     .collect();
+                let ControllerPhase::Attached { ref mut session } = self.phase else {
+                    panic!("process_step_key: requires active session");
+                };
                 for effect in to_apply {
                     apply_step_effect_to_host(
-                        self.session.as_mut().expect("requires active session"),
+                        session,
                         effect,
                         editor,
                         editor_id,
                         scrolloff,
                     );
                 }
-                self.transient.vimdebug.step_quit();
+                self.ctx.transient.vimdebug.step_quit();
             }
             Some('q') => {
-                self.transient.vimdebug.step_quit();
-                self.transient.pending_step_effects = None;
+                self.ctx.transient.vimdebug.step_quit();
+                self.ctx.transient.pending_step_effects = None;
             }
             _ => {} // Consume all other keys while stepping
         }
-        // Step effects bypass GodotHost::apply_effects, so the text cache
-        // may be stale. Force a rebuild on the next access.
         if matches!(ch, Some('n') | Some('c')) {
-            if let Some(session) = self.session.as_mut() {
+            if let ControllerPhase::Attached { ref mut session } = self.phase {
                 session.host_mut().invalidate_cache();
             }
         }
-        true
     }
 }
 

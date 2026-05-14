@@ -2,11 +2,16 @@
 //! per-buffer engine state save/restore, indent/commentstring sync, and UI
 //! lifecycle management.
 
+// Promote #[must_use] warnings to errors so that dropping an EngineOutcome
+// without calling .apply_ui_update() or .discard() is a compile-time error.
+#![deny(unused_must_use)]
+
 use godot::classes::CodeEdit;
 use godot::prelude::*;
 
 use crate::bridge::code_edit_ext::CodeEditExt;
 
+use super::outcome::EngineOutcome;
 use super::signals::{connect_deferred, connect_immediate, safe_disconnect};
 use super::GodotVimCore;
 
@@ -124,7 +129,8 @@ impl GodotVimCore {
         // (search highlights, status bar mode label, cursor shape, etc.).
         if let Some(controller) = &mut self.controller {
             let snap = controller.ui_snapshot(new_id);
-            self.ui.update(&snap, &mut editor);
+            EngineOutcome::with_snapshot(snap, crate::controller::PipelineOutcome::Passthrough)
+                .apply_ui_update(&mut self.ui, &mut editor, &mut self.caret_reconciler);
         }
 
         // Scrollbar instances are stable across attach/detach -- Godot does not
@@ -160,9 +166,9 @@ impl GodotVimCore {
         // language would produce wrong results in the new editor.
         crate::bridge::port_impl::invalidate_brace_pair_cache();
 
-        // Reset so outstanding suppressions from this editor don't swallow
+        // Reset so outstanding expectations from this editor don't suppress
         // legitimate caret_changed events on the next editor.
-        self.pending_caret_suppressions = 0;
+        self.caret_reconciler.reset();
 
         // Discard any unconsumed yank highlight so it doesn't flash on the
         // next editor's first ui_snapshot(). Matches the substitute_preview
