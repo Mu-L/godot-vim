@@ -56,7 +56,7 @@ impl AutoBraceSnapshot {
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect();
                     // Longest-match-first: e.g. `/*` must match before `*`.
-                    pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                    pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
                     let rc = Rc::new(pairs);
                     *cache = Some((editor_id, Rc::clone(&rc)));
                     rc
@@ -68,7 +68,7 @@ impl AutoBraceSnapshot {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect();
                 // Longest-match-first: e.g. `/*` must match before `*`.
-                pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
                 let rc = Rc::new(pairs);
                 *cache = Some((editor_id, Rc::clone(&rc)));
                 rc
@@ -296,14 +296,6 @@ impl TextEditorPort for CodeEditPort<'_> {
 
     fn end_multicaret_edit(&mut self) {
         self.0.end_multicaret_edit();
-    }
-
-    fn undo(&mut self) {
-        self.0.undo();
-    }
-
-    fn redo(&mut self) {
-        self.0.redo();
     }
 
     fn set_v_scroll(&mut self, value: f64) {

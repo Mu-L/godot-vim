@@ -112,32 +112,21 @@ pub(crate) fn compute_cursor_geometry(
     // get_caret_column()'s semantics (not byte or grapheme count).
     let line_len = editor.get_line(line).chars().len();
 
+    let mut ctx = ShapingContext {
+        shaped_cache,
+        editor,
+        font: &font,
+        font_size,
+    };
+
     let (target_x, width) = if override_pos.is_some() {
         // Override path: shapes the line once for both x and width.
-        compute_override_x_and_width(
-            shaped_cache,
-            editor,
-            &font,
-            font_size,
-            line,
-            col,
-            line_len,
-            fallback_char_width,
-        )
+        compute_override_x_and_width(&mut ctx, line, col, line_len, fallback_char_width)
     } else {
         // Native caret path: x from Godot's built-in draw_pos (free),
         // width from a shaped-text measurement (cached per line).
         let x = editor.get_caret_draw_pos().x;
-        let w = compute_char_width_ts(
-            shaped_cache,
-            editor,
-            &font,
-            font_size,
-            line,
-            col,
-            line_len,
-            fallback_char_width,
-        );
+        let w = compute_char_width_ts(&mut ctx, line, col, line_len, fallback_char_width);
         (x, w)
     };
 
@@ -146,6 +135,15 @@ pub(crate) fn compute_cursor_geometry(
         height,
         width,
     })
+}
+
+/// Shared context for shaped-text operations, reducing repeated parameter
+/// passing through the cursor geometry pipeline.
+struct ShapingContext<'a> {
+    shaped_cache: &'a mut ShapedTextCache,
+    editor: &'a Gd<CodeEdit>,
+    font: &'a Gd<Font>,
+    font_size: i32,
 }
 
 /// Compute x-coordinate and character width for an override position using a
@@ -160,36 +158,25 @@ pub(crate) fn compute_cursor_geometry(
 ///   base + shaped offset from col 0. Less accurate but the only option when
 ///   the native caret is on another line.
 fn compute_override_x_and_width(
-    shaped_cache: &mut ShapedTextCache,
-    editor: &Gd<CodeEdit>,
-    font: &Gd<Font>,
-    font_size: i32,
+    ctx: &mut ShapingContext,
     line: i32,
     col: i32,
     line_len: usize,
     fallback_char_width: f32,
 ) -> (f32, f32) {
+    let editor = ctx.editor;
     let draw_pos = editor.get_caret_draw_pos();
     let caret_line = editor.get_caret_line();
     let caret_col = editor.get_caret_column();
 
     // Fast path: override matches native caret, so draw_pos is exact.
     if caret_line == line && caret_col == col {
-        let w = compute_char_width_ts(
-            shaped_cache,
-            editor,
-            font,
-            font_size,
-            line,
-            col,
-            line_len,
-            fallback_char_width,
-        );
+        let w = compute_char_width_ts(ctx, line, col, line_len, fallback_char_width);
         return (draw_pos.x, w);
     }
 
-    let result = shaped_cache
-        .get_or_shape(editor, font, font_size, line)
+    let result = ctx.shaped_cache
+        .get_or_shape(editor, ctx.font, ctx.font_size, line)
         .map(|(rid, ts)| {
             let x = if caret_line == line {
                 // Same line: shaped delta from native caret col to target col,
@@ -393,10 +380,7 @@ fn caret_x_from_dict(dict: &VarDictionary) -> Option<f32> {
 /// Only used on the non-override (native caret) path; the override path
 /// computes width inside `compute_override_x_and_width` to share the RID.
 fn compute_char_width_ts(
-    shaped_cache: &mut ShapedTextCache,
-    editor: &Gd<CodeEdit>,
-    font: &Gd<Font>,
-    font_size: i32,
+    ctx: &mut ShapingContext,
     line: i32,
     col: i32,
     line_len: usize,
@@ -406,7 +390,7 @@ fn compute_char_width_ts(
         return fallback;
     }
 
-    if let Some(delta) = shaped_text_caret_delta(shaped_cache, editor, font, font_size, line, col + 1, col) {
+    if let Some(delta) = shaped_text_caret_delta(ctx.shaped_cache, ctx.editor, ctx.font, ctx.font_size, line, col + 1, col) {
         let w = delta.abs();
         if is_sane_coord(w) && w >= MIN_CURSOR_WIDTH {
             return w;

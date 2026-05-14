@@ -2,7 +2,7 @@
 //!
 //! Trait hierarchy:
 //!
-//! - **`TextEditorPort`** (26 methods) — core text editing (required).
+//! - **`TextEditorPort`** (33 methods) — core text editing (required).
 //! - **`FoldCapable`** (5 methods, default no-ops) — code folding.
 //! - **`IdeCapable`** (2 methods, default no-ops) — autocomplete/hints.
 //! - **`NavigationCapable`** (2 methods, default no-ops) — go-to-definition, hover docs.
@@ -79,8 +79,6 @@ pub(crate) trait TextEditorPort {
 
     fn begin_multicaret_edit(&mut self);
     fn end_multicaret_edit(&mut self);
-    fn undo(&mut self);
-    fn redo(&mut self);
 
     fn set_v_scroll(&mut self, value: f64);
     fn get_first_visible_line(&self) -> i32;

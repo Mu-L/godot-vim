@@ -173,11 +173,6 @@ impl VimController {
         self.engine().state().multi_cursor().selections().len()
     }
 
-    /// Scrolloff value from vim-core options.
-    pub(crate) fn scrolloff(&self) -> i32 {
-        crate::bridge::codec::usize_to_i32(self.engine().options().scrolloff())
-    }
-
     /// Mutable access to the host's shell state.
     ///
     /// Returns `None` when detached (no active session).

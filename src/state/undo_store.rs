@@ -37,17 +37,9 @@ struct UndoSnapshot {
 }
 
 /// Result of applying a changeset during undo/redo.
-///
-/// Contains both the full result text and the individual changes suitable
-/// for applying to `CodeEdit` via targeted `insert_text`/`remove_text`.
 pub(crate) struct UndoApplyResult {
     /// The document text after applying the changeset.
     pub text: String,
-    /// `(from, to, replacement)` triples in input-document byte offsets.
-    /// - `(from, to, None)` — deletion of `from..to`
-    /// - `(pos, pos, Some(text))` — insertion at `pos`
-    /// - `(from, to, Some(text))` — replacement of `from..to` with `text`
-    pub changes: Vec<(usize, usize, Option<String>)>,
 }
 
 /// Changeset-based undo storage keyed by vim-core `NodeId`.
@@ -156,19 +148,13 @@ impl UndoStore {
     pub fn undo_step(&mut self, node_id: NodeId, current_text: &str) -> Option<UndoApplyResult> {
         let snap = self.snapshots.get(&node_id)?;
         match snap.inverse.apply(current_text) {
-            Ok(result_text) => {
-                let changes = Self::collect_changes(&snap.inverse);
-                Some(UndoApplyResult {
-                    text: result_text,
-                    changes,
-                })
-            }
+            Ok(text) => Some(UndoApplyResult { text }),
             Err(ChangeSetError::LengthMismatch { .. }) => {
                 log::warn!(
                     "undo_store: LengthMismatch on undo node {} — attempting checkpoint fallback",
                     node_id
                 );
-                self.checkpoint_fallback(node_id, current_text, Direction::Undo)
+                self.checkpoint_fallback(node_id, Direction::Undo)
             }
             Err(e) => {
                 log::error!(
@@ -181,26 +167,20 @@ impl UndoStore {
         }
     }
 
-    /// Apply forward changeset (redo). Returns changes for `CodeEdit` application.
+    /// Apply forward changeset (redo). Returns the result text.
     ///
     /// Falls back to checkpoint on `LengthMismatch` (external edit desync).
     /// Returns `None` if the node has no snapshot stored.
     pub fn redo_step(&mut self, node_id: NodeId, current_text: &str) -> Option<UndoApplyResult> {
         let snap = self.snapshots.get(&node_id)?;
         match snap.forward.apply(current_text) {
-            Ok(result_text) => {
-                let changes = Self::collect_changes(&snap.forward);
-                Some(UndoApplyResult {
-                    text: result_text,
-                    changes,
-                })
-            }
+            Ok(text) => Some(UndoApplyResult { text }),
             Err(ChangeSetError::LengthMismatch { .. }) => {
                 log::warn!(
                     "undo_store: LengthMismatch on redo node {} — attempting checkpoint fallback",
                     node_id
                 );
-                self.checkpoint_fallback(node_id, current_text, Direction::Redo)
+                self.checkpoint_fallback(node_id, Direction::Redo)
             }
             Err(e) => {
                 log::error!(
@@ -210,13 +190,6 @@ impl UndoStore {
                 );
                 None
             }
-        }
-    }
-
-    /// Garbage-collect entries for pruned nodes.
-    pub fn remove_pruned(&mut self, ids: &[NodeId]) {
-        for id in ids {
-            self.snapshots.remove(id);
         }
     }
 
@@ -250,20 +223,13 @@ impl UndoStore {
     fn checkpoint_fallback(
         &self,
         node_id: NodeId,
-        current_text: &str,
         direction: Direction,
     ) -> Option<UndoApplyResult> {
         // Try to find the target text from the node's own checkpoint or
         // the nearest checkpoint by sequence.
-        let target_text = self.find_checkpoint_target(node_id, direction)?;
+        let text = self.find_checkpoint_target(node_id, direction)?;
 
-        let diff = ChangeSet::from_diff(current_text, &target_text);
-        let changes = Self::collect_changes(&diff);
-
-        Some(UndoApplyResult {
-            text: target_text,
-            changes,
-        })
+        Some(UndoApplyResult { text })
     }
 
     /// Find the target text for checkpoint fallback.
@@ -330,14 +296,6 @@ impl UndoStore {
             .min_by_key(|s| s.sequence.abs_diff(target_seq));
 
         nearest.and_then(|s| s.checkpoint.clone())
-    }
-
-    /// Collect `(from, to, Option<String>)` triples from a changeset's
-    /// `changes()` iterator. Converts borrowed `&str` to owned `String`.
-    fn collect_changes(cs: &ChangeSet) -> Vec<(usize, usize, Option<String>)> {
-        cs.changes()
-            .map(|(from, to, text)| (from, to, text.map(String::from)))
-            .collect()
     }
 
     /// Evict oldest non-checkpoint entries if at or above `max_entries`.
@@ -495,7 +453,6 @@ mod tests {
 
         let result = store.undo_step(nid(1), after).unwrap();
         assert_eq!(result.text, before);
-        assert!(!result.changes.is_empty());
     }
 
     #[test]
@@ -564,10 +521,9 @@ mod tests {
         store.begin_group(text);
         store.end_group(nid(1), text);
 
-        // Undo an identity edit — text should be unchanged, no changes.
+        // Undo an identity edit — text should be unchanged.
         let result = store.undo_step(nid(1), text).unwrap();
         assert_eq!(result.text, text);
-        assert!(result.changes.is_empty());
     }
 
     // ── Multiple independent groups ─────────────────────────────────────
@@ -599,38 +555,6 @@ mod tests {
         // Redo group 2
         let r2_redo = store.redo_step(nid(2), "hello world").unwrap();
         assert_eq!(r2_redo.text, "hello world!");
-    }
-
-    // ── remove_pruned ───────────────────────────────────────────────────
-
-    #[test]
-    fn remove_pruned_removes_entries() {
-        let mut store = UndoStore::new();
-        store.begin_group("a");
-        store.end_group(nid(1), "b");
-        store.begin_group("b");
-        store.end_group(nid(2), "c");
-        store.begin_group("c");
-        store.end_group(nid(3), "d");
-
-        assert_eq!(store.snapshots.len(), 3);
-
-        store.remove_pruned(&[nid(1), nid(3)]);
-        assert_eq!(store.snapshots.len(), 1);
-        assert!(store.snapshots.contains_key(&nid(2)));
-        assert!(!store.snapshots.contains_key(&nid(1)));
-        assert!(!store.snapshots.contains_key(&nid(3)));
-    }
-
-    #[test]
-    fn remove_pruned_with_nonexistent_ids() {
-        let mut store = UndoStore::new();
-        store.begin_group("a");
-        store.end_group(nid(1), "b");
-
-        // Removing nonexistent IDs should not panic or affect existing.
-        store.remove_pruned(&[nid(99), nid(100)]);
-        assert_eq!(store.snapshots.len(), 1);
     }
 
     // ── Checkpoint interval ─────────────────────────────────────────────
@@ -715,44 +639,6 @@ mod tests {
         assert!(store.snapshots.contains_key(&nid(2)));
     }
 
-    // ── Changes vector correctness ──────────────────────────────────────
-
-    #[test]
-    fn undo_changes_are_correct_triples() {
-        let mut store = UndoStore::new();
-        let before = "hello";
-        let after = "hello world";
-
-        store.begin_group(before);
-        store.end_group(nid(1), after);
-
-        let result = store.undo_step(nid(1), after).unwrap();
-
-        // The inverse of "hello" -> "hello world" should delete " world".
-        // " world" was inserted at position 5, so inverse deletes at 5..11.
-        assert!(!result.changes.is_empty());
-
-        // Apply the changes manually: start from "hello world", apply inverse.
-        // The result text should match.
-        assert_eq!(result.text, "hello");
-    }
-
-    #[test]
-    fn redo_changes_are_correct_triples() {
-        let mut store = UndoStore::new();
-        let before = "hello";
-        let after = "hello world";
-
-        store.begin_group(before);
-        store.end_group(nid(1), after);
-
-        let result = store.redo_step(nid(1), before).unwrap();
-
-        // The forward changeset inserts " world" at position 5.
-        assert!(!result.changes.is_empty());
-        assert_eq!(result.text, "hello world");
-    }
-
     // ── Replacement edit ────────────────────────────────────────────────
 
     #[test]
@@ -767,21 +653,10 @@ mod tests {
         // Undo
         let undo = store.undo_step(nid(1), after).unwrap();
         assert_eq!(undo.text, before);
-        // The change should be a replacement at bytes 6..11.
-        assert_eq!(undo.changes.len(), 1);
-        let (from, to, ref text) = undo.changes[0];
-        assert_eq!(from, 6);
-        assert_eq!(to, 11);
-        assert_eq!(text.as_deref(), Some("world"));
 
         // Redo
         let redo = store.redo_step(nid(1), before).unwrap();
         assert_eq!(redo.text, after);
-        assert_eq!(redo.changes.len(), 1);
-        let (from, to, ref text) = redo.changes[0];
-        assert_eq!(from, 6);
-        assert_eq!(to, 11);
-        assert_eq!(text.as_deref(), Some("WORLD"));
     }
 
     // ── Deletion edit ───────────────────────────────────────────────────
@@ -983,15 +858,6 @@ mod tests {
         assert!(store.snapshots.len() <= 10);
     }
 
-    // ── remove_pruned on empty store ────────────────────────────────────
-
-    #[test]
-    fn remove_pruned_on_empty_store() {
-        let mut store = UndoStore::new();
-        store.remove_pruned(&[nid(1), nid(2)]);
-        assert!(store.snapshots.is_empty());
-    }
-
     // ── has_pending starts false ─────────────────────────────────────────
 
     #[test]
@@ -1042,7 +908,6 @@ mod tests {
         // text_before). Fallback uses nearest-by-distance as last resort,
         // which is nid(1)'s checkpoint = "hello world!".
         assert!(!result.text.is_empty());
-        assert!(!result.changes.is_empty());
     }
 
     // ── LengthMismatch with no checkpoints ──────────────────────────────
