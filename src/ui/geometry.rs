@@ -7,6 +7,8 @@
 
 use godot::prelude::{Rect2, Vector2};
 
+use vim_core::primitives::SelectionShape;
+
 use crate::types::{CharLineCol, PixelPos};
 
 /// Left-edge x of column `col` on `line`, in editor-local pixels.
@@ -47,14 +49,39 @@ pub(super) fn corrected_col_x(
     Some(PixelPos::new(x, rect.position.y))
 }
 
-/// One `Rect2` per visible line in the `[start, end)` range, suitable for
+/// One `Rect2` per visible line in the highlight range, suitable for
 /// painting colored highlight overlays.
 ///
-/// Multi-line ranges produce: first line from start col to right edge,
-/// intermediate lines at full width, last line from col 0 to end col.
+/// The `shape` parameter determines geometry:
+///
+/// - **Char** (trapezoid): first line from start col to right edge,
+///   intermediate lines at full width, last line from col 0 to end col.
+/// - **Line**: every line at full editor width (col 0 to right edge).
+///   If `end.col == 0` and `end.line > start.line`, the last line is excluded
+///   (it's the line *after* the yanked region, an artifact of how linewise
+///   ranges work in byte coordinates).
+/// - **Block**: every line gets the same column span (start.col to end.col).
+///
 /// `max_rects` caps output to prevent runaway draw cost on huge ranges.
 /// Off-screen lines (sentinel rects from Godot) are silently skipped.
 pub(super) fn compute_highlight_rects(
+    editor: &godot::classes::CodeEdit,
+    start: &CharLineCol,
+    end: &CharLineCol,
+    max_rects: usize,
+    shape: SelectionShape,
+) -> Vec<Rect2> {
+    match shape {
+        SelectionShape::Char => compute_highlight_rects_char(editor, start, end, max_rects),
+        SelectionShape::Line => compute_highlight_rects_line(editor, start, end, max_rects),
+        SelectionShape::Block => compute_highlight_rects_block(editor, start, end, max_rects),
+        // Non-exhaustive fallback — treat unknown shapes as charwise.
+        _ => compute_highlight_rects_char(editor, start, end, max_rects),
+    }
+}
+
+/// Charwise highlight: trapezoid shape across partial first/last lines.
+fn compute_highlight_rects_char(
     editor: &godot::classes::CodeEdit,
     start: &CharLineCol,
     end: &CharLineCol,
@@ -101,6 +128,90 @@ pub(super) fn compute_highlight_rects(
                 Vector2::new(width as f32, line_height as f32),
             ));
         }
+    }
+
+    rects
+}
+
+/// Linewise highlight: every affected line at full editor width.
+///
+/// If `end.col == 0` and `end.line > start.line`, the last line is excluded
+/// because the byte range's exclusive end falls on the *start* of the next
+/// line — that line is not part of the yanked content.
+fn compute_highlight_rects_line(
+    editor: &godot::classes::CodeEdit,
+    start: &CharLineCol,
+    end: &CharLineCol,
+    max_rects: usize,
+) -> Vec<Rect2> {
+    let mut rects = Vec::new();
+    let line_height = editor.get_line_height().max(1);
+    let editor_width = editor.get_size().x;
+    if !editor_width.is_finite() || editor_width < 0.0 {
+        return rects;
+    }
+
+    // Exclude the ghost last line when the exclusive byte-end maps to col 0
+    // on a line beyond the start — that line isn't part of the content.
+    let last_line = if end.col == 0 && end.line > start.line {
+        end.line - 1
+    } else {
+        end.line
+    };
+
+    for line in start.line..=last_line {
+        if rects.len() >= max_rects {
+            break;
+        }
+        let Some(pos) = corrected_col_x(editor, line, 0) else {
+            continue;
+        };
+        let width = (crate::bridge::codec::f32_to_i32_sat(editor_width) - pos.x).max(1);
+        rects.push(Rect2::new(
+            Vector2::new(pos.x as f32, pos.y as f32),
+            Vector2::new(width as f32, line_height as f32),
+        ));
+    }
+
+    rects
+}
+
+/// Block highlight: every line gets the same column span (start.col..end.col).
+fn compute_highlight_rects_block(
+    editor: &godot::classes::CodeEdit,
+    start: &CharLineCol,
+    end: &CharLineCol,
+    max_rects: usize,
+) -> Vec<Rect2> {
+    let mut rects = Vec::new();
+    let line_height = editor.get_line_height().max(1);
+
+    let (top, bot) = if start.line <= end.line {
+        (start.line, end.line)
+    } else {
+        (end.line, start.line)
+    };
+    let (left_col, right_col) = if start.col <= end.col {
+        (start.col, end.col)
+    } else {
+        (end.col, start.col)
+    };
+
+    for line in top..=bot {
+        if rects.len() >= max_rects {
+            break;
+        }
+        let Some(left_pos) = corrected_col_x(editor, line, left_col) else {
+            continue;
+        };
+        let Some(right_pos) = corrected_col_x(editor, line, right_col) else {
+            continue;
+        };
+        let width = (right_pos.x - left_pos.x).max(1);
+        rects.push(Rect2::new(
+            Vector2::new(left_pos.x as f32, left_pos.y as f32),
+            Vector2::new(width as f32, line_height as f32),
+        ));
     }
 
     rects

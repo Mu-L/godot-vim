@@ -16,28 +16,12 @@ use godot::classes::{
 };
 use godot::prelude::*;
 
-use vim_core::primitives::Mode;
+use vim_core::primitives::{CursorShape, CursorStyle, Mode, Operator};
 
 use crate::bridge::code_edit_ext::CodeEditExt;
 use crate::bridge::codec;
 use crate::safety::panic_guard;
 use crate::types::CharLineCol;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CursorShapeMode — which cursor shape to display
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Cursor shape, derived from Vim mode. Each variant maps to a distinct
-/// geometry in [`VimCursor::update_visual_shape`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CursorShapeMode {
-    /// Full-cell block (Normal, Visual, Operator-Pending).
-    Block,
-    /// Thin vertical beam at the left edge of the cell (Insert).
-    Beam,
-    /// Thin horizontal underline at the bottom of the cell (Replace).
-    Underline,
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CursorGeometry — pixel-perfect cursor placement
@@ -497,6 +481,122 @@ impl Default for CursorColorMap {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Operator HSL tint — per-operator cursor color differentiation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the hue rotation in degrees for a given operator, used to
+/// visually differentiate the operator-pending cursor color.
+fn operator_hue_rotation(op: &Operator) -> f32 {
+    match op {
+        Operator::Delete => 0.0,
+        Operator::Change => 120.0,
+        Operator::Yank => 240.0,
+        Operator::Indent | Operator::Outdent | Operator::Reindent => 60.0,
+        Operator::ToggleCase
+        | Operator::Uppercase
+        | Operator::Lowercase
+        | Operator::Rot13
+        | Operator::Rot47 => 180.0,
+        Operator::Format | Operator::FormatKeepCursor | Operator::Filter => 300.0,
+        // Custom, Composed, CallOperatorFunc, and any future variants.
+        _ => 0.0,
+    }
+}
+
+/// Apply a per-operator hue shift to a base color. Converts RGB to HSL,
+/// rotates the hue by the operator's assigned rotation, and converts back.
+/// Alpha is preserved. Short-circuits when the rotation is zero.
+fn apply_operator_hue_shift(base: Color, op: &Operator) -> Color {
+    let rotation = operator_hue_rotation(op);
+    if rotation == 0.0 {
+        return base;
+    }
+
+    let (h, s, l) = rgb_to_hsl(base.r, base.g, base.b);
+    let new_h = (h + rotation) % 360.0;
+    let (r, g, b) = hsl_to_rgb(new_h, s, l);
+    Color::from_rgba(r, g, b, base.a)
+}
+
+/// Standard RGB to HSL conversion.
+/// R, G, B in [0, 1]. Returns H in [0, 360), S and L in [0, 1].
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+
+    if (max - min).abs() < f32::EPSILON {
+        // Achromatic (gray/black/white).
+        return (0.0, 0.0, l);
+    }
+
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+
+    let h = if (max - r).abs() < f32::EPSILON {
+        let mut h = (g - b) / d;
+        if g < b {
+            h += 6.0;
+        }
+        h
+    } else if (max - g).abs() < f32::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+
+    (h * 60.0, s, l)
+}
+
+/// Standard HSL to RGB conversion.
+/// H in [0, 360), S and L in [0, 1]. Returns R, G, B in [0, 1].
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s.abs() < f32::EPSILON {
+        // Achromatic.
+        return (l, l, l);
+    }
+
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let h_norm = h / 360.0;
+
+    let r = hue_to_rgb(p, q, h_norm + 1.0 / 3.0);
+    let g = hue_to_rgb(p, q, h_norm);
+    let b = hue_to_rgb(p, q, h_norm - 1.0 / 3.0);
+
+    (r, g, b)
+}
+
+/// Helper for `hsl_to_rgb`: converts a single hue sector to an RGB channel.
+fn hue_to_rgb(p: f32, q: f32, t: f32) -> f32 {
+    let mut t = t;
+    if t < 0.0 {
+        t += 1.0;
+    }
+    if t > 1.0 {
+        t -= 1.0;
+    }
+    if t < 1.0 / 6.0 {
+        return p + (q - p) * 6.0 * t;
+    }
+    if t < 1.0 / 2.0 {
+        return q;
+    }
+    if t < 2.0 / 3.0 {
+        return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+    }
+    p
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CursorAnimation — lerp and blink state
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -590,7 +690,8 @@ pub struct VimCursor {
     /// Alpha ceiling from the current mode's color. The blink cycle
     /// oscillates between 0 and this value.
     base_alpha: f32,
-    shape_mode: CursorShapeMode,
+    cursor_shape: CursorShape,
+    blink_enabled: bool,
 
     /// Reused across mode changes to avoid StyleBoxFlat allocation churn.
     cached_style: Option<Gd<StyleBoxFlat>>,
@@ -613,7 +714,8 @@ impl IControl for VimCursor {
             font_height: 20.0,
             char_width: 10.0,
             base_alpha: 0.5,
-            shape_mode: CursorShapeMode::Block,
+            cursor_shape: CursorShape::Block,
+            blink_enabled: false,
             cached_style: None,
             color_map: CursorColorMap::default(),
             beam_width: BEAM_CURSOR_WIDTH,
@@ -692,14 +794,15 @@ impl IControl for VimCursor {
                         self.base_mut().set_position(target);
                     }
 
-                    // Square-wave blink: sin(t) >= 0 -> visible, < 0 -> hidden.
-                    self.animation.blink_time += delta * self.animation.blink_speed;
-                    let blink_factor = if self.animation.blink_time.sin() >= 0.0 {
-                        1.0
-                    } else {
-                        0.0
-                    };
-                    self.update_alpha(self.base_alpha * blink_factor);
+                    if self.blink_enabled {
+                        self.animation.blink_time += delta * self.animation.blink_speed;
+                        let blink_factor = if self.animation.blink_time.sin() >= 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        self.update_alpha(self.base_alpha * blink_factor);
+                    }
                 }
 
                 // Manual clip: the screen_texture shader bypasses Godot's
@@ -759,21 +862,16 @@ impl VimCursor {
         }
     }
 
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.shape_mode = if mode.is_insert() {
-            CursorShapeMode::Beam
-        } else if mode.is_replace() {
-            CursorShapeMode::Underline
-        } else {
-            CursorShapeMode::Block
-        };
+    pub fn set_style(&mut self, style: CursorStyle, mode: Mode) {
+        self.cursor_shape = style.shape;
+        self.blink_enabled = style.blink;
         self.animation.blink_time = 0.0;
         self.update_alpha(1.0);
         self.update_visual_style(mode);
         self.update_visual_shape();
     }
 
-    /// Takes effect on the next `set_mode` call.
+    /// Takes effect on the next `set_style` call.
     pub fn set_color_map(&mut self, map: CursorColorMap) {
         self.color_map = map;
     }
@@ -825,11 +923,19 @@ impl VimCursor {
             Mode::Normal => self.color_map.normal,
             Mode::Insert => self.color_map.insert,
             Mode::Visual(_) => self.color_map.visual,
+            Mode::Select(_) => self.color_map.visual,
             Mode::Replace | Mode::VirtualReplace => self.color_map.replace,
-            Mode::OperatorPending(_) => self.color_map.operator,
+            Mode::OperatorPending(ref op) => {
+                apply_operator_hue_shift(self.color_map.operator, op)
+            }
             Mode::CommandLine => self.color_map.command,
-            // Mode is #[non_exhaustive] in vim-core.
-            _ => self.color_map.normal,
+            _ => {
+                log::warn!(
+                    "VimCursor: unrecognized Mode variant {:?}, falling back to normal color",
+                    mode
+                );
+                self.color_map.normal
+            }
         };
 
         if let Some(ref mut style) = self.cached_style {
@@ -855,19 +961,125 @@ impl VimCursor {
             return;
         };
 
-        match self.shape_mode {
-            CursorShapeMode::Beam => {
+        match self.cursor_shape {
+            CursorShape::VerticalBar => {
                 visual.set_size(Vector2::new(self.beam_width, self.font_height));
                 visual.set_position(Vector2::new(0.0, 0.0));
             }
-            CursorShapeMode::Underline => {
+            CursorShape::HorizontalBar => {
                 visual.set_size(Vector2::new(self.char_width, self.underline_height));
                 visual.set_position(Vector2::new(0.0, self.font_height - self.underline_height));
             }
-            CursorShapeMode::Block => {
+            CursorShape::HalfBlock => {
+                let half = self.font_height / 2.0;
+                visual.set_size(Vector2::new(self.char_width, half));
+                visual.set_position(Vector2::new(0.0, half));
+            }
+            CursorShape::Block => {
+                visual.set_size(Vector2::new(self.char_width, self.font_height));
+                visual.set_position(Vector2::new(0.0, 0.0));
+            }
+            _ => {
+                log::warn!(
+                    "VimCursor: unrecognized CursorShape {:?}, falling back to Block",
+                    self.cursor_shape
+                );
                 visual.set_size(Vector2::new(self.char_width, self.font_height));
                 visual.set_position(Vector2::new(0.0, 0.0));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.02
+    }
+
+    #[test]
+    fn delete_has_zero_rotation() {
+        let base = Color::from_rgba(0.8, 0.2, 0.3, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Delete);
+        assert_eq!(result.r, base.r);
+        assert_eq!(result.g, base.g);
+        assert_eq!(result.b, base.b);
+        assert_eq!(result.a, base.a);
+    }
+
+    #[test]
+    fn alpha_preserved() {
+        let base = Color::from_rgba(1.0, 0.0, 0.0, 0.7);
+        let result = apply_operator_hue_shift(base, &Operator::Yank);
+        assert!(approx_eq(result.a, 0.7), "alpha was {}, expected 0.7", result.a);
+    }
+
+    #[test]
+    fn change_rotates_120_degrees() {
+        // Pure red + 120 degrees = pure green.
+        let base = Color::from_rgba(1.0, 0.0, 0.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Change);
+        assert!(approx_eq(result.r, 0.0), "r was {}, expected 0.0", result.r);
+        assert!(approx_eq(result.g, 1.0), "g was {}, expected 1.0", result.g);
+        assert!(approx_eq(result.b, 0.0), "b was {}, expected 0.0", result.b);
+    }
+
+    #[test]
+    fn yank_rotates_240_degrees() {
+        // Pure red + 240 degrees = pure blue.
+        let base = Color::from_rgba(1.0, 0.0, 0.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Yank);
+        assert!(approx_eq(result.r, 0.0), "r was {}, expected 0.0", result.r);
+        assert!(approx_eq(result.g, 0.0), "g was {}, expected 0.0", result.g);
+        assert!(approx_eq(result.b, 1.0), "b was {}, expected 1.0", result.b);
+    }
+
+    #[test]
+    fn gray_unchanged_by_rotation() {
+        let base = Color::from_rgba(0.5, 0.5, 0.5, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Change);
+        assert!(approx_eq(result.r, 0.5), "r was {}, expected 0.5", result.r);
+        assert!(approx_eq(result.g, 0.5), "g was {}, expected 0.5", result.g);
+        assert!(approx_eq(result.b, 0.5), "b was {}, expected 0.5", result.b);
+    }
+
+    #[test]
+    fn black_unchanged_by_rotation() {
+        let base = Color::from_rgba(0.0, 0.0, 0.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Yank);
+        assert!(approx_eq(result.r, 0.0), "r was {}, expected 0.0", result.r);
+        assert!(approx_eq(result.g, 0.0), "g was {}, expected 0.0", result.g);
+        assert!(approx_eq(result.b, 0.0), "b was {}, expected 0.0", result.b);
+    }
+
+    #[test]
+    fn white_unchanged_by_rotation() {
+        let base = Color::from_rgba(1.0, 1.0, 1.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::ToggleCase);
+        assert!(approx_eq(result.r, 1.0), "r was {}, expected 1.0", result.r);
+        assert!(approx_eq(result.g, 1.0), "g was {}, expected 1.0", result.g);
+        assert!(approx_eq(result.b, 1.0), "b was {}, expected 1.0", result.b);
+    }
+
+    #[test]
+    fn indent_rotates_60_degrees() {
+        // Pure red + 60 degrees = yellow (1, 1, 0).
+        let base = Color::from_rgba(1.0, 0.0, 0.0, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Indent);
+        assert!(approx_eq(result.r, 1.0), "r was {}, expected 1.0", result.r);
+        assert!(approx_eq(result.g, 1.0), "g was {}, expected 1.0", result.g);
+        assert!(approx_eq(result.b, 0.0), "b was {}, expected 0.0", result.b);
+    }
+
+    #[test]
+    fn unknown_operator_no_rotation() {
+        let base = Color::from_rgba(0.4, 0.6, 0.8, 1.0);
+        let result = apply_operator_hue_shift(base, &Operator::Custom(42));
+        assert_eq!(result.r, base.r);
+        assert_eq!(result.g, base.g);
+        assert_eq!(result.b, base.b);
+        assert_eq!(result.a, base.a);
     }
 }

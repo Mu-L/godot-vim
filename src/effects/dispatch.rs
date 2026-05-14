@@ -8,6 +8,8 @@ use std::borrow::Cow;
 
 use godot::prelude::*;
 use vim_core::effects::Effect;
+#[cfg(test)]
+use vim_core::effects::EffectKind;
 
 use super::{
     auto_brace,
@@ -57,6 +59,16 @@ pub(crate) struct DispatchContext<'a> {
     pub(crate) cursor_count: usize,
 }
 
+/// Read-only environment for pass-2 effect dispatch. Separates immutable
+/// context from mutable targets to align with Rust's borrow model.
+#[allow(dead_code)]
+pub(crate) struct DispatchEnv<'a> {
+    pub(crate) doc: &'a DocumentView<'a>,
+    pub(crate) scrolloff: i32,
+    pub(crate) highlight_yank_duration_ms: u32,
+    pub(crate) editor_id: InstanceId,
+}
+
 /// State machine tracking SetSelection → SetCursor effect pairing.
 ///
 /// The engine guarantees each `SetSelection` is followed by a `SetCursor`
@@ -92,6 +104,168 @@ impl SelectionPairing {
         matches!(self, Self::AwaitingCursor { .. })
     }
 }
+
+/// Every [`EffectKind`] variant that has an explicit match arm in the dispatch
+/// system. The coverage test in `coverage_tests` verifies this matches
+/// [`EffectKind::ALL`] exactly — when vim-core adds a new variant, `cargo test`
+/// fails immediately naming the missing variant.
+#[cfg(test)]
+const HANDLED_EFFECTS: &[EffectKind] = &[
+    // Pass 1: text mutations + undo
+    EffectKind::Insert,
+    EffectKind::Delete,
+    EffectKind::Replace,
+    EffectKind::BeginUndoGroup,
+    EffectKind::EndUndoGroup,
+    EffectKind::Undo,
+    EffectKind::UndoLine,
+    EffectKind::Redo,
+    // Pass 2 main loop: cursor/selection lifecycle
+    EffectKind::SetCursor,
+    EffectKind::SetSelection,
+    EffectKind::ClearSelection,
+    EffectKind::SaveSelections,
+    EffectKind::RestoreSelections,
+    // Pass 2: mode
+    EffectKind::SetMode,
+    EffectKind::CommandLineEdit,
+    EffectKind::BeginInsert,
+    EffectKind::SetBlockInsert,
+    // Pass 2: cursor style
+    EffectKind::SetCursorStyle,
+    // Pass 2: search
+    EffectKind::SetSearchPattern,
+    EffectKind::ClearHighlights,
+    EffectKind::HighlightMatches,
+    EffectKind::SubstitutePreview,
+    EffectKind::ClearSubstitutePreview,
+    EffectKind::SearchMatchInfo,
+    // Pass 2: scroll
+    EffectKind::ScrollTo,
+    EffectKind::CenterCursor,
+    EffectKind::CursorToTop,
+    EffectKind::CursorToBottom,
+    EffectKind::ScrollLeft,
+    EffectKind::ScrollRight,
+    // Pass 2: fold
+    EffectKind::FoldLine,
+    EffectKind::UnfoldLine,
+    EffectKind::ToggleFold,
+    EffectKind::ToggleFoldRecursive,
+    EffectKind::FoldAll,
+    EffectKind::UnfoldAll,
+    EffectKind::FoldLineRecursive,
+    EffectKind::UnfoldLineRecursive,
+    EffectKind::DeleteFold,
+    EffectKind::DeleteFoldRecursive,
+    EffectKind::SetFoldEnable,
+    EffectKind::EliminateAllFolds,
+    EffectKind::ToggleFoldEnable,
+    // Pass 2: window (actionable)
+    EffectKind::WindowMoveLeft,
+    EffectKind::WindowMoveRight,
+    EffectKind::WindowMoveUp,
+    EffectKind::WindowMoveDown,
+    EffectKind::WindowNext,
+    EffectKind::WindowPrev,
+    EffectKind::WindowClose,
+    // Pass 2: window (no-op in Godot)
+    EffectKind::WindowSplit,
+    EffectKind::WindowVSplit,
+    EffectKind::WindowOnly,
+    EffectKind::WindowEqualSize,
+    EffectKind::WindowNew,
+    EffectKind::WindowRotateDown,
+    EffectKind::WindowRotateUp,
+    EffectKind::WindowIncreaseHeight,
+    EffectKind::WindowDecreaseHeight,
+    EffectKind::WindowIncreaseWidth,
+    EffectKind::WindowDecreaseWidth,
+    // Pass 2: messages
+    EffectKind::ShowInfo,
+    EffectKind::ShowError,
+    EffectKind::ShowWarning,
+    EffectKind::ClearMessage,
+    // Pass 2: registers
+    EffectKind::SetRegister,
+    EffectKind::CopyToClipboard,
+    // Pass 2: compound actions
+    EffectKind::NormCommand,
+    EffectKind::OperatorFilter,
+    // Pass 2: engine-internal (enriched logging)
+    EffectKind::SetMark,
+    EffectKind::Event,
+    // Pass 2: engine-internal (state updated by effect_processor)
+    EffectKind::PushJumpList,
+    EffectKind::JumpOlder,
+    EffectKind::JumpNewer,
+    EffectKind::StartRecording,
+    EffectKind::StopRecording,
+    EffectKind::OperatorToMark,
+    EffectKind::OperatorReindent,
+    EffectKind::SaveLastVisual,
+    EffectKind::SetLastFind,
+    EffectKind::ChangelistOlder,
+    EffectKind::ChangelistNewer,
+    EffectKind::SetStickyColumn,
+    EffectKind::SetSubstitutePattern,
+    EffectKind::SetHighlightRange,
+    EffectKind::ClearHighlightRange,
+    EffectKind::ClearNamedRegister,
+    EffectKind::ClearMark,
+    EffectKind::JumpToBuffer,
+    EffectKind::SetDiagnostics,
+    EffectKind::SyncFoldRanges,
+    EffectKind::SetLastSubstitute,
+    EffectKind::SetLastSubstituteFlags,
+    // Pass 2: macro replay
+    EffectKind::PlayMacro,
+    // Pass 2: LSP navigation
+    EffectKind::GotoDefinition,
+    EffectKind::ShowDocumentation,
+    // Pass 2: host action
+    EffectKind::HostAction,
+    // Pass 2: virtual text
+    EffectKind::SetVirtualText,
+    EffectKind::ClearVirtualText,
+    // Pass 2: undo tree visualization
+    EffectKind::UndoTreeSnapshot,
+    // Pass 2: unsupported commands
+    EffectKind::OpenCommandWindow,
+    EffectKind::CallOperatorFunc,
+    // Pass 2: no-op
+    EffectKind::Noop,
+    // Pass 2: mode transition
+    EffectKind::ModeTransition,
+    // Pass 2: substitute confirm
+    EffectKind::SubstituteConfirmShow,
+    EffectKind::SubstituteConfirmEnd,
+    EffectKind::SetSubstituteConfirmState,
+    EffectKind::ClearSubstituteConfirmState,
+    // Pass 2: syntax selection
+    EffectKind::SyntaxSelectionPush,
+    EffectKind::SyntaxSelectionPop,
+    // Pass 2: multi-selection / block selection
+    EffectKind::SelectNextMatch,
+    EffectKind::SelectPreviousMatch,
+    EffectKind::SetBlockSelections,
+    EffectKind::HighlightRows,
+    // Pass 2: scroll half-count
+    EffectKind::SetScrollHalfCount,
+    // Pass 2: explicit no-ops (user-facing, intentionally unhandled)
+    EffectKind::Bell,
+    EffectKind::ShowMatch,
+    EffectKind::CursorShapeHint,
+    EffectKind::RequestTimer,
+    EffectKind::CrossBufferEdit,
+    // Pass 2: explicit no-ops (engine-internal, consumed by effect processor)
+    EffectKind::SetExtState,
+    EffectKind::ClearExtState,
+    EffectKind::SetVariable,
+    EffectKind::DeleteVariable,
+    EffectKind::SyntaxHistoryClear,
+    EffectKind::SetSyntaxSelections,
+];
 
 /// Translate a list of vim-core `Effect`s into Godot CodeEdit API calls.
 ///
@@ -295,6 +469,12 @@ pub(crate) fn dispatch(
     // (no pass-1 mutations) or incrementally updated through splices.
     let mut compound_actions = Vec::new();
     let doc = DocumentView::new(&text, &line_index);
+    let env = DispatchEnv {
+        doc: &doc,
+        scrolloff,
+        highlight_yank_duration_ms,
+        editor_id,
+    };
 
     let mut pairing = SelectionPairing::Idle;
     let mut cursor_effect_index: usize = 0;
@@ -443,12 +623,9 @@ pub(crate) fn dispatch(
                     other,
                     editor,
                     state,
-                    &doc,
+                    &env,
                     &mut compound_actions,
-                    scrolloff,
-                    highlight_yank_duration_ms,
                     clipboard,
-                    editor_id,
                 );
             }
         }
@@ -483,22 +660,18 @@ pub(crate) fn dispatch(
 /// Route a single pass-2 effect to its domain handler. Compound actions
 /// (`:norm`, window nav) are collected for the controller to handle after
 /// dispatch completes.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_pass2_effect(
     effect: Effect,
     editor: &mut (impl FoldCapable + IdeCapable + NavigationCapable),
     state: &mut ShellState,
-    doc: &DocumentView,
+    env: &DispatchEnv<'_>,
     compound_actions: &mut Vec<CompoundAction>,
-    scrolloff: i32,
-    _highlight_yank_duration_ms: u32,
     clipboard: &mut dyn crate::bridge::clipboard::ClipboardPort,
-    _editor_id: InstanceId,
 ) {
     match effect {
         // ── Cursor ──────────────────────────────────────────────────────
         Effect::SetCursor { .. } => {
-            dispatch_cursor_effect(effect, editor, doc, scrolloff);
+            dispatch_cursor_effect(effect, editor, env.doc, env.scrolloff);
         }
         // ── Mode ────────────────────────────────────────────────────────
         Effect::SetMode { .. }
@@ -508,6 +681,11 @@ pub(crate) fn dispatch_pass2_effect(
             dispatch_mode_effect(effect, editor);
         }
 
+        // ── Cursor style ─────────────────────────────────────────────────
+        Effect::SetCursorStyle { style } => {
+            state.set_cursor_style(style);
+        }
+
         // ── Search ──────────────────────────────────────────────────────
         Effect::SetSearchPattern { .. }
         | Effect::ClearHighlights
@@ -515,7 +693,7 @@ pub(crate) fn dispatch_pass2_effect(
         | Effect::SubstitutePreview { .. }
         | Effect::ClearSubstitutePreview
         | Effect::SearchMatchInfo { .. } => {
-            dispatch_search_effect(effect, state, doc);
+            dispatch_search_effect(effect, state, env.doc);
         }
 
         // ── Scroll ──────────────────────────────────────────────────────
@@ -525,7 +703,7 @@ pub(crate) fn dispatch_pass2_effect(
         | Effect::CursorToBottom
         | Effect::ScrollLeft { .. }
         | Effect::ScrollRight { .. } => {
-            dispatch_scroll_effect(effect, editor, doc);
+            dispatch_scroll_effect(effect, editor, env.doc);
         }
         // ── Fold ────────────────────────────────────────────────────────
         Effect::FoldLine { .. }
@@ -598,7 +776,7 @@ pub(crate) fn dispatch_pass2_effect(
         }
 
         // ── Message ─────────────────────────────────────────────────────
-        Effect::ShowInfo { .. } | Effect::ShowError { .. } | Effect::ClearMessage => {
+        Effect::ShowInfo { .. } | Effect::ShowError { .. } | Effect::ShowWarning { .. } | Effect::ClearMessage => {
             dispatch_message_effect(effect, state);
         }
 
@@ -640,6 +818,27 @@ pub(crate) fn dispatch_pass2_effect(
         }
 
         // ── Engine-internal: state updated by effect_processor, no shell work ──
+        // ── Highlight ranges (yank flash) ──────────────────────────────────
+        Effect::SetHighlightRange { ref owner, ref range, shape, .. } => {
+            if owner.as_str() == vim_core::effects::HIGHLIGHT_OWNER_YANK
+                && env.highlight_yank_duration_ms > 0
+            {
+                let start = env.doc.line_index.byte_to_line_col(env.doc.text, range.start().get());
+                let end = env.doc.line_index.byte_to_line_col(env.doc.text, range.end().get());
+                state.set_highlight_yank(crate::types::HighlightYank::new(
+                    start,
+                    end,
+                    env.highlight_yank_duration_ms,
+                    shape,
+                ));
+            } else {
+                log::trace!("[highlight] SetHighlightRange owner={} (no-op)", owner);
+            }
+        }
+        Effect::ClearHighlightRange { ref owner, .. } => {
+            log::trace!("[highlight] ClearHighlightRange owner={}", owner);
+        }
+
         e @ (Effect::PushJumpList { .. }
         | Effect::JumpOlder { .. }
         | Effect::JumpNewer { .. }
@@ -652,10 +851,7 @@ pub(crate) fn dispatch_pass2_effect(
         | Effect::ChangelistOlder { .. }
         | Effect::ChangelistNewer { .. }
         | Effect::SetStickyColumn { .. }
-        | Effect::SetCursorStyle { .. }
         | Effect::SetSubstitutePattern { .. }
-        | Effect::SetHighlightRange { .. }
-        | Effect::ClearHighlightRange { .. }
         | Effect::ClearNamedRegister { .. }
         | Effect::ClearMark { .. }
         | Effect::JumpToBuffer { .. }
@@ -707,10 +903,6 @@ pub(crate) fn dispatch_pass2_effect(
             let report = crate::state::undo_tree::format_undo_tree_snapshot(&snapshot);
             log::info!("UndoTreeSnapshot:\n{}", report);
         }
-        // Note: HighlightYank was removed from vim-core (replaced by
-        // HighlightRows for a different purpose). Yank highlighting is now
-        // handled via the host event pipeline. HighlightRows is matched
-        // in the multi-selection block below.
         Effect::OpenCommandWindow { .. } => {
             log::warn!("q: / q/ command window not supported in CodeEdit");
             state
@@ -791,10 +983,39 @@ pub(crate) fn dispatch_pass2_effect(
             log::trace!("[internal] SetScrollHalfCount");
         }
 
+        // ── Explicit no-ops: user-facing effects intentionally unhandled ──
+        Effect::Bell => {
+            // No audible/visual bell in Godot editor
+        }
+        Effect::ShowMatch { .. } => {
+            // CodeEdit has native bracket matching; showmatch not needed
+        }
+        Effect::CursorShapeHint { .. } => {
+            // Mode-based pull model handles cursor shape
+        }
+        Effect::RequestTimer { .. } => {
+            // Timer infrastructure not yet needed
+        }
+        Effect::CrossBufferEdit { .. } => {
+            // Single-buffer editor, no cross-buffer support
+        }
+
+        // ── Explicit no-ops: engine-internal, consumed by effect processor ──
+        Effect::SetExtState { .. } => {}
+        Effect::ClearExtState { .. } => {}
+        Effect::SetVariable { .. } => {}
+        Effect::DeleteVariable { .. } => {}
+        Effect::SyntaxHistoryClear => {}
+        Effect::SetSyntaxSelections { .. } => {}
+
         // ── Forward compatibility for #[non_exhaustive] ─────────────────
-        // New effects from future vim-core versions are expected and benign.
+        // This arm only fires for Effect variants from a newer vim-core
+        // that godot-vim was not compiled against.
         effect => {
-            log::debug!("dispatch: unknown effect from newer vim-core: {:?}", effect);
+            log::warn!(
+                "dispatch: unrecognized effect from newer vim-core: {:?}",
+                effect.kind()
+            );
         }
     }
 }
@@ -958,7 +1179,10 @@ fn dispatch_fold_effect(effect: Effect, editor: &mut impl FoldCapable) {
 fn dispatch_message_effect(effect: Effect, state: &mut ShellState) {
     match effect {
         Effect::ShowInfo { info } => {
-            messages::handle_show_message(state.globals_mut(), &format!("{:?}", info));
+            messages::handle_show_message(state.globals_mut(), &format!("{}", info));
+        }
+        Effect::ShowWarning { text } => {
+            messages::handle_show_message(state.globals_mut(), &text);
         }
         Effect::ShowError { error, .. } => {
             messages::handle_show_error(state.globals_mut(), &error);
@@ -1057,5 +1281,47 @@ mod selection_pairing_tests {
             .on_consume_cursor() // ClearSelection: -> Idle
             .on_consume_cursor(); // SetCursor: -> Idle (should NOT suppress)
         assert_eq!(state, SelectionPairing::Idle);
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::HANDLED_EFFECTS;
+    use vim_core::effects::EffectKind;
+
+    #[test]
+    fn effect_dispatch_covers_all_known_variants() {
+        use std::collections::HashSet;
+
+        let handled: HashSet<EffectKind> = HANDLED_EFFECTS.iter().copied().collect();
+        let all: HashSet<EffectKind> = EffectKind::ALL.iter().copied().collect();
+
+        let missing: Vec<_> = all.difference(&handled).collect();
+        let stale: Vec<_> = handled.difference(&all).collect();
+
+        assert!(
+            missing.is_empty(),
+            "Effect variants not in HANDLED_EFFECTS (add explicit match arm + registry entry): {:?}",
+            missing
+        );
+        assert!(
+            stale.is_empty(),
+            "Stale entries in HANDLED_EFFECTS (variant removed from vim-core): {:?}",
+            stale
+        );
+    }
+
+    #[test]
+    fn handled_effects_has_no_duplicates() {
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+        for kind in HANDLED_EFFECTS {
+            assert!(
+                seen.insert(kind),
+                "Duplicate entry in HANDLED_EFFECTS: {:?}",
+                kind
+            );
+        }
     }
 }

@@ -568,16 +568,19 @@ fn apply_step_effect_to_host(
             {
                 let state = host.state_mut();
                 let mut port = crate::bridge::port_impl::CodeEditPort(editor);
+                let env = crate::effects::dispatch::DispatchEnv {
+                    doc: &doc,
+                    scrolloff,
+                    highlight_yank_duration_ms: highlight_yank_ms,
+                    editor_id,
+                };
                 crate::effects::dispatch::dispatch_pass2_effect(
                     other,
                     &mut port,
                     state,
-                    &doc,
+                    &env,
                     &mut compound_actions,
-                    scrolloff,
-                    highlight_yank_ms,
                     &mut crate::bridge::clipboard::GodotClipboard,
-                    editor_id,
                 );
             }
         }

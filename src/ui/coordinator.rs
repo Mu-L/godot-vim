@@ -13,7 +13,7 @@ use godot::classes::{CodeEdit, Control, Node};
 use godot::obj::NewAlloc;
 use godot::prelude::*;
 
-use vim_core::primitives::{CommandLinePrompt, Direction, Mode};
+use vim_core::primitives::{CommandLinePrompt, CursorStyle, Direction, Mode};
 
 use super::block_visual::BlockVisualOverlay;
 use super::cursor_shape::{compute_cursor_geometry, VimCursor};
@@ -324,7 +324,7 @@ impl UiCoordinator {
             let mut vim_cursor = cursor.bind_mut();
             // Always push mode even without geometry, so the shape doesn't
             // get stuck (e.g. beam lingering after insert-repeat exit).
-            vim_cursor.set_mode(snap.mode);
+            vim_cursor.set_style(snap.cursor_style, snap.mode);
             // visual_head: in visual mode, Godot's caret is at the exclusive
             // selection end, but Vim's cursor should render at the head.
             if let Some(geom) = compute_cursor_geometry(editor, snap.visual_head) {
@@ -411,7 +411,7 @@ impl UiCoordinator {
                 if let Some(ref mut overlay) = self.highlight_yank {
                     overlay
                         .bind_mut()
-                        .show_yank(yank.start, yank.end, yank.duration_ms, editor);
+                        .show_yank(yank.start, yank.end, yank.duration_ms, yank.shape, editor);
                 }
             }
         }
@@ -484,7 +484,7 @@ impl UiCoordinator {
                 command: snapshot.cursor.command,
             });
             // Force repaint now so color is correct before the next keystroke.
-            vim_cursor.set_mode(current_mode);
+            vim_cursor.set_style(CursorStyle::for_mode(current_mode), current_mode);
 
             // Blink speed: derive from Godot's native caret_blink settings.
             let blink_speed = if editor.is_caret_blink_enabled() {

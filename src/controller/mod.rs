@@ -37,6 +37,7 @@ use vim_core::primitives::Direction;
 
 use crate::bridge::godot_host::{GodotHost, PendingUiAction};
 use crate::host::SecurityPolicy;
+use crate::multi_cursor::keybindings::{self, MultiCursorAction};
 use crate::settings::{FileAccessScope, ShellExecution};
 use crate::state::ShellState;
 
@@ -98,6 +99,7 @@ pub(crate) enum ControllerPhase {
 pub(crate) struct ControllerContext {
     pub(crate) transient: TransientShellState,
     pub(crate) passthrough_keys: HashSet<KeyEvent>,
+    pub(crate) multi_cursor_bindings: Vec<(KeyEvent, MultiCursorAction)>,
     pub(crate) security_policy: SecurityPolicy,
     pub(crate) perf: perf::PerfTracker,
     /// 0 = disabled.
@@ -137,6 +139,7 @@ impl VimController {
             ctx: ControllerContext {
                 transient: TransientShellState::new(),
                 passthrough_keys: HashSet::new(),
+                multi_cursor_bindings: keybindings::default_bindings(),
                 security_policy: SecurityPolicy {
                     shell_execution: ShellExecution::Disabled,
                     file_access_scope: FileAccessScope::ProjectOnly,
@@ -319,6 +322,7 @@ impl VimController {
         let state = self.host_state_mut();
         let message = state.globals().message_status().clone();
         let hlsearch_enabled = state.globals().hlsearch_enabled();
+        let cursor_style = state.cursor_style();
         let visual_head = state
             .buffer_ref(editor_id)
             .and_then(|b| b.visual().map(|v| v.head_pos));
@@ -362,6 +366,7 @@ impl VimController {
 
         crate::types::UiSnapshot {
             mode,
+            cursor_style,
             message,
             cmdline: crate::types::CommandLineState {
                 prompt: cmdline_prompt,
@@ -727,7 +732,7 @@ impl VimController {
         for effect in effects {
             match effect {
                 vim_core::effects::Effect::ShowInfo { info } => {
-                    let msg = format!("{:?}", info);
+                    let msg = format!("{}", info);
                     if has_session {
                         crate::effects::messages::handle_show_message(
                             self.host_state_mut().globals_mut(),
@@ -1297,6 +1302,7 @@ mod tests {
             let ControllerContext {
                 transient: _,                  // transient: .reset()
                 passthrough_keys: _,           // config
+                multi_cursor_bindings: _,      // config
                 security_policy: _,            // config
                 perf: _,                       // persistent
                 highlight_yank_duration_ms: _, // config

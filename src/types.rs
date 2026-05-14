@@ -6,7 +6,7 @@
 //! (bool, tuple, Option pair) with a named, mis-use-resistant alternative.
 
 use compact_str::CompactString;
-use vim_core::primitives::{CommandLinePrompt, Direction, Mode};
+use vim_core::primitives::{CommandLinePrompt, CursorStyle, Direction, Mode};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ForceOverride
@@ -158,16 +158,22 @@ pub(crate) struct HighlightYank {
     pub(crate) start: CharLineCol,
     pub(crate) end: CharLineCol,
     pub(crate) duration_ms: u32,
+    pub(crate) shape: vim_core::primitives::SelectionShape,
 }
 
 impl HighlightYank {
     #[must_use]
-    #[allow(dead_code)] // Constructor for yank highlight — currently unused after vim-core removed HighlightYank effect
-    pub(crate) const fn new(start: CharLineCol, end: CharLineCol, duration_ms: u32) -> Self {
+    pub(crate) const fn new(
+        start: CharLineCol,
+        end: CharLineCol,
+        duration_ms: u32,
+        shape: vim_core::primitives::SelectionShape,
+    ) -> Self {
         Self {
             start,
             end,
             duration_ms,
+            shape,
         }
     }
 }
@@ -334,6 +340,7 @@ impl VimdebugSnapshot {
 #[derive(Debug)]
 pub(crate) struct UiSnapshot {
     pub(crate) mode: Mode,
+    pub(crate) cursor_style: CursorStyle,
     pub(crate) message: StatusMessage,
     pub(crate) cmdline: CommandLineState,
     /// Register character being recorded (e.g. 'q'), or `None`.

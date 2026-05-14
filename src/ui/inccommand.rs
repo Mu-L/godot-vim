@@ -135,7 +135,7 @@ impl InccommandOverlay {
         for m in self.last_positions.iter().take(MAX_HIGHLIGHTS) {
             let remaining = MAX_HIGHLIGHTS - self.highlights.len();
             let rects =
-                super::geometry::compute_highlight_rects(editor, &m.start, &m.end, remaining);
+                super::geometry::compute_highlight_rects(editor, &m.start, &m.end, remaining, vim_core::primitives::SelectionShape::Char);
             self.highlights
                 .extend(rects.into_iter().map(|rect| MatchHighlight { rect }));
             if self.highlights.len() >= MAX_HIGHLIGHTS {
