@@ -58,7 +58,18 @@ impl GodotVimCore {
             return;
         };
 
-        let attached_id = self.attached_editor.as_ref().map(|e| e.instance_id());
+        // Phase 1: decide, holding only an immutable borrow of self.attached_editor.
+        let (attached_id, stale) = match self.attached_editor.as_ref() {
+            Some(e) if e.is_instance_valid() => (Some(e.instance_id()), false),
+            Some(_) => (None, true), // editor freed externally (e.g. a foreign addon closed its view)
+            None => (None, false),
+        };
+        // Phase 2: borrow released — now safe to take &mut self.
+        if stale {
+            // Deref-free self-heal: drop the stale handle. detach() is self-completing (Task 3).
+            self.detach();
+            self.last_editor_id = None;
+        }
         let context = classify_focus(&viewport, attached_id);
 
         // Consume Ctrl+hjkl for cross-panel navigation, with mode awareness:
