@@ -157,7 +157,9 @@ impl INode for GodotVimCore {
             "exit_tree:dialog",
             || {
                 if let Some(mut dialog) = self.mapping_dialog.take() {
-                    dialog.queue_free();
+                    if dialog.is_instance_valid() {
+                        dialog.queue_free();
+                    }
                 }
             },
             (),
@@ -167,6 +169,7 @@ impl INode for GodotVimCore {
         // controller so enter_tree can reinitialize cleanly. Orphaned signals
         // from a panicking teardown step fire into handlers that check
         // self.controller.is_none() and return early.
+        self.wired = false;
         self.controller = None;
         self.settings = None;
         self.last_editor_id = None;
@@ -179,6 +182,9 @@ impl INode for GodotVimCore {
 impl GodotVimCore {
     #[func]
     fn on_script_changed(&mut self, _script: Variant) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -227,6 +233,9 @@ impl GodotVimCore {
 
     #[func]
     fn on_focus_changed(&mut self, focused_node: Gd<Control>) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -244,6 +253,9 @@ impl GodotVimCore {
 
     #[func]
     fn on_window_visibility_changed(&mut self, visible: bool) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -267,6 +279,9 @@ impl GodotVimCore {
 
     #[func]
     fn on_child_entered_tree(&mut self, node: Gd<Node>) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -317,6 +332,9 @@ impl GodotVimCore {
 
     #[func]
     fn on_wrapper_tree_exited(&mut self) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -334,6 +352,9 @@ impl GodotVimCore {
     /// we don't hold a dangling handle until the next focus event.
     #[func]
     fn on_attached_editor_tree_exited(&mut self) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -354,6 +375,9 @@ impl GodotVimCore {
 
     #[func]
     fn evict_stale_wrappers(&mut self) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -415,6 +439,9 @@ impl GodotVimCore {
 
     #[func]
     fn on_floating_window_focused(&mut self) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -493,6 +520,9 @@ impl GodotVimCore {
     /// signal handlers to avoid borrowing conflicts with `&mut self`.
     #[func]
     fn perform_attach(&mut self, node: Variant) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -539,6 +569,9 @@ impl GodotVimCore {
     /// or switched to a non-CodeEdit editor view such as the 2D/3D viewport).
     #[func]
     fn perform_detach(&mut self) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -735,6 +768,9 @@ impl GodotVimCore {
 
     #[func]
     fn on_fs_prompt_submitted(&mut self, text: GString) {
+        if !self.enabled {
+            return;
+        }
         panic_guard(
             "on_fs_prompt_submitted",
             || self.fs_explorer.on_prompt_submitted(text.to_string()),
@@ -744,6 +780,9 @@ impl GodotVimCore {
 
     #[func]
     fn on_fs_prompt_gui_input(&mut self, event: Gd<InputEvent>) {
+        if !self.enabled {
+            return;
+        }
         panic_guard(
             "on_fs_prompt_gui_input",
             || {
@@ -763,6 +802,9 @@ impl GodotVimCore {
 
     #[func]
     fn on_config_saved(&mut self) {
+        if !self.enabled {
+            return;
+        }
         if self.controller.is_none() {
             return;
         }
@@ -784,7 +826,7 @@ impl GodotVimCore {
     /// to defaults for missing or wrong-type values.
     #[func]
     fn on_settings_changed(&mut self) {
-        // Intentionally NOT gated by `!self.enabled` — must observe re-enable.
+        // Intentionally ungated — must observe re-enable to become active again.
         if self.controller.is_none() {
             return;
         }

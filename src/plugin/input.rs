@@ -30,6 +30,9 @@ impl GodotVimCore {
     ///
     /// Editor-context keys fall through to the per-editor `gui_input` pipeline.
     pub(super) fn handle_input_impl(&mut self, event: Gd<InputEvent>) {
+        if !self.enabled {
+            return;
+        }
         let Ok(key_event) = event.try_cast::<InputEventKey>() else {
             return;
         };
