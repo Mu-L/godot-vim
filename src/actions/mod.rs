@@ -18,9 +18,15 @@
 //! - [`action`] — named verbs: stable dotted ids, the registry that interns
 //!   them, and the context an action runs in.
 //! - [`specs`] — the shipped keyset as named verbs, in one const array.
+//! - [`surface`] — where a keystroke is, as literal data: the sampled
+//!   `FocusChain` and the declared surface forest above it.
+//! - [`providers`] — one file per subsystem, declaring its surfaces in the
+//!   probe order that *is* the classification.
 
 pub(crate) mod action;
 pub(crate) mod caps;
 pub(crate) mod keys;
 pub(crate) mod outcome;
+pub(crate) mod providers;
 pub(crate) mod specs;
+pub(crate) mod surface;

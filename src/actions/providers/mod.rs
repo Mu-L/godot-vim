@@ -1,0 +1,1134 @@
+//! The shipped surface providers, in probe order.
+//!
+//! A provider is one file that declares one subsystem's surfaces (and, from
+//! P5, its actions and default bindings). Adding a panel to the plugin is one
+//! new file here plus one line in [`PROVIDERS`]; `src/plugin/input.rs`,
+//! `src/actions/caps.rs` and every other provider stay untouched.
+//!
+//! # Why a `const` array and not `inventory`/`linkme`
+//!
+//! Link-time registration was rejected outright. Life-before-main constructors
+//! in a `cdylib` that the Godot editor `dlopen`s, under `lto = "fat"` with
+//! linker section GC and GDExtension hot-reload, is a cross-platform footgun
+//! for zero semantic gain. A `const` array is compile-time checked, reviewable
+//! in a diff, and deterministically ordered — which the ordering audits below
+//! and the introspector's golden snapshots both depend on.
+//!
+//! # The order is the classification, and it is fixed in both directions
+//!
+//! Probes run in array order and the **first `Some` wins**. That is what
+//! preserves the mutual exclusivity today's `classify_focus` gets structurally
+//! from being one `if`/`else` chain, and which N independent predicates would
+//! otherwise silently lose. Four constraints pin the order:
+//!
+//! 1. **`unknown` probes unconditionally**, so it must be the last *probing*
+//!    entry. Anything behind it is unreachable.
+//! 2. **`foreign` must therefore precede `unknown`.** Behind it, a Project
+//!    Settings `LineEdit` would resolve to `unknown` → `panel` instead of to a
+//!    `Barrier`, and Ctrl+hjkl would be consumed mid-word — a direct violation
+//!    of `FocusContext::Foreign => false` (`src/plugin/input.rs:114`).
+//! 3. **`foreign` must not be first.** Its predicate claims "a `LineEdit` with
+//!    no sibling nav control", and whether the plugin's own FileSystem prompt
+//!    has one is an editor-runtime fact nobody can settle from source. Ahead
+//!    of `prompt` it could take the prompt, and `<Esc>` would meet a `Barrier`
+//!    instead of dismissing it. `prompt`, `searchbox`, `filesystem`, `dock`
+//!    and `editor` all get first refusal for the same reason.
+//! 4. **A descendant precedes its ancestor** — `filesystem` before `dock` —
+//!    or the child never matches and its bindings are silently dead.
+//!
+//! `panel` is last and never probes: it is reached only by following parent
+//! links, so no total probe can shadow it. Every clause above is a test in
+//! this module's `ordering` block, each written so that reordering the array
+//! fails the suite rather than a user's keyboard.
+#![allow(
+    dead_code,
+    reason = "the provider array is consumed by `ActionPlane::rebuild` in P5 and by the dispatcher in P6"
+)]
+
+pub(crate) mod dock;
+pub(crate) mod editor;
+pub(crate) mod filesystem;
+pub(crate) mod foreign;
+pub(crate) mod panel;
+pub(crate) mod prompt;
+pub(crate) mod searchbox;
+pub(crate) mod unknown;
+
+use super::surface::{Forest, SurfaceSpec};
+
+/// One subsystem's contribution to the plane.
+///
+/// Grows in P5 with the actions it registers and its `panelmap` defaults; the
+/// `tag` is already here because every rule a provider registers is owned by
+/// it, and ownership is what makes "a third party cannot silently displace a
+/// builtin binding" checkable rather than aspirational.
+pub(crate) struct Provider {
+    pub(crate) tag: &'static str,
+    /// Surfaces this provider declares, in probe order.
+    pub(crate) surfaces: &'static [&'static SurfaceSpec],
+}
+
+/// Probe order. See the module docs — every position here is load-bearing.
+pub(crate) const PROVIDERS: &[Provider] = &[
+    // editor.nav / editor.insert — the attached CodeEdit, split by mode. First
+    // refusal on our own editor, before anything can claim it as a text input.
+    editor::PROVIDER,
+    // prompt — our own LineEdit, by instance identity. Ahead of `searchbox`
+    // and `foreign`, both of which could otherwise claim it.
+    prompt::PROVIDER,
+    // searchbox — a dock filter LineEdit, discriminated by a sibling nav
+    // control.
+    searchbox::PROVIDER,
+    // dock.filesystem — before `dock`, its declared parent, or the FileSystem
+    // keyset is unreachable.
+    filesystem::PROVIDER,
+    // dock — the generic Tree/ItemList/RichTextLabel surface.
+    dock::PROVIDER,
+    // foreign — a Barrier, but only AFTER every surface that needs first
+    // refusal and BEFORE `unknown`, or it is unreachable.
+    foreign::PROVIDER,
+    // unknown — the TOTAL probe. Must be the last probing entry.
+    unknown::PROVIDER,
+    // panel — the forest root. Never probes; reached only through parent links.
+    panel::PROVIDER,
+];
+
+/// Every declared surface, flattened in probe order.
+pub(crate) fn surfaces() -> Vec<&'static SurfaceSpec> {
+    PROVIDERS
+        .iter()
+        .flat_map(|p| p.surfaces.iter().copied())
+        .collect()
+}
+
+/// The shipped forest, ready to classify.
+pub(crate) fn forest() -> Forest {
+    Forest::new(&surfaces())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::caps::Caps;
+    use crate::actions::surface::fixtures::*;
+    use crate::actions::surface::{Anchor, ChainNode, FocusChain, Seal, SurfaceId};
+    use vim_core::primitives::{Mode, Operator, VisualType};
+
+    // ── The golden table ─────────────────────────────────────────────
+    //
+    // Forty-two literal focus chains, each one a shape the editor really
+    // produces, and each asserting the whole resolved path: surface ids,
+    // capabilities, seal and anchor. This table is the plane's specification.
+    // It is also the input to the partition audit and to every ordering test
+    // below, which is why a new surface must arrive with a fixture — a surface
+    // with no fixture is a surface nobody proved disjoint.
+
+    const NAV: &[SurfaceId] = &["editor.nav", "panel"];
+    const INSERT: &[SurfaceId] = &["editor.insert"];
+    const FOREIGN: &[SurfaceId] = &["foreign"];
+    const PROMPT: &[SurfaceId] = &["prompt", "panel"];
+    const SEARCH: &[SurfaceId] = &["searchbox", "panel"];
+    const FS: &[SurfaceId] = &["dock.filesystem", "dock", "panel"];
+    const DOCK: &[SurfaceId] = &["dock", "panel"];
+    const UNKNOWN: &[SurfaceId] = &["unknown", "panel"];
+
+    const ATTACHED: i64 = 7;
+
+    struct Case {
+        what: &'static str,
+        chain: FocusChain,
+        ids: &'static [SurfaceId],
+        caps: Caps,
+        seal: Seal,
+        anchor: Anchor,
+    }
+
+    fn editor_chain(mode: Option<Mode>) -> FocusChain {
+        FocusChain {
+            nodes: vec![
+                code_edit(ATTACHED),
+                plain("CodeTextEditor", 101),
+                plain("ScriptTextEditor", 102),
+            ],
+            attached_editor: Some(id(ATTACHED)),
+            editor_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    /// A chain inside Godot's FileSystem dock.
+    fn fs_chain(focus: ChainNode) -> FocusChain {
+        FocusChain {
+            nodes: vec![
+                focus,
+                plain("SplitContainer", 110),
+                plain("VBoxContainer", 111),
+                plain("FileSystemDock", 112),
+            ],
+            in_filesystem_dock: true,
+            ..Default::default()
+        }
+    }
+
+    /// A chain inside some other dock.
+    fn dock_chain(focus: ChainNode, dock_class: &'static str) -> FocusChain {
+        FocusChain {
+            nodes: vec![focus, plain("VBoxContainer", 120), plain(dock_class, 121)],
+            ..Default::default()
+        }
+    }
+
+    #[allow(clippy::too_many_lines, reason = "a golden table is a table")]
+    fn golden() -> Vec<Case> {
+        let tree_caps = Caps::VNAV | Caps::HIERARCHY | Caps::ACTIVATE;
+        let list_caps = Caps::VNAV | Caps::ACTIVATE;
+        vec![
+            // ── The attached CodeEdit, one case per mode ──────────────
+            Case {
+                what: "attached CodeEdit, no controller yet",
+                chain: editor_chain(None),
+                ids: NAV,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit in Normal",
+                chain: editor_chain(Some(Mode::Normal)),
+                ids: NAV,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit in Visual char",
+                chain: editor_chain(Some(Mode::Visual(VisualType::Char))),
+                ids: NAV,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit in Visual line",
+                chain: editor_chain(Some(Mode::Visual(VisualType::Line))),
+                ids: NAV,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit in Visual block",
+                chain: editor_chain(Some(Mode::Visual(VisualType::Block))),
+                ids: NAV,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit in Operator-pending",
+                chain: editor_chain(Some(Mode::OperatorPending(Operator::Delete))),
+                ids: NAV,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit in Insert — Ctrl+H is backspace",
+                chain: editor_chain(Some(Mode::Insert)),
+                ids: INSERT,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit in Replace",
+                chain: editor_chain(Some(Mode::Replace)),
+                ids: INSERT,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit in Virtual replace",
+                chain: editor_chain(Some(Mode::VirtualReplace)),
+                ids: INSERT,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit on the command line",
+                chain: editor_chain(Some(Mode::CommandLine)),
+                ids: INSERT,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "attached CodeEdit in Select — insert-like on purpose",
+                chain: editor_chain(Some(Mode::Select(VisualType::Char))),
+                ids: INSERT,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            // ── Text inputs that are not ours ─────────────────────────
+            Case {
+                what: "a CodeEdit in an addon panel while ours is attached",
+                chain: FocusChain {
+                    nodes: vec![code_edit(9), plain("AddonPanel", 130)],
+                    attached_editor: Some(id(ATTACHED)),
+                    editor_mode: Some(Mode::Normal),
+                    ..Default::default()
+                },
+                ids: FOREIGN,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a CodeEdit with nothing attached at all",
+                chain: FocusChain {
+                    nodes: vec![code_edit(9)],
+                    ..Default::default()
+                },
+                ids: FOREIGN,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a plain TextEdit",
+                chain: FocusChain {
+                    nodes: vec![text_edit(131), plain("EditorPropertyText", 132)],
+                    ..Default::default()
+                },
+                ids: FOREIGN,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a Project Settings LineEdit — the Ctrl+hjkl hard stop",
+                chain: FocusChain {
+                    nodes: vec![line_edit(133), plain("EditorSettingsDialog", 134)],
+                    ..Default::default()
+                },
+                ids: FOREIGN,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a TextEdit inside the FileSystem dock is still foreign",
+                chain: fs_chain(text_edit(135)),
+                ids: FOREIGN,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a TextEdit beside a nav control is foreign, not a filter box",
+                chain: FocusChain {
+                    nodes: vec![text_edit(136)],
+                    sibling_nav_control: Some(id(137)),
+                    ..Default::default()
+                },
+                ids: FOREIGN,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Barrier,
+                anchor: Anchor::Node(0),
+            },
+            // ── The plugin's own prompt ───────────────────────────────
+            Case {
+                what: "FS create prompt, with a sibling nav control (today's shape)",
+                chain: FocusChain {
+                    sibling_nav_control: Some(id(141)),
+                    is_plugin_prompt: true,
+                    ..fs_chain(line_edit(140))
+                },
+                ids: PROMPT,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Sealed,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "FS create prompt, with no sibling nav control",
+                chain: FocusChain {
+                    is_plugin_prompt: true,
+                    ..fs_chain(line_edit(140))
+                },
+                ids: PROMPT,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Sealed,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "FS prompt in a floated dock, outside the dock ancestry",
+                chain: FocusChain {
+                    nodes: vec![line_edit(140), plain("Window", 142)],
+                    is_plugin_prompt: true,
+                    ..Default::default()
+                },
+                ids: PROMPT,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Sealed,
+                anchor: Anchor::Node(0),
+            },
+            // ── Dock filter boxes ─────────────────────────────────────
+            Case {
+                what: "the FileSystem dock's own filter box",
+                chain: FocusChain {
+                    sibling_nav_control: Some(id(151)),
+                    ..fs_chain(line_edit(150))
+                },
+                ids: SEARCH,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Sealed,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the Scene tree dock's filter box",
+                chain: FocusChain {
+                    sibling_nav_control: Some(id(153)),
+                    ..dock_chain(line_edit(152), "SceneTreeDock")
+                },
+                ids: SEARCH,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Sealed,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the Inspector's property filter box",
+                chain: FocusChain {
+                    sibling_nav_control: Some(id(155)),
+                    ..dock_chain(line_edit(154), "InspectorDock")
+                },
+                ids: SEARCH,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Sealed,
+                anchor: Anchor::Node(0),
+            },
+            // ── The FileSystem dock ───────────────────────────────────
+            Case {
+                what: "the FileSystem tree",
+                chain: fs_chain(tree("FileSystemTree", 160)),
+                ids: FS,
+                caps: tree_caps | Caps::FILEOPS,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the FileSystem file list",
+                chain: fs_chain(item_list("FileSystemList", 161)),
+                ids: FS,
+                caps: list_caps | Caps::FILEOPS,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a RichTextLabel inside the FileSystem dock",
+                chain: fs_chain(rich_text("RichTextLabel", 162)),
+                ids: FS,
+                caps: Caps::VNAV | Caps::FILEOPS,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            // ── Every other dock ──────────────────────────────────────
+            Case {
+                what: "the Scene tree",
+                chain: dock_chain(tree("SceneTreeEditor", 170), "SceneTreeDock"),
+                ids: DOCK,
+                caps: tree_caps,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the Import dock's tree",
+                chain: dock_chain(tree("Tree", 171), "ImportDock"),
+                ids: DOCK,
+                caps: tree_caps,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the open-scripts list",
+                chain: dock_chain(item_list("ItemList", 172), "ScriptEditor"),
+                ids: DOCK,
+                caps: list_caps,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the built-in docs panel (EditorHelp class_desc)",
+                chain: dock_chain(rich_text("RichTextLabel", 173), "EditorHelp"),
+                ids: DOCK,
+                caps: Caps::VNAV,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the Output log (EditorLog log)",
+                chain: dock_chain(rich_text("RichTextLabel", 174), "EditorLog"),
+                ids: DOCK,
+                caps: Caps::VNAV,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what:
+                    "a FileSystemTree that is NOT inside the dock — the fact decides, not the class",
+                chain: dock_chain(tree("FileSystemTree", 175), "SomeAddonDock"),
+                ids: DOCK,
+                caps: tree_caps,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a dock tree focused while an editor is attached elsewhere",
+                chain: FocusChain {
+                    attached_editor: Some(id(ATTACHED)),
+                    editor_mode: Some(Mode::Normal),
+                    ..dock_chain(tree("SceneTreeEditor", 176), "SceneTreeDock")
+                },
+                ids: DOCK,
+                caps: tree_caps,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a favorites ItemList in the FileSystem dock, dock ancestry only",
+                chain: dock_chain(item_list("FileSystemList", 177), "SomeOtherDock"),
+                ids: DOCK,
+                caps: list_caps,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            // ── Everything else ───────────────────────────────────────
+            Case {
+                what: "a focused GraphEdit — no `graph` surface, and none needed",
+                chain: dock_chain(plain("GraphEdit", 180), "VisualShaderEditor"),
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a focused Button inside a dock",
+                chain: dock_chain(plain("Button", 181), "SceneTreeDock"),
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a focused Button inside the FileSystem dock — must NOT get FILEOPS",
+                chain: fs_chain(plain("Button", 182)),
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a focused OptionButton in the FileSystem dock toolbar",
+                chain: fs_chain(plain("OptionButton", 183)),
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a focused HSlider in an inspector row",
+                chain: dock_chain(plain("HSlider", 184), "InspectorDock"),
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "a focused TabBar",
+                chain: dock_chain(plain("TabBar", 185), "TabContainer"),
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "no focus owner at all",
+                chain: no_focus_owner(),
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Rootless,
+            },
+            Case {
+                what: "no focus owner while an editor is attached and in Insert",
+                chain: FocusChain {
+                    attached_editor: Some(id(ATTACHED)),
+                    editor_mode: Some(Mode::Insert),
+                    ..Default::default()
+                },
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Rootless,
+            },
+            Case {
+                what: "no focus owner with a stale in-dock flag",
+                chain: FocusChain {
+                    in_filesystem_dock: true,
+                    ..Default::default()
+                },
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Rootless,
+            },
+        ]
+    }
+
+    #[test]
+    fn the_golden_table_covers_every_declared_surface() {
+        // A surface with no fixture is a surface nobody proved disjoint, so
+        // this is what makes the partition audit meaningful rather than
+        // decorative. `panel` is excluded: it never classifies directly.
+        let forest = forest();
+        let table = golden();
+        assert!(table.len() >= 40, "table has only {} rows", table.len());
+        for id in forest.ids().filter(|id| *id != "panel") {
+            assert!(
+                table.iter().any(|c| c.ids.first() == Some(&id)),
+                "no golden fixture resolves to '{id}'"
+            );
+        }
+    }
+
+    #[test]
+    fn every_fixture_resolves_to_its_declared_path() {
+        let forest = forest();
+        for case in golden() {
+            let path = forest
+                .classify(&case.chain)
+                .unwrap_or_else(|| panic!("'{}' classified to nothing", case.what));
+            assert_eq!(path.ids, case.ids, "ids for '{}'", case.what);
+            assert_eq!(path.caps, case.caps, "caps for '{}'", case.what);
+            assert_eq!(path.seal, case.seal, "seal for '{}'", case.what);
+            assert_eq!(path.anchor, case.anchor, "anchor for '{}'", case.what);
+        }
+    }
+
+    #[test]
+    fn every_path_ends_at_a_root_and_only_barriers_skip_panel() {
+        // The focus-trap invariant in its structural form: a non-Barrier path
+        // must reach `panel`, or the user is stuck somewhere Ctrl+hjkl cannot
+        // leave. The two Barriers are the deliberate exceptions, and both are
+        // escapable — Esc leaves insert mode, clicking leaves a foreign input.
+        let forest = forest();
+        for case in golden() {
+            let path = forest.classify(&case.chain).expect("total");
+            let ends_at_panel = path.ids.last() == Some(&"panel");
+            match path.seal {
+                Seal::Barrier => assert!(
+                    !ends_at_panel,
+                    "'{}' is a Barrier yet still reaches panel",
+                    case.what
+                ),
+                Seal::Open | Seal::Sealed => assert!(
+                    ends_at_panel,
+                    "'{}' cannot reach panel — Ctrl+hjkl would be lost",
+                    case.what
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_editor_surface_yields_to_the_engine() {
+        let forest = forest();
+        for case in golden() {
+            let path = forest.classify(&case.chain).expect("total");
+            assert_eq!(
+                path.anchor_yields_to_engine,
+                case.ids.first() == Some(&"editor.nav"),
+                "'{}' — arbitration is a property of the surface",
+                case.what
+            );
+        }
+    }
+
+    #[test]
+    fn fileops_is_granted_by_exactly_one_surface() {
+        // The loose end `Caps::of_control` structurally cannot close: no
+        // widget class implies FILEOPS, so if the surface did not grant it,
+        // nothing would, and every `godotvim.fs.*` binding would be dead.
+        let forest = forest();
+        for case in golden() {
+            let path = forest.classify(&case.chain).expect("total");
+            assert_eq!(
+                path.caps.contains(Caps::FILEOPS),
+                path.ids.contains(&"dock.filesystem"),
+                "'{}' — FILEOPS must track dock membership exactly",
+                case.what
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_catch_all_ever_anchors_rootless() {
+        // `Anchor::Rootless` means "matched with no focus owner", and
+        // `ActionCtx::target` is `None` for it. Any other surface returning it
+        // would hand a target-less context to an action that assumes one.
+        let forest = forest();
+        for case in golden() {
+            for (id, anchor) in forest.claimants(&case.chain) {
+                if anchor == Anchor::Rootless {
+                    assert_eq!(id, "unknown", "'{}' anchored rootless at '{id}'", case.what);
+                }
+            }
+        }
+    }
+
+    // ── Agreement with the classifier still in production ────────────
+
+    /// `classify_focus`'s five answers (`src/navigation/focus.rs:20-37`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Legacy {
+        Editor,
+        Dock,
+        SearchBox,
+        Foreign,
+        Unknown,
+    }
+
+    /// `classify_focus` (`src/navigation/focus.rs:42-96`) transcribed against
+    /// the sampled chain instead of a live `Gd<Control>` — same order, same
+    /// predicates, same fallthrough.
+    ///
+    /// This is the testable half of the shadow comparison the design asks for.
+    /// The other half — running both over a scripted corpus inside a live
+    /// editor — needs a sampled chain on the dispatch path, which P4
+    /// deliberately does not add: `handle_input_impl` still calls
+    /// `classify_focus` and reads nothing from this plane.
+    fn classify_focus_equivalent(chain: &FocusChain) -> Legacy {
+        let Some(node) = chain.focus() else {
+            return Legacy::Unknown;
+        };
+        if node.is("CodeEdit") {
+            if chain.attached_editor_focused() {
+                return Legacy::Editor;
+            }
+            return Legacy::Foreign;
+        }
+        if node.is("Tree") || node.is("ItemList") || node.is("RichTextLabel") {
+            return Legacy::Dock;
+        }
+        if node.is("LineEdit") {
+            if chain.sibling_nav_control.is_some() {
+                return Legacy::SearchBox;
+            }
+            return Legacy::Foreign;
+        }
+        if node.is("TextEdit") {
+            return Legacy::Foreign;
+        }
+        Legacy::Unknown
+    }
+
+    fn legacy_of(surface: SurfaceId) -> Legacy {
+        match surface {
+            "editor.nav" | "editor.insert" => Legacy::Editor,
+            "dock" | "dock.filesystem" => Legacy::Dock,
+            // The prompt is a `SearchBox` to today's classifier, which is why
+            // `input.rs:187` has to ask `is_prompt_active` and decline.
+            "searchbox" | "prompt" => Legacy::SearchBox,
+            "foreign" => Legacy::Foreign,
+            "unknown" => Legacy::Unknown,
+            other => unreachable!("no legacy answer for surface '{other}'"),
+        }
+    }
+
+    #[test]
+    fn the_new_classifier_agrees_with_classify_focus() {
+        // The divergence count the design requires is zero, with exactly one
+        // structural exception, asserted rather than waived: a plugin prompt
+        // that has no sibling nav control. Today's classifier answers
+        // `Foreign` for it — a Barrier — because it can only see a `LineEdit`
+        // with no sibling. That is the very failure `prompt` exists to make
+        // impossible, so disagreeing there is the point of the surface, not a
+        // transcription slip.
+        let forest = forest();
+        for case in golden() {
+            let path = forest.classify(&case.chain).expect("total");
+            let new = legacy_of(path.ids[0]);
+            let old = classify_focus_equivalent(&case.chain);
+            if new == old {
+                continue;
+            }
+            assert!(
+                case.chain.is_plugin_prompt && new == Legacy::SearchBox && old == Legacy::Foreign,
+                "'{}' diverges: surface plane says {new:?}, classify_focus says {old:?}",
+                case.what
+            );
+        }
+    }
+
+    // ── The partition audit (V5) ─────────────────────────────────────
+
+    /// The overlaps in the shipped forest that are resolved by ARRAY ORDER
+    /// rather than by disjoint predicates, earlier surface first.
+    ///
+    /// Both entries are the same fact: the FileSystem prompt is a `LineEdit`
+    /// this plugin builds and parents into Godot's own dock
+    /// (`filesystem_explorer.rs:158-192`), so the two generic `LineEdit`
+    /// predicates cannot be made to miss it. Whether
+    /// `find_sibling_nav_control` reaches the dock's tree from the prompt is
+    /// an editor-runtime fact — today it does, so `searchbox` would claim it;
+    /// re-parent the prompt one level and `foreign` would. Teaching either
+    /// predicate about `is_plugin_prompt` would put the decision in three
+    /// places that must agree; giving `prompt` first refusal keeps it in one,
+    /// where the `ordering` tests below can falsify it.
+    ///
+    /// A new entry here is a design decision that needs the same paragraph.
+    /// An entry no fixture exercises is stale and fails the suite.
+    const ORDERED_OVERRIDES: &[(SurfaceId, SurfaceId)] =
+        &[("prompt", "searchbox"), ("prompt", "foreign")];
+
+    /// Unrelated (earlier, later) claimant pairs over the whole golden table.
+    fn unrelated_overlaps() -> Vec<(SurfaceId, SurfaceId, &'static str)> {
+        let forest = forest();
+        let mut found = Vec::new();
+        for case in golden() {
+            // `unknown` is excluded by construction: it is the designated
+            // total probe, so it claims every fixture on purpose, and V4 —
+            // asserted separately — is what keeps that harmless.
+            let claimants: Vec<_> = forest
+                .claimants(&case.chain)
+                .into_iter()
+                .map(|(id, _)| id)
+                .filter(|id| *id != "unknown")
+                .collect();
+            for (i, a) in claimants.iter().enumerate() {
+                for b in &claimants[i + 1..] {
+                    if !forest.is_ancestor_or_self(a, b) && !forest.is_ancestor_or_self(b, a) {
+                        found.push((*a, *b, case.what));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn no_two_unrelated_surfaces_claim_the_same_fixture() {
+        // Replacing an exclusive if/else chain with N independent probes
+        // structurally loses mutual exclusivity. This is what buys it back:
+        // two claimants are legal when one is the other's declared ancestor
+        // (dock.filesystem ⊂ dock), because then array order is *derived* from
+        // the forest — or when the pair is a documented ordered override.
+        // Anything else is two providers disagreeing about who owns a control,
+        // settled by array position: nondeterministic to the authors and
+        // invisible to the user.
+        for (a, b, what) in unrelated_overlaps() {
+            assert!(
+                ORDERED_OVERRIDES.contains(&(a, b)),
+                "'{what}' is claimed by unrelated surfaces '{a}' and '{b}', \
+                 and that pair is not a documented ordered override"
+            );
+        }
+    }
+
+    #[test]
+    fn every_ordered_override_is_exercised_by_a_fixture() {
+        // The other half: an override nobody triggers is either a predicate
+        // that has since been made disjoint — in which case delete the entry
+        // and let the audit be strict again — or a fixture that went missing.
+        let overlaps = unrelated_overlaps();
+        for pair in ORDERED_OVERRIDES {
+            assert!(
+                overlaps.iter().any(|(a, b, _)| (*a, *b) == *pair),
+                "ordered override {pair:?} is stale — no golden fixture produces it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_claimant_is_always_the_winner() {
+        // Classification is a *fold* with first-match-wins, not a search for
+        // the most specific claimant. Anything else would make array order
+        // decorative and the ordering audits meaningless.
+        let forest = forest();
+        for case in golden() {
+            let first = forest.claimants(&case.chain).first().copied();
+            let path = forest.classify(&case.chain).expect("total");
+            assert_eq!(first, Some((path.ids[0], path.anchor)), "'{}'", case.what);
+        }
+    }
+
+    // ── Ordering (V4) ────────────────────────────────────────────────
+
+    mod ordering {
+        use super::*;
+
+        /// The shipped surfaces in a caller-chosen probe order.
+        ///
+        /// Every reorder test below builds one of these and asserts the WRONG
+        /// answer it produces. That is the point: it makes each position in
+        /// `PROVIDERS` falsifiable instead of merely commented.
+        fn reordered(ids: &[SurfaceId]) -> crate::actions::surface::Forest {
+            let all = surfaces();
+            assert_eq!(
+                ids.len(),
+                all.len(),
+                "a reorder must keep every surface, or it proves nothing"
+            );
+            let specs: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    *all.iter()
+                        .find(|s| s.id == *id)
+                        .unwrap_or_else(|| panic!("no surface '{id}'"))
+                })
+                .collect();
+            crate::actions::surface::Forest::new(&specs)
+        }
+
+        /// The shipped order, spelled out. Reordering `PROVIDERS` without
+        /// updating this list fails here first, with the diff in the message.
+        const SHIPPED: &[SurfaceId] = &[
+            "editor.nav",
+            "editor.insert",
+            "prompt",
+            "searchbox",
+            "dock.filesystem",
+            "dock",
+            "foreign",
+            "unknown",
+            "panel",
+        ];
+
+        #[test]
+        fn the_array_order_is_the_documented_order() {
+            assert_eq!(
+                PROVIDERS.iter().map(|p| p.tag).collect::<Vec<_>>(),
+                vec![
+                    "godotvim.editor",
+                    "godotvim.prompt",
+                    "godotvim.searchbox",
+                    "godotvim.filesystem",
+                    "godotvim.dock",
+                    "godotvim.foreign",
+                    "godotvim.unknown",
+                    "godotvim.panel",
+                ]
+            );
+            assert_eq!(surfaces().iter().map(|s| s.id).collect::<Vec<_>>(), SHIPPED);
+        }
+
+        #[test]
+        fn the_forest_audit_passes_on_the_shipped_order() {
+            // V1, V3 and the descendant-before-ancestor half of V4.
+            assert_eq!(forest().audit(), Vec::<String>::new());
+        }
+
+        #[test]
+        fn unknown_is_the_only_total_probe() {
+            // "Total" is not decidable from a fn pointer, so it is decided
+            // over the golden table: every other surface misses at least one
+            // fixture, and `unknown` misses none.
+            let forest = forest();
+            let table = golden();
+            for id in forest.ids() {
+                let spec = forest.get(id).expect("declared");
+                let claims = table
+                    .iter()
+                    .filter(|c| (spec.probe)(&c.chain).is_some())
+                    .count();
+                if id == "unknown" {
+                    assert_eq!(claims, table.len(), "unknown must claim everything");
+                } else {
+                    assert!(claims < table.len(), "'{id}' has a total probe too");
+                }
+            }
+        }
+
+        #[test]
+        fn nothing_probes_after_unknown() {
+            // The rule that makes `foreign`'s position mandatory rather than
+            // stylistic: behind a total probe, a surface is unreachable.
+            let order = surfaces();
+            let unknown_at = order
+                .iter()
+                .position(|s| s.id == "unknown")
+                .expect("declared");
+            for spec in &order[unknown_at + 1..] {
+                for case in golden() {
+                    assert_eq!(
+                        (spec.probe)(&case.chain),
+                        None,
+                        "'{}' sits behind `unknown` and would never match '{}'",
+                        spec.id,
+                        case.what
+                    );
+                }
+            }
+        }
+
+        fn project_settings_line_edit() -> FocusChain {
+            FocusChain {
+                nodes: vec![line_edit(200), plain("EditorSettingsDialog", 201)],
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn foreign_after_unknown_would_consume_ctrl_hjkl_in_project_settings() {
+            let chain = project_settings_line_edit();
+
+            let shipped = forest().classify(&chain).expect("total");
+            assert_eq!(shipped.ids, vec!["foreign"]);
+            assert_eq!(shipped.seal, Seal::Barrier, "dispatch stops before lookup");
+
+            // Move `foreign` one place later and the barrier evaporates: the
+            // path becomes unknown → panel, whose Ctrl+hjkl rules are `Void`,
+            // and the key is consumed while the user is typing a setting name.
+            let broken = reordered(&[
+                "editor.nav",
+                "editor.insert",
+                "prompt",
+                "searchbox",
+                "dock.filesystem",
+                "dock",
+                "unknown",
+                "foreign",
+                "panel",
+            ]);
+            let wrong = broken.classify(&chain).expect("total");
+            assert_eq!(wrong.ids, vec!["unknown", "panel"]);
+            assert_eq!(wrong.seal, Seal::Open, "this is the regression");
+        }
+
+        #[test]
+        fn foreign_before_prompt_would_barrier_the_filesystem_prompt() {
+            // `foreign` claims "a LineEdit with no sibling nav control", and
+            // whether the prompt has one cannot be settled from source. With
+            // `foreign` first, the prompt becomes a Barrier: Esc never
+            // dismisses it and the stale prompt keeps stealing focus back.
+            let chain = FocusChain {
+                nodes: vec![line_edit(202), plain("HBoxContainer", 203)],
+                is_plugin_prompt: true,
+                ..Default::default()
+            };
+
+            let shipped = forest().classify(&chain).expect("total");
+            assert_eq!(shipped.ids, vec!["prompt", "panel"]);
+            assert_eq!(shipped.seal, Seal::Sealed);
+
+            let broken = reordered(&[
+                "foreign",
+                "editor.nav",
+                "editor.insert",
+                "prompt",
+                "searchbox",
+                "dock.filesystem",
+                "dock",
+                "unknown",
+                "panel",
+            ]);
+            let wrong = broken.classify(&chain).expect("total");
+            assert_eq!(wrong.ids, vec!["foreign"]);
+            assert_eq!(wrong.seal, Seal::Barrier, "this is the regression");
+        }
+
+        #[test]
+        fn searchbox_before_prompt_would_route_escape_to_the_wrong_verb() {
+            // In today's editor the prompt DOES have a sibling nav control —
+            // its HBox shares a parent with the FileSystemTree — so this is
+            // the reordering that actually bites, not a hypothetical one.
+            let chain = FocusChain {
+                nodes: vec![line_edit(204), plain("HBoxContainer", 205)],
+                sibling_nav_control: Some(id(206)),
+                is_plugin_prompt: true,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                forest().classify(&chain).expect("total").ids,
+                vec!["prompt", "panel"]
+            );
+
+            let broken = reordered(&[
+                "editor.nav",
+                "editor.insert",
+                "searchbox",
+                "prompt",
+                "dock.filesystem",
+                "dock",
+                "foreign",
+                "unknown",
+                "panel",
+            ]);
+            assert_eq!(
+                broken.classify(&chain).expect("total").ids,
+                vec!["searchbox", "panel"],
+                "this is the regression"
+            );
+        }
+
+        #[test]
+        fn dock_before_dock_filesystem_would_kill_the_filesystem_keyset() {
+            let chain = fs_chain(tree("FileSystemTree", 207));
+
+            let shipped = forest().classify(&chain).expect("total");
+            assert!(shipped.caps.contains(Caps::FILEOPS));
+
+            let broken = reordered(&[
+                "editor.nav",
+                "editor.insert",
+                "prompt",
+                "searchbox",
+                "dock",
+                "dock.filesystem",
+                "foreign",
+                "unknown",
+                "panel",
+            ]);
+            let wrong = broken.classify(&chain).expect("total");
+            assert_eq!(wrong.ids, vec!["dock", "panel"]);
+            assert!(
+                !wrong.caps.contains(Caps::FILEOPS),
+                "every godotvim.fs.* binding would be capability-gated out"
+            );
+            // And the audit catches it without needing a fixture at all.
+            assert!(broken.audit().iter().any(|e| e.contains("dock.filesystem")));
+        }
+
+        #[test]
+        fn editor_after_unknown_would_leak_ctrl_hjkl_into_insert_mode() {
+            let chain = editor_chain(Some(Mode::Insert));
+
+            assert_eq!(
+                forest().classify(&chain).expect("total").seal,
+                Seal::Barrier
+            );
+
+            let broken = reordered(&[
+                "prompt",
+                "searchbox",
+                "dock.filesystem",
+                "dock",
+                "foreign",
+                "unknown",
+                "editor.nav",
+                "editor.insert",
+                "panel",
+            ]);
+            let wrong = broken.classify(&chain).expect("total");
+            assert_eq!(wrong.ids, vec!["unknown", "panel"]);
+            assert_eq!(
+                wrong.seal,
+                Seal::Open,
+                "Ctrl+H would stop being backspace mid-word"
+            );
+        }
+    }
+}

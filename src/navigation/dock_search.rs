@@ -60,7 +60,11 @@ pub(super) fn find_sibling_search_box(node: &Gd<Control>) -> Option<Gd<LineEdit>
 /// Find a sibling navigable control (Tree/ItemList/RichTextLabel) within the
 /// same dock boundary. Used to return focus from a search box back to the
 /// dock's main content after ESC/Enter.
-pub(super) fn find_sibling_nav_control(node: &Gd<Control>) -> Option<Gd<Control>> {
+///
+/// `pub(crate)` because it is also the discriminant that separates a dock
+/// filter box from a foreign text input — `classify_focus` calls it inline
+/// today, and `FocusChain::sample` records its answer once per focus change.
+pub(crate) fn find_sibling_nav_control(node: &Gd<Control>) -> Option<Gd<Control>> {
     let mut current = node.clone().upcast::<Node>();
 
     for _ in 0..MAX_CLIMB_DEPTH {
