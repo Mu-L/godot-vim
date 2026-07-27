@@ -84,6 +84,8 @@ pub(crate) static EDITOR_INSERT: SurfaceSpec = SurfaceSpec {
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.editor",
     surfaces: &[&EDITOR_NAV, &EDITOR_INSERT],
+    // Verbs stayed in `specs::SHIPPED` when P2 extracted them; see `Provider`.
+    actions: &[],
     // Deliberately none, and this is the design's sharpest structural claim:
     // `editor.nav` carries ZERO rules of its own, because `<C-h>` lives on
     // `panel`, its declared parent. Duplicating the panel keyset here is what

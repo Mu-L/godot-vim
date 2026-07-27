@@ -33,18 +33,29 @@
 //!    of `prompt` it could take the prompt, and `<Esc>` would meet a `Barrier`
 //!    instead of dismissing it. `prompt`, `searchbox`, `filesystem`, `dock`
 //!    and `editor` all get first refusal for the same reason.
-//! 4. **A descendant precedes its ancestor** — `filesystem` before `dock` —
-//!    or the child never matches and its bindings are silently dead.
+//! 4. **A descendant precedes its ancestor** — `filesystem` and `debugger`
+//!    both before `dock` — or the child never matches and its bindings are
+//!    silently dead.
 //!
-//! `panel` is last and never probes: it is reached only by following parent
-//! links, so no total probe can shadow it. Every clause above is a test in
-//! this module's `ordering` block, each written so that reordering the array
-//! fails the suite rather than a user's keyboard.
+//! Two surfaces never probe at all, and their positions are therefore free.
+//! `panel` is the forest root, reached only by following parent links, so no
+//! total probe can shadow it. `editor.completion` is reached by an explicit
+//! lookup from the `gui_input` transport, because whether the autocomplete
+//! popup is visible is a per-keystroke fact and the sampled `FocusChain` is
+//! cached per focus change. Both are excluded from the golden-fixture coverage
+//! audit for the same reason: a fixture for a surface that cannot be
+//! classified would prove nothing.
+//!
+//! Every clause above is a test in this module's `ordering` block, each
+//! written so that reordering the array fails the suite rather than a user's
+//! keyboard.
 #![allow(
     dead_code,
     reason = "the provider array is consumed by `ActionPlane::rebuild` in P5 and by the dispatcher in P6"
 )]
 
+pub(crate) mod completion;
+pub(crate) mod debugger;
 pub(crate) mod dock;
 pub(crate) mod editor;
 pub(crate) mod filesystem;
@@ -54,6 +65,7 @@ pub(crate) mod prompt;
 pub(crate) mod searchbox;
 pub(crate) mod unknown;
 
+use super::action::ActionSpec;
 use super::surface::{Forest, SurfaceSpec};
 
 /// One subsystem's contribution to the plane.
@@ -65,6 +77,23 @@ pub(crate) struct Provider {
     pub(crate) tag: &'static str,
     /// Surfaces this provider declares, in probe order.
     pub(crate) surfaces: &'static [&'static SurfaceSpec],
+    /// Verbs this provider contributes to the [`ActionRegistry`].
+    ///
+    /// This field is what makes §7.1's "one file plus one manifest line"
+    /// literally true rather than nearly true. Without it a new subsystem's
+    /// `ActionSpec`s would have to be appended to `actions::specs::SHIPPED`,
+    /// which is a second registration point in a file the new provider has no
+    /// business editing — and `builtin_index` would reject its defaults with
+    /// `UnknownAction` until someone did.
+    ///
+    /// Empty for the eight original providers: their verbs were extracted into
+    /// `specs::SHIPPED` in P2, before this field existed, and moving them now
+    /// would be churn with no behavioural change. `specs::registry()` unions
+    /// both sources, and `every_provider_verb_is_registered` below pins that
+    /// the union is what actually reaches the registry.
+    ///
+    /// [`ActionRegistry`]: crate::actions::action::ActionRegistry
+    pub(crate) actions: &'static [&'static ActionSpec],
     /// Default bindings, written in **exactly the text a user types** and
     /// parsed by exactly the same parser (`crate::config::panelmap`).
     ///
@@ -85,6 +114,12 @@ pub(crate) const PROVIDERS: &[Provider] = &[
     // editor.nav / editor.insert — the attached CodeEdit, split by mode. First
     // refusal on our own editor, before anything can claim it as a text input.
     editor::PROVIDER,
+    // editor.completion — the autocomplete popup's keys. Position here is
+    // arbitrary and that is a property, not a hole: its probe is `|_| None`,
+    // so it is unreachable by classification from ANY position. The
+    // `gui_input` transport looks it up by name. It sits beside the other
+    // editor surfaces so a reader finds it where they expect.
+    completion::PROVIDER,
     // prompt — our own LineEdit, by instance identity. Ahead of `searchbox`
     // and `foreign`, both of which could otherwise claim it.
     prompt::PROVIDER,
@@ -94,6 +129,11 @@ pub(crate) const PROVIDERS: &[Provider] = &[
     // dock.filesystem — before `dock`, its declared parent, or the FileSystem
     // keyset is unreachable.
     filesystem::PROVIDER,
+    // dock.debugger — THE ENTIRE REGISTRATION of a new subsystem (§7.2). Same
+    // constraint as its sibling above: before `dock`, its declared parent, or
+    // the child never matches and its four bindings are silently dead. `Forest
+    // ::audit` checks that rather than trusting this comment.
+    debugger::PROVIDER,
     // dock — the generic Tree/ItemList/RichTextLabel surface.
     dock::PROVIDER,
     // foreign — a Barrier, but only AFTER every surface that needs first
@@ -110,6 +150,20 @@ pub(crate) fn surfaces() -> Vec<&'static SurfaceSpec> {
     PROVIDERS
         .iter()
         .flat_map(|p| p.surfaces.iter().copied())
+        .collect()
+}
+
+/// Every verb the providers contribute, flattened in `PROVIDERS` order.
+///
+/// Unioned with `specs::SHIPPED` by `specs::registry()`, which is the single
+/// place the registry is built. A provider that ships a default naming a verb
+/// it did not declare here is rejected at load with `UnknownAction` — under
+/// `Provenance::Builtin` that is a `debug_assert!`, so it fails the suite
+/// rather than shipping a dead key.
+pub(crate) fn actions() -> Vec<&'static ActionSpec> {
+    PROVIDERS
+        .iter()
+        .flat_map(|p| p.actions.iter().copied())
         .collect()
 }
 
@@ -141,6 +195,7 @@ mod tests {
     const PROMPT: &[SurfaceId] = &["prompt", "panel"];
     const SEARCH: &[SurfaceId] = &["searchbox", "panel"];
     const FS: &[SurfaceId] = &["dock.filesystem", "dock", "panel"];
+    const DEBUGGER: &[SurfaceId] = &["dock.debugger", "dock", "panel"];
     const DOCK: &[SurfaceId] = &["dock", "panel"];
     const UNKNOWN: &[SurfaceId] = &["unknown", "panel"];
 
@@ -186,6 +241,23 @@ mod tests {
     fn dock_chain(focus: ChainNode, dock_class: &'static str) -> FocusChain {
         FocusChain {
             nodes: vec![focus, plain("VBoxContainer", 120), plain(dock_class, 121)],
+            ..Default::default()
+        }
+    }
+
+    /// A chain inside the debugger dock, shaped like the real one:
+    /// `EditorDebuggerNode` → `TabContainer` → `ScriptEditorDebugger` → the
+    /// Stack Trace tab's containers → the focused control.
+    fn debugger_chain(focus: ChainNode) -> FocusChain {
+        FocusChain {
+            nodes: vec![
+                focus,
+                plain("VBoxContainer", 190),
+                plain("HSplitContainer", 191),
+                plain("ScriptEditorDebugger", 192),
+                plain("TabContainer", 193),
+                plain("EditorDebuggerNode", 194),
+            ],
             ..Default::default()
         }
     }
@@ -446,6 +518,63 @@ mod tests {
                 seal: Seal::Open,
                 anchor: Anchor::Node(0),
             },
+            // ── The debugger dock ─────────────────────────────────────
+            //
+            // §7.3 makes a fixture per new surface mandatory rather than
+            // courteous: the partition audit runs over this table, so a
+            // surface with no row here is a surface nobody proved disjoint.
+            Case {
+                what: "the debugger's Stack Frames tree",
+                chain: debugger_chain(tree("Tree", 195)),
+                ids: DEBUGGER,
+                caps: tree_caps,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the debugger's Breakpoints tree — same class, same surface",
+                chain: FocusChain {
+                    nodes: vec![
+                        tree("Tree", 196),
+                        plain("HSplitContainer", 197),
+                        plain("ScriptEditorDebugger", 198),
+                        plain("TabContainer", 199),
+                        plain("EditorDebuggerNode", 200),
+                    ],
+                    ..Default::default()
+                },
+                ids: DEBUGGER,
+                caps: tree_caps,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the debugger's thread OptionButton — inside the dock, but not a Tree",
+                chain: debugger_chain(plain("OptionButton", 201)),
+                ids: UNKNOWN,
+                caps: Caps::empty(),
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the debugger's 'Filter Stack Variables' box is a filter box, not a debugger",
+                chain: FocusChain {
+                    sibling_nav_control: Some(id(203)),
+                    ..debugger_chain(line_edit(202))
+                },
+                ids: SEARCH,
+                caps: Caps::TEXTENTRY,
+                seal: Seal::Sealed,
+                anchor: Anchor::Node(0),
+            },
+            Case {
+                what: "the debugger's Errors tree is a debugger tree too",
+                chain: debugger_chain(tree("Tree", 204)),
+                ids: DEBUGGER,
+                caps: tree_caps,
+                seal: Seal::Open,
+                anchor: Anchor::Node(0),
+            },
             // ── Every other dock ──────────────────────────────────────
             Case {
                 what: "the Scene tree",
@@ -600,6 +729,49 @@ mod tests {
     }
 
     #[test]
+    fn every_provider_verb_is_registered_and_namespaced_to_its_owner() {
+        // The other half of the "one file plus one line" claim. A provider
+        // that declares an `ActionSpec` nobody registers ships defaults that
+        // fail to load — a `debug_assert!` under `Provenance::Builtin`, so it
+        // is loud, but the message names the *binding* rather than the missing
+        // registration. This names the registration.
+        let registry = crate::actions::specs::registry();
+        for provider in PROVIDERS {
+            for spec in provider.actions {
+                assert!(
+                    registry.id_of(spec.id).is_some(),
+                    "'{}' is declared by '{}' but never registered",
+                    spec.id,
+                    provider.tag
+                );
+                // A provider may not squat on another's namespace: V2 rejects a
+                // duplicate id outright, and this catches the near miss that
+                // would otherwise read as a builtin verb.
+                assert!(
+                    spec.id.starts_with(provider.tag),
+                    "'{}' escapes its provider's namespace '{}'",
+                    spec.id,
+                    provider.tag
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_providers_declare_the_same_verb() {
+        // V2 in its structural form. `NameRegistry::register` is idempotent, so
+        // a duplicate id would silently ALIAS an existing verb and the second
+        // provider's `run` would never execute — a third-party action that
+        // does nothing, with no diagnostic anywhere.
+        let mut ids: Vec<&str> = actions().iter().map(|s| s.id).collect();
+        ids.extend(crate::actions::specs::SHIPPED.iter().map(|s| s.id));
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "duplicate action id across providers");
+    }
+
+    #[test]
     fn the_golden_table_covers_every_declared_surface() {
         // A surface with no fixture is a surface nobody proved disjoint, so
         // this is what makes the partition audit meaningful rather than
@@ -607,7 +779,17 @@ mod tests {
         let forest = forest();
         let table = golden();
         assert!(table.len() >= 40, "table has only {} rows", table.len());
-        for id in forest.ids().filter(|id| *id != "panel") {
+        // `panel` and `editor.completion` are excluded, and for the same
+        // reason: neither probes. `panel` is reached by following parent
+        // links, `editor.completion` by an explicit lookup from the
+        // `gui_input` transport, so neither can have a fixture and a fixture
+        // for either would prove nothing. Every surface that DOES probe must
+        // still bring one — that is what makes the partition audit below
+        // meaningful rather than decorative.
+        for id in forest
+            .ids()
+            .filter(|id| *id != "panel" && *id != "editor.completion")
+        {
             assert!(
                 table.iter().any(|c| c.ids.first() == Some(&id)),
                 "no golden fixture resolves to '{id}'"
@@ -749,7 +931,10 @@ mod tests {
     fn legacy_of(surface: SurfaceId) -> Legacy {
         match surface {
             "editor.nav" | "editor.insert" => Legacy::Editor,
-            "dock" | "dock.filesystem" => Legacy::Dock,
+            // `dock.debugger` is a Tree like any other to today's classifier,
+            // which is the whole point: the new surface refines where a key
+            // lands without changing what the legacy code would have said.
+            "dock" | "dock.filesystem" | "dock.debugger" => Legacy::Dock,
             // The prompt is a `SearchBox` to today's classifier, which is why
             // `input.rs:187` has to ask `is_prompt_active` and decline.
             "searchbox" | "prompt" => Legacy::SearchBox,
@@ -909,9 +1094,11 @@ mod tests {
         const SHIPPED: &[SurfaceId] = &[
             "editor.nav",
             "editor.insert",
+            "editor.completion",
             "prompt",
             "searchbox",
             "dock.filesystem",
+            "dock.debugger",
             "dock",
             "foreign",
             "unknown",
@@ -924,9 +1111,11 @@ mod tests {
                 PROVIDERS.iter().map(|p| p.tag).collect::<Vec<_>>(),
                 vec![
                     "godotvim.editor",
+                    "godotvim.completion",
                     "godotvim.prompt",
                     "godotvim.searchbox",
                     "godotvim.filesystem",
+                    "godotvim.debugger",
                     "godotvim.dock",
                     "godotvim.foreign",
                     "godotvim.unknown",
@@ -1004,11 +1193,13 @@ mod tests {
             // path becomes unknown → panel, whose Ctrl+hjkl rules are `Void`,
             // and the key is consumed while the user is typing a setting name.
             let broken = reordered(&[
+                "editor.completion",
                 "editor.nav",
                 "editor.insert",
                 "prompt",
                 "searchbox",
                 "dock.filesystem",
+                "dock.debugger",
                 "dock",
                 "unknown",
                 "foreign",
@@ -1036,12 +1227,14 @@ mod tests {
             assert_eq!(shipped.seal, Seal::Sealed);
 
             let broken = reordered(&[
+                "editor.completion",
                 "foreign",
                 "editor.nav",
                 "editor.insert",
                 "prompt",
                 "searchbox",
                 "dock.filesystem",
+                "dock.debugger",
                 "dock",
                 "unknown",
                 "panel",
@@ -1069,11 +1262,13 @@ mod tests {
             );
 
             let broken = reordered(&[
+                "editor.completion",
                 "editor.nav",
                 "editor.insert",
                 "searchbox",
                 "prompt",
                 "dock.filesystem",
+                "dock.debugger",
                 "dock",
                 "foreign",
                 "unknown",
@@ -1094,10 +1289,12 @@ mod tests {
             assert!(shipped.caps.contains(Caps::FILEOPS));
 
             let broken = reordered(&[
+                "editor.completion",
                 "editor.nav",
                 "editor.insert",
                 "prompt",
                 "searchbox",
+                "dock.debugger",
                 "dock",
                 "dock.filesystem",
                 "foreign",
@@ -1115,6 +1312,38 @@ mod tests {
         }
 
         #[test]
+        fn dock_before_dock_debugger_would_kill_the_debugger_keyset() {
+            // The sibling of the FileSystem case, and the reason the P9 diff
+            // had to insert its line ABOVE `dock::PROVIDER` rather than
+            // appending it. Appended, `dock` would claim the stack tree first,
+            // the walk would never reach `dock.debugger`, and all four of its
+            // bindings would be dead with a green suite.
+            let chain = debugger_chain(tree("Tree", 208));
+
+            let shipped = forest().classify(&chain).expect("total");
+            assert_eq!(shipped.ids, vec!["dock.debugger", "dock", "panel"]);
+
+            let broken = reordered(&[
+                "editor.completion",
+                "editor.nav",
+                "editor.insert",
+                "prompt",
+                "searchbox",
+                "dock.filesystem",
+                "dock",
+                "dock.debugger",
+                "foreign",
+                "unknown",
+                "panel",
+            ]);
+            let wrong = broken.classify(&chain).expect("total");
+            assert_eq!(wrong.ids, vec!["dock", "panel"], "this is the regression");
+            // And the audit catches it with no fixture at all, which is what
+            // makes the rule enforced rather than merely tested.
+            assert!(broken.audit().iter().any(|e| e.contains("dock.debugger")));
+        }
+
+        #[test]
         fn editor_after_unknown_would_leak_ctrl_hjkl_into_insert_mode() {
             let chain = editor_chain(Some(Mode::Insert));
 
@@ -1124,9 +1353,11 @@ mod tests {
             );
 
             let broken = reordered(&[
+                "editor.completion",
                 "prompt",
                 "searchbox",
                 "dock.filesystem",
+                "dock.debugger",
                 "dock",
                 "foreign",
                 "unknown",

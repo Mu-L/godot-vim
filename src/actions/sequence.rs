@@ -362,12 +362,14 @@ mod tests {
 
     const TREE: Caps = Caps::VNAV.union(Caps::HIERARCHY).union(Caps::ACTIVATE);
 
+    /// The whole shipped registry — `specs::SHIPPED` **plus** every
+    /// `Provider::actions` table. Looping `SHIPPED` alone here would leave a
+    /// provider's own verbs unregistered, and `builtin_index` would then
+    /// reject that provider's defaults with `UnknownAction` — a
+    /// `debug_assert!` under `Provenance::Builtin`, so the failure is loud
+    /// but the cause reads as unrelated.
     fn registry() -> ActionRegistry {
-        let mut r = ActionRegistry::new();
-        for spec in specs::SHIPPED {
-            r.register(spec);
-        }
-        r
+        specs::registry()
     }
 
     fn ch(c: char) -> KeyEvent {

@@ -87,6 +87,8 @@ panelmap dock <Esc> godotvim.focus.editor
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.dock",
     surfaces: &[&DOCK],
+    // Verbs stayed in `specs::SHIPPED` when P2 extracted them; see `Provider`.
+    actions: &[],
     defaults: DEFAULTS,
 };
 

@@ -210,6 +210,51 @@ impl std::fmt::Debug for ActionSpec {
     }
 }
 
+/// The autocomplete popup, as questions and commands.
+///
+/// A trait rather than a concrete struct for one reason that decides it: the
+/// only real implementation holds `&mut VimSession<GodotHost>` and
+/// `&mut Gd<CodeEdit>`, and neither can exist under `cargo test` in a
+/// `cdylib`. Behind this seam the `godotvim.completion.*` bodies are pure
+/// decision logic over two booleans and two integers, so the trichotomy they
+/// produce — consume / hand to the control / let the engine have it — is
+/// table-tested headlessly, which is the same trick `FocusChain` plays for the
+/// surface plane.
+///
+/// It is deliberately narrow. Nothing here can reach the document, the mode or
+/// the engine: a completion verb decides *routing*, and the text reconciliation
+/// that `confirm` triggers stays on the transport side where the session lives.
+pub(crate) trait CompletionOps {
+    /// Godot returns -1 from `get_code_completion_selected_index` when no
+    /// popup is up, which is the only "is it visible" answer it offers.
+    fn popup_visible(&self) -> bool;
+    /// `code_complete_enabled` in EditorSettings. False means the user turned
+    /// autocompletion off, and every trigger verb must decline rather than
+    /// force a popup they asked not to see.
+    fn completion_enabled(&self) -> bool;
+    fn option_count(&self) -> i32;
+    fn selected_index(&self) -> i32;
+    /// Ask Godot to (re)build the candidate list. Synchronous: popup state and
+    /// selected index are valid immediately after the call.
+    fn request(&mut self, force: bool);
+    fn select(&mut self, index: i32);
+    /// Accept the selected candidate and reconcile the text delta with the
+    /// engine, so dot-repeat and macro recording capture the completed text.
+    fn confirm(&mut self);
+    fn cancel(&mut self);
+    /// Route this keystroke to the control's own `gui_input` instead: the vim
+    /// engine does not see it, and the event is **not** consumed.
+    ///
+    /// This is the `Some(false)` leg of `try_handle_completion` — "handled by
+    /// us, but deliberately not marked handled" — and it exists because
+    /// Godot's `CodeEdit` moves the popup selection on Up/Down itself. There
+    /// is no way to express it in [`Outcome`], which is why it is a command on
+    /// the port rather than a fourth variant: `Outcome` is shared with the
+    /// `_input` transport, where "not consumed" and "engine skipped" cannot
+    /// both be true.
+    fn hand_to_editor(&mut self);
+}
+
 /// What an action can reach while it runs.
 ///
 /// Ships **chain-less** at this phase: the sampled focus chain arrives with
@@ -231,6 +276,13 @@ pub(crate) struct ActionCtx<'a> {
     /// would make every re-entrancy question a runtime one. `None` on the
     /// host transport, where an action that needs it declines.
     fs: Option<&'a mut crate::navigation::FileSystemExplorer>,
+    /// The autocomplete popup, lent by the `gui_input` transport only.
+    ///
+    /// Same shape and same reasoning as `fs`: borrowed as one capability
+    /// rather than as the whole plugin, and `None` everywhere else — the
+    /// `_input` panel dispatcher and `:action` both leave it unset, and a
+    /// completion verb reached from there declines instead of half-running.
+    completion: Option<&'a mut dyn CompletionOps>,
 }
 
 /// One observable side effect of running an action.
@@ -267,12 +319,19 @@ impl<'a> ActionCtx<'a> {
             params,
             recorder: None,
             fs: None,
+            completion: None,
         }
     }
 
     /// Lend the FileSystem explorer for the duration of one dispatch.
     pub(crate) fn with_fs(mut self, fs: &'a mut crate::navigation::FileSystemExplorer) -> Self {
         self.fs = Some(fs);
+        self
+    }
+
+    /// Lend the autocomplete popup for the duration of one dispatch.
+    pub(crate) fn with_completion(mut self, ops: &'a mut dyn CompletionOps) -> Self {
+        self.completion = Some(ops);
         self
     }
 
@@ -284,6 +343,7 @@ impl<'a> ActionCtx<'a> {
             params: Params::new(),
             recorder: Some(sink),
             fs: None,
+            completion: None,
         }
     }
 
@@ -294,6 +354,15 @@ impl<'a> ActionCtx<'a> {
     /// The FileSystem explorer, when this transport lends one.
     pub(crate) fn fs(&mut self) -> Option<&mut crate::navigation::FileSystemExplorer> {
         self.fs.as_deref_mut()
+    }
+
+    /// The autocomplete popup, when this transport lends one.
+    ///
+    /// The `+ 'a` is load-bearing rather than decorative: `&mut` is invariant,
+    /// so eliding it would ask the compiler to shorten a trait object's
+    /// lifetime behind a mutable reference, which it correctly refuses.
+    pub(crate) fn completion(&mut self) -> Option<&mut (dyn CompletionOps + 'a)> {
+        self.completion.as_deref_mut()
     }
 
     /// Emit a Godot signal, or record the intent under test.

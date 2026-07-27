@@ -59,6 +59,8 @@ panelmap <physical> <void> <norepeat> panel <C-l> godotvim.focus.right
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.panel",
     surfaces: &[&PANEL],
+    // Verbs stayed in `specs::SHIPPED` when P2 extracted them; see `Provider`.
+    actions: &[],
     defaults: DEFAULTS,
 };
 

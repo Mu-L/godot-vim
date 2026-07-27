@@ -65,6 +65,8 @@ pub(crate) static FOREIGN: SurfaceSpec = SurfaceSpec {
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.foreign",
     surfaces: &[&FOREIGN],
+    // Verbs stayed in `specs::SHIPPED` when P2 extracted them; see `Provider`.
+    actions: &[],
     // A Barrier takes no rules, by validation and not merely by convention:
     // `try_insert` rejects them. Keys here belong to whatever text input has
     // focus, which is the entire point of the surface.

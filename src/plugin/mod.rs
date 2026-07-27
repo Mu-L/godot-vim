@@ -141,10 +141,7 @@ impl INode for GodotVimCore {
         // default naming an unregistered action, which is the load-time check
         // that keeps a typo from becoming a key that consumes and does
         // nothing.
-        let mut actions = crate::actions::action::ActionRegistry::new();
-        for spec in crate::actions::specs::SHIPPED {
-            actions.register(spec);
-        }
+        let actions = crate::actions::specs::registry();
         let bindings = crate::actions::bind::builtin_index(&actions);
         Self {
             base,

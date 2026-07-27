@@ -13,7 +13,7 @@ use godot::global::Key;
 use godot::prelude::*;
 use vim_core::keymap::KeyEvent;
 
-use crate::actions::action::{ActionCtx, Params};
+use crate::actions::action::{ActionCtx, ActionSpec, Params};
 use crate::actions::outcome::Outcome;
 use crate::actions::resolve::{
     self, Candidate, CandidateTarget, Disposition, Resolution, ResolveInput,
@@ -482,6 +482,41 @@ impl GodotVimCore {
         }
     }
 
+    /// Resolve a keystroke on the `editor.completion` surface (P9).
+    ///
+    /// This is the whole of "completion routing became rebindable". It is a
+    /// **direct lookup by surface name**, not a forest walk: `editor.completion`
+    /// declares `probe: |_| None` because popup visibility is a per-keystroke
+    /// fact while the sampled `FocusChain` is cached per focus change, so a
+    /// probe here would answer from a cache that is stale by construction.
+    ///
+    /// Three things a walked surface would get and this one deliberately does
+    /// not, all inert rather than wrong:
+    ///
+    /// - **`<physical>`** — only probe 1 (the canonicalized logical key) is
+    ///   offered. A positional guess inside the attached editor is what
+    ///   `refuses_positional` exists to forbid; honouring it here would turn a
+    ///   Dvorak `Ctrl+p` into a completion key.
+    /// - **`<void>` / `<norepeat>`** — the verdict is the action's own
+    ///   `Outcome`, i.e. always elastic. That is not a shortcut: consuming
+    ///   `<CR>` when no popup is up would stop Enter inserting a newline, so
+    ///   `Void` has no correct meaning on this surface.
+    /// - **multi-key sequences** — rejected at registration by V8, since
+    ///   `editor.completion` is editor-reachable.
+    fn completion_binding(&self, key: vim_core::keymap::KeyEvent) -> Option<&'static ActionSpec> {
+        let lhs = [crate::actions::keys::canonicalize(key)];
+        let rule = self
+            .bindings
+            .rule_for(crate::actions::providers::completion::SURFACE, &lhs)?;
+        match rule.target {
+            crate::actions::action::RuleTarget::Action(id) => self.actions.get(id),
+            // `native` and `<Shortcut>(…)` have no meaning against a popup:
+            // both mean "not ours", which on this transport is exactly what
+            // `None` already says.
+            _ => None,
+        }
+    }
+
     /// Per-editor keystroke handler. Connected to `gui_input` on the attached CodeEdit.
     pub(super) fn handle_gui_input_impl(&mut self, event: Gd<InputEvent>) {
         let Some(editor) = &self.attached_editor else {
@@ -563,12 +598,20 @@ impl GodotVimCore {
         };
         let mut ed = editor.clone();
 
+        // Resolved here and passed down, rather than looked up inside the
+        // controller: the `BindingIndex` lives on the plugin, and the
+        // controller holding a reference to it would be a second cache of the
+        // index generation to keep honest. Deliberately AFTER the IME guard
+        // above — a preedit must reach `TextEdit` untouched, and that guard is
+        // one of the three reasons these keys never moved to `_input`.
+        let completion_binding = self.completion_binding(key);
+
         let outcome = {
             let _guard = ProcessingKeyGuard::new(&mut self.processing_key);
             let Some(controller) = &mut self.controller else {
                 return;
             };
-            controller.process_cycle(key, &mut ed)
+            controller.process_cycle(key, &mut ed, completion_binding)
         };
 
         let snap = {

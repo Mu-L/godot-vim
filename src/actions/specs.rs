@@ -330,6 +330,11 @@ pub(crate) static FS_REFRESH: ActionSpec = ActionSpec {
 ///
 /// Adding one here is the entire cost of adding a verb — no dispatcher edit,
 /// no match arm, no widget taxonomy.
+///
+/// This array is **not** the only registration point, and deliberately so:
+/// `Provider::actions` is the other, and it is the one a new subsystem uses.
+/// Build the registry through [`registry`] rather than looping this directly,
+/// or a provider's verbs go missing and its shipped defaults fail to load.
 pub(crate) const SHIPPED: &[&ActionSpec] = &[
     &ITEM_NEXT,
     &ITEM_PREV,
@@ -352,18 +357,32 @@ pub(crate) const SHIPPED: &[&ActionSpec] = &[
     &FS_REFRESH,
 ];
 
+/// The whole registry: the core keyset above, then every provider's own verbs.
+///
+/// The single seam. Before it existed the registry was assembled by five
+/// separate `for spec in SHIPPED` loops — one in `GodotVimCore::init` and four
+/// in test modules — and none of them consulted `PROVIDERS`, so a new provider
+/// that shipped a verb had to edit all five. That is exactly the per-subsystem
+/// cost §7.1 claims not to charge, which is why it is one function now.
+///
+/// Order is `SHIPPED` first, then `PROVIDERS` order. Ids are minted by an
+/// append-only interner, so that order is what makes `ActionId`s stable across
+/// a rebuild — the introspector's golden snapshots depend on it.
+pub(crate) fn registry() -> super::action::ActionRegistry {
+    let mut r = super::action::ActionRegistry::new();
+    for spec in SHIPPED {
+        r.register(spec);
+    }
+    for spec in super::providers::actions() {
+        r.register(spec);
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::actions::action::{is_valid_action_id, ActionCtx, ActionRegistry};
-
-    fn registry() -> ActionRegistry {
-        let mut r = ActionRegistry::new();
-        for spec in SHIPPED {
-            r.register(spec);
-        }
-        r
-    }
 
     #[test]
     fn every_shipped_id_is_well_formed() {
@@ -614,9 +633,15 @@ mod tests {
     #[test]
     fn the_registry_enumerates_everything_for_the_introspector() {
         let r = registry();
-        assert_eq!(r.iter().count(), SHIPPED.len());
+        let provider_verbs = crate::actions::providers::actions();
+        assert_eq!(r.iter().count(), SHIPPED.len() + provider_verbs.len());
         let names: Vec<&str> = r.iter().map(|(_, s)| s.id).collect();
         assert!(names.contains(&"godotvim.fs.refresh"));
+        // The union, asserted from the other side: a provider verb that never
+        // reaches the registry is a shipped default that cannot load.
+        for spec in provider_verbs {
+            assert!(names.contains(&spec.id), "{} is not registered", spec.id);
+        }
     }
 
     // ── The host bridge namespace split (P3) ─────────────────────────

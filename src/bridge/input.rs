@@ -2093,12 +2093,14 @@ mod tests {
             false,
         )
         .unwrap();
-        // This is the exact condition from try_handle_completion.
-        // If this assertion fails, update completion.rs to match.
+        // This is the exact key the `editor.completion` surface binds
+        // `godotvim.completion.trigger` to. If this assertion fails, the
+        // `<C-@>` line in `actions::providers::completion::DEFAULTS` is a
+        // silently dead binding — it would still load, and never fire.
         assert!(
             event.modifiers().contains(Modifiers::CTRL) && event.key() == Key::Char('@'),
-            "Bridge Ctrl+Space output changed! Was {:?} — update completion.rs \
-             try_handle_completion to match the new post-translation form",
+            "Bridge Ctrl+Space output changed! Was {:?} — update the <C-@> default \
+             in actions::providers::completion to the new post-translation form",
             event,
         );
     }

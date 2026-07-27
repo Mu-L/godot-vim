@@ -35,6 +35,7 @@ pub(super) fn process_cycle_impl(
     ctx: &mut ControllerContext,
     key: KeyEvent,
     editor: &mut Gd<CodeEdit>,
+    completion_binding: Option<&'static crate::actions::action::ActionSpec>,
 ) -> PipelineOutcome {
     ctx.transient.operations_this_cycle = 0;
 
@@ -50,7 +51,7 @@ pub(super) fn process_cycle_impl(
     }
 
     if let Some(consumed) =
-        completion::try_handle_completion(session, key, editor)
+        completion::try_handle_completion(session, editor, completion_binding)
     {
         log::debug!(
             "process_cycle: completion intercepted key={} consumed={}",

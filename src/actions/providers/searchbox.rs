@@ -58,6 +58,8 @@ panelmap <shift> searchbox <Esc> godotvim.search.accept
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.searchbox",
     surfaces: &[&SEARCHBOX],
+    // Verbs stayed in `specs::SHIPPED` when P2 extracted them; see `Provider`.
+    actions: &[],
     defaults: DEFAULTS,
 };
 

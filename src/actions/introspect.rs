@@ -364,12 +364,14 @@ mod tests {
     use crate::actions::surface::fixtures::{code_edit, id, line_edit, plain, tree};
     use vim_core::keymap::{Key as VimKey, Modifiers};
 
+    /// The whole shipped registry — `specs::SHIPPED` **plus** every
+    /// `Provider::actions` table. Looping `SHIPPED` alone here would leave a
+    /// provider's own verbs unregistered, and `builtin_index` would then
+    /// reject that provider's defaults with `UnknownAction` — a
+    /// `debug_assert!` under `Provenance::Builtin`, so the failure is loud
+    /// but the cause reads as unrelated.
     fn registry() -> ActionRegistry {
-        let mut r = ActionRegistry::new();
-        for spec in specs::SHIPPED {
-            r.register(spec);
-        }
-        r
+        specs::registry()
     }
 
     const NEVER: &dyn Fn(KeyEvent) -> bool = &|_| false;
@@ -413,13 +415,27 @@ mod tests {
     }
 
     /// Asserted literally rather than through a snapshot crate: the shipped
-    /// keyset is sixteen rules and a hand-written expectation is reviewable
+    /// keyset is thirty rules and a hand-written expectation is reviewable
     /// in a diff, which is the same argument the provider array makes.
+    ///
+    /// `dock.debugger` appearing between `dock.filesystem` and `dock` is not
+    /// cosmetic — the listing walks `PROVIDERS` order, which *is* the probe
+    /// order, so a child printed after its parent here would be a child that
+    /// never classifies.
     fn insta_like(report: &str) {
         let expected = "\
 --- panel bindings ---
 editor.nav  (no bindings)
 editor.insert  (barrier — takes no bindings)
+editor.completion  (parent: -, seal: Open)
+  panelmap editor.completion <C-@> godotvim.completion.trigger    [godotvim.completion]
+  panelmap editor.completion <C-n> godotvim.completion.next    [godotvim.completion]
+  panelmap editor.completion <C-p> godotvim.completion.prev    [godotvim.completion]
+  panelmap editor.completion <Tab> godotvim.completion.confirm    [godotvim.completion]
+  panelmap editor.completion <CR> godotvim.completion.confirm    [godotvim.completion]
+  panelmap editor.completion <Esc> godotvim.completion.dismiss    [godotvim.completion]
+  panelmap editor.completion <Up> godotvim.completion.navigate    [godotvim.completion]
+  panelmap editor.completion <Down> godotvim.completion.navigate    [godotvim.completion]
 prompt  (no bindings)
 searchbox  (parent: panel, seal: Sealed)
   panelmap <shift> searchbox <CR> godotvim.search.accept    [godotvim.searchbox]
@@ -430,6 +446,11 @@ dock.filesystem  (parent: dock, seal: Open)
   panelmap <physical> dock.filesystem r godotvim.fs.rename    [godotvim.filesystem]
   panelmap <physical> dock.filesystem y godotvim.fs.yank_path    [godotvim.filesystem]
   panelmap <physical> dock.filesystem R godotvim.fs.refresh    [godotvim.filesystem]
+dock.debugger  (parent: dock, seal: Open)
+  panelmap dock.debugger J godotvim.debugger.frame_next    [godotvim.debugger]
+  panelmap dock.debugger K godotvim.debugger.frame_prev    [godotvim.debugger]
+  panelmap dock.debugger G godotvim.debugger.frame_last    [godotvim.debugger]
+  panelmap dock.debugger y godotvim.debugger.yank_frame    [godotvim.debugger]
 dock  (parent: panel, seal: Open)
   panelmap <physical> dock h godotvim.item.collapse    [godotvim.dock]
   panelmap <physical> dock j godotvim.item.next    [godotvim.dock]
@@ -445,7 +466,7 @@ panel  (parent: -, seal: Open)
   panelmap <physical> <void> <norepeat> panel <C-j> godotvim.focus.down    [godotvim.panel]
   panelmap <physical> <void> <norepeat> panel <C-k> godotvim.focus.up    [godotvim.panel]
   panelmap <physical> <void> <norepeat> panel <C-l> godotvim.focus.right    [godotvim.panel]
---- 18 binding(s) ---
+--- 30 binding(s) ---
 ";
         assert_eq!(report, expected);
     }

@@ -90,6 +90,8 @@ panelmap <physical> dock.filesystem R godotvim.fs.refresh
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.filesystem",
     surfaces: &[&DOCK_FILESYSTEM],
+    // Verbs stayed in `specs::SHIPPED` when P2 extracted them; see `Provider`.
+    actions: &[],
     defaults: DEFAULTS,
 };
 

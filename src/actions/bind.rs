@@ -704,12 +704,14 @@ mod tests {
     use crate::actions::outcome::Outcome;
     use crate::actions::specs;
 
+    /// The whole shipped registry — `specs::SHIPPED` **plus** every
+    /// `Provider::actions` table. Looping `SHIPPED` alone here would leave a
+    /// provider's own verbs unregistered, and `builtin_index` would then
+    /// reject that provider's defaults with `UnknownAction` — a
+    /// `debug_assert!` under `Provenance::Builtin`, so the failure is loud
+    /// but the cause reads as unrelated.
     fn registry() -> ActionRegistry {
-        let mut r = ActionRegistry::new();
-        for spec in specs::SHIPPED {
-            r.register(spec);
-        }
-        r
+        specs::registry()
     }
 
     fn empty_index() -> BindingIndex {
@@ -812,6 +814,84 @@ mod tests {
             true,
             Consumption::Void,
             Repeat::Suppress,
+            false,
+        ),
+        // The autocomplete popup (P9). Every one is elastic and none carries
+        // `<physical>`: the verdict on the `gui_input` transport IS the
+        // action's outcome, and `<CR>` consuming with no popup up would stop
+        // Enter inserting a newline. `<C-@>` and not `<C-Space>` — the bridge
+        // folds Ctrl+Space into `Char('@') + CTRL` before anything sees it, so
+        // the other spelling would load cleanly and never fire.
+        (
+            "editor.completion",
+            "<C-@>",
+            "godotvim.completion.trigger",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "editor.completion",
+            "<C-n>",
+            "godotvim.completion.next",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "editor.completion",
+            "<C-p>",
+            "godotvim.completion.prev",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "editor.completion",
+            "<Tab>",
+            "godotvim.completion.confirm",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "editor.completion",
+            "<CR>",
+            "godotvim.completion.confirm",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "editor.completion",
+            "<Esc>",
+            "godotvim.completion.dismiss",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "editor.completion",
+            "<Up>",
+            "godotvim.completion.navigate",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "editor.completion",
+            "<Down>",
+            "godotvim.completion.navigate",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
             false,
         ),
         // Dock item navigation. Elastic: `j` at the end of a list declines and
@@ -951,6 +1031,47 @@ mod tests {
             Repeat::Allow,
             false,
         ),
+        // The debugger provider (P9). Transcribed from `providers/debugger.rs`
+        // independently, which is the point of this table: a provider that
+        // silently stops loading its own defaults is invisible in its own file
+        // and visible here. No `<physical>` — these keys are mnemonic, not
+        // positional — so the "exactly fourteen" count below still holds.
+        (
+            "dock.debugger",
+            "J",
+            "godotvim.debugger.frame_next",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "dock.debugger",
+            "K",
+            "godotvim.debugger.frame_prev",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "dock.debugger",
+            "G",
+            "godotvim.debugger.frame_last",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
+        (
+            "dock.debugger",
+            "y",
+            "godotvim.debugger.yank_frame",
+            false,
+            Consumption::Elastic,
+            Repeat::Allow,
+            false,
+        ),
     ];
 
     #[test]
@@ -1000,6 +1121,8 @@ mod tests {
             "panel" => "godotvim.panel",
             "dock" => "godotvim.dock",
             "dock.filesystem" => "godotvim.filesystem",
+            "dock.debugger" => "godotvim.debugger",
+            "editor.completion" => "godotvim.completion",
             "searchbox" => "godotvim.searchbox",
             other => unreachable!("no provider ships defaults for '{other}'"),
         }
@@ -1144,14 +1267,19 @@ mod tests {
 
     #[test]
     fn an_unknown_surface_is_rejected() {
+        // `dock.profiler` is deliberately a *plausible* name: it is exactly
+        // what a user would guess after reading about `dock.debugger`, and
+        // guessing must produce a diagnostic rather than a silently ignored
+        // line. (This test used to name `dock.debugger` itself, which stopped
+        // being undeclared the moment P9 shipped the provider.)
         let mut index = empty_index();
         assert_eq!(
-            user_reject(&mut index, "panelmap dock.debugger j godotvim.item.next"),
-            Some(RuleReject::UnknownSurface("dock.debugger".into()))
+            user_reject(&mut index, "panelmap dock.profiler j godotvim.item.next"),
+            Some(RuleReject::UnknownSurface("dock.profiler".into()))
         );
         assert_eq!(
-            user_reject(&mut index, "panelunmap dock.debugger j"),
-            Some(RuleReject::UnknownSurface("dock.debugger".into()))
+            user_reject(&mut index, "panelunmap dock.profiler j"),
+            Some(RuleReject::UnknownSurface("dock.profiler".into()))
         );
     }
 
@@ -1224,12 +1352,18 @@ mod tests {
         // with `editor.`, and it must still be caught. `dock` is not an
         // ancestor of any editor surface, and must not be.
         let index = empty_index();
-        for surface in ["panel", "editor.nav", "editor.insert"] {
+        // `editor.completion` is reachable by its own name and by nothing
+        // else — it is a root with no probe, dispatched by direct lookup from
+        // `gui_input`. It must still be caught, because V8's multi-key and
+        // grammar-prefix rejections are exactly what stop a user binding
+        // `<C-w>` there and breaking `<C-w>s` inside the editor.
+        for surface in ["panel", "editor.nav", "editor.insert", "editor.completion"] {
             assert!(index.editor_reachable(surface), "{surface}");
         }
         for surface in [
             "dock",
             "dock.filesystem",
+            "dock.debugger",
             "searchbox",
             "prompt",
             "foreign",
