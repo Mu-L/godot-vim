@@ -239,7 +239,10 @@ fn handle_host_pending_ui_action(
     match action {
         PendingUiAction::OpenMappingDialog
         | PendingUiAction::SourceConfigFile
-        | PendingUiAction::ShowTooltip { .. } => {
+        | PendingUiAction::ShowTooltip { .. }
+        // Must be forwarded, not handled here: running an ActionSpec needs
+        // `&mut GodotVimCore`, which this scope does not have.
+        | PendingUiAction::RunRegistryAction { .. } => {
             ctx.transient.pending_ui_actions.push(action);
         }
         PendingUiAction::ShowUndoTree => {

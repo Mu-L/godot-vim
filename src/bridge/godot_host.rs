@@ -41,6 +41,16 @@ pub(crate) enum PendingUiAction {
     SourceConfigFile,
     ShowUndoTree,
     Vimdebug(compact_str::CompactString),
+    /// Run a shell-side action by NAME.
+    ///
+    /// Name-carrying, never id-carrying. `ActionNames` wraps its own
+    /// `NameRegistry`, a different instance from the engine's, so a raw id
+    /// would resolve against the wrong table. The string also keeps `bridge`
+    /// free of any dependency on `crate::actions`.
+    RunRegistryAction {
+        name: compact_str::CompactString,
+        count: u32,
+    },
     PerfReport,
     PerfReset,
     ShowTooltip {

@@ -440,6 +440,31 @@ pub(crate) fn execute(
             log::debug!("RunAction: {} (count={:?})", name, count);
             let repeat = count.unwrap_or(1).max(1);
 
+            // Link 0: the plugin's own action registry. Probed first so
+            // `:action godotvim.fs.refresh` and `<Action>(godotvim.fs.create)`
+            // reach the same ActionSpec a panel key would.
+            //
+            // The split is on the dot: action ids are dotted and slash-free
+            // (`godotvim.fs.create`), Godot's editor-shortcut paths are
+            // slash-bearing (`filesystem_dock/delete`). Anything dotted is
+            // ours, so a shortcut path can never be shadowed.
+            //
+            // Execution hops to the plugin: an ActionSpec needs `&mut
+            // GodotVimCore`, and this runs inside a `&mut controller` borrow.
+            // The hop costs zero frames but is ordered AFTER apply_ui_update
+            // and set_input_as_handled, so a registry action must not publish
+            // text through handle_show_message — it would surface one
+            // keystroke late.
+            if name.contains('.') && !name.contains('/') {
+                pending_ui_actions.push(
+                    crate::bridge::godot_host::PendingUiAction::RunRegistryAction {
+                        name: name.clone(),
+                        count: repeat,
+                    },
+                );
+                return host_success(request.id());
+            }
+
             // Try editor shortcut synthesis first.
             let editor_iface = EditorInterface::singleton();
             let settings = editor_iface.get_editor_settings();

@@ -513,4 +513,79 @@ mod tests {
         let names: Vec<&str> = r.iter().map(|(_, s)| s.id).collect();
         assert!(names.contains(&"godotvim.fs.refresh"));
     }
+
+    // ── The host bridge namespace split (P3) ─────────────────────────
+
+    /// Mirrors the split at the `HostRequest::RunAction` arm: dotted and
+    /// slash-free is ours, anything else falls through to Godot's shortcuts.
+    fn is_registry_name(name: &str) -> bool {
+        name.contains('.') && !name.contains('/')
+    }
+
+    #[test]
+    fn every_shipped_action_is_claimed_by_the_registry_probe() {
+        for spec in SHIPPED {
+            assert!(is_registry_name(spec.id), "{} would fall through", spec.id);
+        }
+    }
+
+    #[test]
+    fn godot_editor_shortcut_paths_are_never_claimed() {
+        // These are Godot's own namespace. Claiming one would shadow a real
+        // editor shortcut and silently break it.
+        for path in [
+            "filesystem_dock/delete",
+            "filesystem_dock/rename",
+            "scene_tree/rename",
+            "editor/save_scene",
+            "debugger/step_over",
+        ] {
+            assert!(!is_registry_name(path), "{path} must reach Godot");
+        }
+    }
+
+    #[test]
+    fn a_bare_name_is_not_claimed_either() {
+        // No dot means no namespace. Falling through is the safe direction:
+        // Godot answers or nothing happens, rather than us guessing.
+        for name in ["save", "quit", "ui_accept"] {
+            assert!(!is_registry_name(name), "{name} must not be claimed");
+        }
+    }
+
+    #[test]
+    fn only_self_locating_actions_accept_a_host_invocation() {
+        // `host_invocable: false` must FAIL LOUDLY rather than decline
+        // invisibly — an action with nothing to act on is a user error worth
+        // reporting, not a silent no-op.
+        let r = registry();
+        for (name, want) in [
+            ("godotvim.fs.create", true),
+            ("godotvim.fs.refresh", true),
+            ("godotvim.focus.left", true),
+            ("godotvim.item.next", false),
+            ("godotvim.item.activate", false),
+            ("godotvim.dock.search", false),
+        ] {
+            let spec = r.get(r.id_of(name).unwrap()).unwrap();
+            assert_eq!(spec.host_invocable, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn host_invocation_ignores_capabilities_entirely() {
+        // `:action godotvim.fs.refresh` from the command line arrives with no
+        // capabilities at all. If the host path gated on them it would
+        // decline everything — which is exactly what host_invocable exists to
+        // prevent. Proven against a probe spec so no shipped body is involved.
+        let mut r = ActionRegistry::new();
+        let id = r.register(&PROBE);
+        let mut effects = Vec::new();
+        let mut cx = ActionCtx::recording(&mut effects);
+        assert_eq!(r.run(id, &mut cx), Outcome::Handled);
+        assert!(
+            !r.caps_allow(id, Caps::empty()),
+            "the BINDING path still gates"
+        );
+    }
 }

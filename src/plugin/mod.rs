@@ -966,6 +966,9 @@ impl GodotVimCore {
     ) {
         use crate::bridge::godot_host::PendingUiAction;
         match action {
+            PendingUiAction::RunRegistryAction { name, count } => {
+                self.run_registry_action(&name, count);
+            }
             PendingUiAction::OpenMappingDialog => {
                 let resolved = self.resolve_config_path();
 
@@ -1216,6 +1219,46 @@ impl GodotVimCore {
         }
         self.rebuild_langmap();
         true
+    }
+
+    /// Run a shell-side action invoked by name rather than by keystroke.
+    ///
+    /// The `:action <id>` / `<Action>(<id>)` path. Two rules from the design
+    /// govern it, and both are why it lives here rather than in the host layer:
+    ///
+    /// 1. **Capabilities are not consulted.** There is no keystroke, no
+    ///    surface and no sampled widget to derive them from, so gating here
+    ///    would decline everything invisibly. `Caps` gates bindings only.
+    /// 2. **`host_invocable: false` fails loudly.** An action that needs a
+    ///    focused panel — `godotvim.item.next` has nothing to move — reports
+    ///    a real error rather than silently doing nothing.
+    fn run_registry_action(&mut self, name: &str, count: u32) {
+        let Some(id) = self.actions.id_of(name) else {
+            log::warn!("action: unknown action '{name}'");
+            return;
+        };
+        let Some(spec) = self.actions.get(id) else {
+            return;
+        };
+        if !spec.host_invocable {
+            log::warn!("action: '{name}' requires panel focus");
+            return;
+        }
+
+        // The focus owner, when there is one. Actions needing a specific
+        // widget re-assert it in their own body — the same predicate the
+        // binding path uses, a no-op there and the real guard here.
+        let target = EditorInterface::singleton()
+            .get_base_control()
+            .and_then(|c| c.get_viewport())
+            .and_then(|vp| vp.gui_get_focus_owner())
+            .map(|o| o.upcast::<godot::classes::Control>());
+
+        let mut params = crate::actions::action::Params::new();
+        params.set_int("count", i64::from(count));
+        let mut cx = crate::actions::action::ActionCtx::new(target, params);
+        let outcome = self.actions.run(id, &mut cx);
+        log::debug!("action: '{name}' -> {outcome:?}");
     }
 
     /// Re-read `:set langmap` into the cached table used by the shell-side
