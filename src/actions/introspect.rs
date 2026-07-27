@@ -117,6 +117,23 @@ pub(crate) fn list_report(index: &BindingIndex, registry: &ActionRegistry) -> St
                 owner_label(&rule.owner)
             );
         }
+        // Reservations, printed under the surface that owns them.
+        //
+        // Not decoration: binding a multi-key LHS implicitly takes the bare
+        // first key on this surface, and a reservation nobody can see is
+        // exactly the silent dead key the introspector exists to prevent.
+        for key in index.reservations(surface) {
+            let sequences: Vec<String> = index
+                .sequences_from(surface, key)
+                .map(|rule| rule.lhs.iter().map(KeyEvent::to_vim_notation).collect())
+                .collect();
+            let _ = writeln!(
+                out,
+                "  reserves {}    (consumed bare on {surface}, then waits timeoutlen for: {})",
+                key.to_vim_notation(),
+                sequences.join(", ")
+            );
+        }
     }
     let _ = writeln!(out, "--- {total} binding(s) ---");
     out
@@ -151,12 +168,16 @@ pub(crate) fn explain_report(
         return out;
     };
     if keys.len() > 1 {
-        // The shell plane holds no multi-key rule on any editor-reachable
-        // surface, and sequences arrive with the pending buffer. Explaining
-        // one now would be inventing an answer.
+        // A sequence is resolved one keystroke at a time against a pending
+        // buffer (§5.10), and the *first* key is where the interesting
+        // decision happens: reserved or not. Replaying the rest against a
+        // buffer that does not exist would be inventing an answer, so the
+        // report says which key it answered for and prints the reservation
+        // below.
         let _ = writeln!(
             out,
-            "multi-key sequences are not resolvable yet; explaining the first key only"
+            "a sequence resolves one keystroke at a time against the pending buffer; \
+             explaining the first key only"
         );
     }
     let key = first;
@@ -208,6 +229,24 @@ pub(crate) fn explain_report(
         let positional = !path.anchor_refuses_positional && index.has_physical_rule(surface);
         let mut any = false;
         for probe in probes.iter_scoped(positional) {
+            // Reservation first, because it is what happens FIRST at dispatch:
+            // a reserved key never reaches the single-key walk below, so
+            // printing the rule without the reservation would explain the
+            // wrong half of the behaviour.
+            if index.is_reserved(surface, probe) {
+                any = true;
+                let sequences: Vec<String> = index
+                    .sequences_from(surface, probe)
+                    .map(|rule| rule.lhs.iter().map(KeyEvent::to_vim_notation).collect())
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "  {surface}: RESERVED — {} is consumed bare here and the plugin waits \
+                     timeoutlen for: {}",
+                    probe.to_vim_notation(),
+                    sequences.join(", ")
+                );
+            }
             let Some(rule) = index.rule_for(surface, &[probe]) else {
                 continue;
             };
@@ -588,6 +627,76 @@ panel  (parent: -, seal: Open)
         assert!(report.contains("dock.filesystem R godotvim.fs.refresh"));
         assert!(!report.contains("<S-r>"));
         assert!(!report.contains("<S-R>"));
+    }
+
+    // ── Reservations (§5.10) ─────────────────────────────────────────
+
+    /// The shipped defaults plus `lines`, in the syntax a user would type.
+    fn index_with(lines: &str) -> BindingIndex {
+        let reg = registry();
+        let mut index = builtin_index(&reg);
+        let mut diagnostics = Vec::new();
+        crate::actions::bind::apply_text(
+            &mut index,
+            &reg,
+            lines,
+            &MappingOwner::User,
+            "test",
+            crate::actions::bind::Provenance::User,
+            &mut diagnostics,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        index
+    }
+
+    #[test]
+    fn the_listing_prints_every_reservation_and_who_owns_it() {
+        // A reservation is invisible in the rule itself — `panelmap dock gg …`
+        // says nothing about bare `g` — and an invisible reservation is a
+        // silent dead key. The listing must name the key, the surface and the
+        // sequences it is waiting for.
+        let reg = registry();
+        let index = index_with(
+            "panelmap dock gg godotvim.item.prev\n\
+             panelmap dock gj godotvim.item.next",
+        );
+        let report = list_report(&index, &reg);
+        assert!(
+            report.contains(
+                "reserves g    (consumed bare on dock, then waits timeoutlen for: gg, gj)"
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn the_listing_prints_no_reservation_line_for_the_shipped_keyset() {
+        // The zero-config guarantee, seen from the introspector: no
+        // reservations means no `set_allow_search(false)` and no pending
+        // buffer for a user who never bound a sequence.
+        let reg = registry();
+        let report = list_report(&builtin_index(&reg), &reg);
+        assert!(!report.contains("reserves"), "{report}");
+    }
+
+    #[test]
+    fn the_explainer_names_a_reservation_before_the_single_key_rule() {
+        // `d` is bound on `dock.filesystem` AND reserved there by `dd`. The
+        // report must say the reservation wins, or the user reads "runs
+        // godotvim.fs.delete" and cannot explain why a single `d` waits.
+        let reg = registry();
+        let index = index_with("panelmap dock.filesystem dd godotvim.fs.delete");
+        let chain = fs_chain();
+        let path = providers::forest().classify(&chain).expect("total probe");
+        let report = explain_report("d", &chain, &path, &index, &reg, NEVER);
+        assert!(report.contains("dock.filesystem: RESERVED"), "{report}");
+        assert!(report.contains("waits timeoutlen for: dd"), "{report}");
+    }
+
+    #[test]
+    fn the_explainer_says_nothing_about_reservations_for_an_unreserved_key() {
+        let report = explain("j", &fs_chain(), NEVER);
+        assert!(!report.contains("RESERVED"), "{report}");
     }
 
     #[test]

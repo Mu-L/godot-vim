@@ -32,10 +32,11 @@
 //! See `docs/DESIGN-rebindable-nav.md` §5.6 through §5.9.
 
 use compact_str::CompactString;
-use vim_core::keymap::{KeyEvent, TrieLookup};
+use vim_core::keymap::{KeyEvent, MappingEntry, TrieLookup};
 
 use super::action::{ActionId, ActionRegistry, ActionSpec, Params, RuleTarget};
 use super::bind::{BindingIndex, Consumption, Repeat};
+use super::caps::Caps;
 use super::keys::Probes;
 use super::outcome::Outcome;
 use super::surface::{Seal, SurfaceId, SurfacePath};
@@ -192,6 +193,78 @@ pub(crate) fn resolve(input: &ResolveInput<'_>) -> Resolution {
     }
 }
 
+/// What one exact trie hit on one surface yields.
+///
+/// Extracted so the single-key walk here and the pending-sequence resolution
+/// in [`super::sequence`] cannot drift. A capability gate that fired on one
+/// path and not on the other would be a verb that runs as `gg` but not as `g`,
+/// or the reverse — and the two would be indistinguishable from a broken
+/// keyboard.
+pub(super) enum Hit {
+    /// Run this.
+    Run(Candidate),
+    /// `native` — hands the key back to Godot and terminates the walk.
+    Native,
+    /// Gated out by capabilities, or a trie entry naming nothing live.
+    /// Treated exactly as `NoMatch`: the caller carries on.
+    Miss,
+}
+
+/// Turn one live trie entry into a [`Hit`], applying the capability gate.
+pub(super) fn hit_from(
+    index: &BindingIndex,
+    registry: &ActionRegistry,
+    caps: Caps,
+    surface: SurfaceId,
+    entry: &MappingEntry,
+) -> Hit {
+    let Some(rule) = BindingIndex::slot_in(entry).and_then(|s| index.rule_at(s)) else {
+        // A live trie entry with no live rule is a programming error in the
+        // index, not a user-reachable state. Treat it as a miss rather than
+        // consuming a key with nothing behind it.
+        log::error!("resolve: {surface} has a trie entry with no live rule");
+        return Hit::Miss;
+    };
+    match &rule.target {
+        // Terminates. NOT a declining action: a declining action would fall
+        // through to `panel`'s Void rule and consume.
+        RuleTarget::Native => Hit::Native,
+        RuleTarget::Action(id) => {
+            let Some(spec) = registry.get(*id) else {
+                log::error!("resolve: {surface} binds unregistered action id {}", id.0);
+                return Hit::Miss;
+            };
+            // The capability gate, and the whole replacement for
+            // `matches!(dock_kind, DockKind::Tree)`. A miss is skipped AS IF
+            // NoMatch — the walk continues to the parent.
+            if !caps.satisfies(spec.requires) {
+                log::trace!(
+                    "resolve: {} gated out on {surface} — needs {:?}, path offers {caps:?}",
+                    spec.id,
+                    spec.requires,
+                );
+                return Hit::Miss;
+            }
+            Hit::Run(Candidate {
+                surface,
+                target: CandidateTarget::Action(*id, spec),
+                params: rule.params.clone(),
+                consume: rule.consume,
+                repeat: rule.repeat,
+            })
+        }
+        // No `ActionSpec`, therefore no `requires`, therefore no capability
+        // gate. Stated so it reads as a decision.
+        RuleTarget::Shortcut(path) => Hit::Run(Candidate {
+            surface,
+            target: CandidateTarget::Shortcut(path.clone()),
+            params: rule.params.clone(),
+            consume: rule.consume,
+            repeat: rule.repeat,
+        }),
+    }
+}
+
 /// The leaf→root candidate walk (S5).
 fn walk_path(input: &ResolveInput<'_>) -> Result<(Vec<Candidate>, KeyEvent), Stop> {
     // The positional probe is opt-in twice over: a rule on this surface must
@@ -202,65 +275,18 @@ fn walk_path(input: &ResolveInput<'_>) -> Result<(Vec<Candidate>, KeyEvent), Sto
         let positional = anchor_allows && input.index.has_physical_rule(surface);
         for probe in input.probes.iter_scoped(positional) {
             let TrieLookup::ExactOnly(entry) = input.index.lookup(surface, &[probe]) else {
-                // `Prefix` belongs to the sequence phase; `NoMatch` and any
-                // future variant are simply misses. Either way the next probe
+                // `Prefix` belongs to [`super::sequence`], which runs BEFORE
+                // this walk and has already decided whether the key is
+                // reserved; reaching a `Prefix` here means it was not, so the
+                // key is simply unbound at this length. `NoMatch` and any
+                // future variant are misses too. Either way the next probe
                 // gets its turn, then the next surface.
                 continue;
             };
-            let Some(rule) = BindingIndex::slot_in(entry).and_then(|s| input.index.rule_at(s))
-            else {
-                // A live trie entry with no live rule is a programming error
-                // in the index, not a user-reachable state. Treat it as a
-                // miss rather than consuming a key with nothing behind it.
-                log::error!("resolve: {surface} has a trie entry with no rule for {probe}");
-                continue;
-            };
-            match &rule.target {
-                // Terminates. NOT a declining action: a declining action
-                // would fall through to `panel`'s Void rule and consume.
-                RuleTarget::Native => return Err(Stop::Native(surface)),
-                RuleTarget::Action(id) => {
-                    let Some(spec) = input.registry.get(*id) else {
-                        log::error!("resolve: {surface} binds unregistered action id {}", id.0);
-                        continue;
-                    };
-                    // The capability gate, and the whole replacement for
-                    // `matches!(dock_kind, DockKind::Tree)`. A miss is skipped
-                    // AS IF NoMatch — the walk continues to the parent.
-                    if !input.path.caps.satisfies(spec.requires) {
-                        log::trace!(
-                            "resolve: {} gated out on {surface} — needs {:?}, path offers {:?}",
-                            spec.id,
-                            spec.requires,
-                            input.path.caps
-                        );
-                        continue;
-                    }
-                    return Ok((
-                        vec![Candidate {
-                            surface,
-                            target: CandidateTarget::Action(*id, spec),
-                            params: rule.params.clone(),
-                            consume: rule.consume,
-                            repeat: rule.repeat,
-                        }],
-                        probe,
-                    ));
-                }
-                // No `ActionSpec`, therefore no `requires`, therefore no
-                // capability gate. Stated so it reads as a decision.
-                RuleTarget::Shortcut(path) => {
-                    return Ok((
-                        vec![Candidate {
-                            surface,
-                            target: CandidateTarget::Shortcut(path.clone()),
-                            params: rule.params.clone(),
-                            consume: rule.consume,
-                            repeat: rule.repeat,
-                        }],
-                        probe,
-                    ));
-                }
+            match hit_from(input.index, input.registry, input.path.caps, surface, entry) {
+                Hit::Miss => continue,
+                Hit::Native => return Err(Stop::Native(surface)),
+                Hit::Run(candidate) => return Ok((vec![candidate], probe)),
             }
         }
         // The seal is the deepest surface's, so this can only fire once —

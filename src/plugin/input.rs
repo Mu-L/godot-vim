@@ -6,15 +6,19 @@
 // without calling .apply_ui_update() or .discard() is a compile-time error.
 #![deny(unused_must_use)]
 
-use godot::classes::{CodeEdit, Control, EditorInterface, InputEvent, InputEventKey, Viewport};
+use godot::classes::{
+    CodeEdit, Control, EditorInterface, InputEvent, InputEventKey, ItemList, Tree, Viewport,
+};
 use godot::global::Key;
 use godot::prelude::*;
+use vim_core::keymap::KeyEvent;
 
 use crate::actions::action::{ActionCtx, Params};
 use crate::actions::outcome::Outcome;
 use crate::actions::resolve::{
     self, Candidate, CandidateTarget, Disposition, Resolution, ResolveInput,
 };
+use crate::actions::sequence::SeqStep;
 use crate::actions::surface::{FocusChain, Seal, SurfacePath};
 use crate::bridge;
 use crate::controller::VimController;
@@ -22,7 +26,29 @@ use crate::ui::UiCoordinator;
 
 use super::outcome::EngineOutcome;
 use super::processing_guard::ProcessingKeyGuard;
-use super::GodotVimCore;
+use super::{GodotVimCore, SearchSuppression};
+
+/// What the transport must do with the keystroke, once the sequence layer and
+/// the resolver have both had their say.
+///
+/// A separate enum rather than a direct call because every arm needs `&mut
+/// self` (the timer, the buffer) while the decision itself is taken with
+/// `&self.bindings` and `&self.actions` borrowed. Naming the decision lets the
+/// borrows end before the side effects begin.
+enum Plan {
+    /// Nothing runs and nothing is consumed: Godot's own handling proceeds.
+    Drop,
+    /// Consume, and touch neither the timer nor the buffer. The echo arm — not
+    /// restarting the timer is what stops a held prefix key from keeping the
+    /// buffer alive forever.
+    Swallow,
+    /// Consume and (re)arm the shell timer: a prefix is pending.
+    Arm,
+    /// Consume, and clear the buffer and the timer. The dead-prefix arm.
+    Clear,
+    /// Run this plan through the ordinary consumption fold.
+    Run(Vec<Candidate>, KeyEvent),
+}
 
 /// The sampled chain, and the state it was sampled against.
 ///
@@ -125,6 +151,11 @@ impl GodotVimCore {
             return;
         };
 
+        // ── S2.5: scope `allow_search` to this focus owner ───────────
+        // Before the barrier return, so that moving focus INTO a foreign text
+        // input still restores the Tree we left behind.
+        self.sync_search_suppression(&path, &viewport);
+
         // ── S3: a barrier is a total hard stop, before any hook ──────
         if path.seal == Seal::Barrier {
             return;
@@ -140,29 +171,71 @@ impl GodotVimCore {
         // ── S4: per-surface hooks, before any lookup ─────────────────
         self.run_surface_hooks(&path, &viewport);
 
-        // ── S5/S6: resolve, then arbitrate ───────────────────────────
-        let resolution = {
+        // ── S5/S6: sequences first, then resolve and arbitrate ───────
+        //
+        // The pending layer runs BEFORE the single-key walk because a reserved
+        // key must never reach it: `d` on a surface that binds `dd` is a
+        // prefix, not a delete. It returns `Passthrough` — having created no
+        // state and consumed nothing — for every key the user did not reserve,
+        // which is every key in the shipped keyset.
+        let plan = {
             let controller = self.controller.as_ref();
             // The polarity flip lives in `engine_claims`, written down once
             // and unit-tested there: no controller must mean INTERCEPT.
-            let claims = |k: vim_core::keymap::KeyEvent| {
+            let claims = |k: KeyEvent| {
                 resolve::engine_claims(controller, k, VimController::could_start_mapping)
             };
-            resolve::resolve(&ResolveInput {
+            let input = ResolveInput {
                 probes: &probes,
                 path: &path,
                 index: &self.bindings,
                 registry: &self.actions,
                 vim_claims: &claims,
-            })
+            };
+            match self.pending.step(&input, is_echo) {
+                SeqStep::Echo => Plan::Swallow,
+                SeqStep::Buffered => Plan::Arm,
+                SeqStep::DeadPrefix(surface) => {
+                    // Consumed on purpose. A reserved prefix owns its whole
+                    // subtree: letting the terminating key through would send
+                    // it to Tree incremental search after the prefix has
+                    // already been destroyed, which is worse than eating it.
+                    log::debug!("input: dead prefix on {surface}");
+                    Plan::Clear
+                }
+                SeqStep::Run(candidates, matched) => Plan::Run(candidates, matched),
+                SeqStep::Passthrough => match resolve::resolve(&input) {
+                    Resolution::Run {
+                        matched,
+                        candidates,
+                    } => Plan::Run(candidates, matched),
+                    Resolution::None(_) => Plan::Drop,
+                },
+            }
         };
-        let Resolution::Run {
-            matched,
-            candidates,
-        } = resolution
-        else {
-            return;
+
+        let (candidates, matched) = match plan {
+            Plan::Drop => return,
+            Plan::Swallow => {
+                viewport.set_input_as_handled();
+                return;
+            }
+            Plan::Arm => {
+                self.arm_panel_timer();
+                viewport.set_input_as_handled();
+                return;
+            }
+            Plan::Clear => {
+                self.stop_panel_timer();
+                viewport.set_input_as_handled();
+                return;
+            }
+            Plan::Run(candidates, matched) => (candidates, matched),
         };
+        // A sequence that completed has already cleared its buffer; stopping
+        // the timer here is what keeps a stale timeout from firing into the
+        // action that just ran.
+        self.stop_panel_timer();
 
         // ── S7/S8: run the plan, then apply its consumption policy ───
         let target = viewport
@@ -180,6 +253,106 @@ impl GodotVimCore {
             );
             viewport.set_input_as_handled();
         }
+    }
+
+    /// §5.10 step 3 — `Tree`/`ItemList` incremental type-to-search, off for
+    /// exactly as long as the focused control's surface reserves a bare prefix.
+    ///
+    /// Godot's `Tree` type-searches on bare printable keys. A reserved `g`
+    /// would otherwise do both jobs at once: buffer in the shell plane and
+    /// start a type-search in the control. Removing the conflict at its source
+    /// beats racing it.
+    ///
+    /// Three things this deliberately does **not** do. It does not touch a
+    /// control whose surface stack reserves nothing — which is every control
+    /// in the shipped zero-config keyset, so a user who never bound a sequence
+    /// never loses type-to-search. It does not assume the previous value:
+    /// `previous` is read back and restored verbatim, because the editor (or
+    /// the user) may have had search off already. And it suppresses exactly
+    /// one control at a time, so moving focus restores the last one.
+    fn sync_search_suppression(&mut self, path: &SurfacePath, viewport: &Gd<Viewport>) {
+        let wanted = crate::actions::sequence::path_reserves(&self.bindings, path)
+            .and_then(|_| viewport.gui_get_focus_owner())
+            .map(|owner| owner.instance_id());
+        if self.search_suppression.as_ref().map(|s| s.control) == wanted {
+            // The overwhelmingly common case, and the only one on the hot
+            // path for a user with no sequences bound: `None == None`.
+            return;
+        }
+        self.restore_search_suppression();
+        let Some(control) = wanted
+            .and_then(|id| Gd::<Control>::try_from_instance_id(id).ok())
+            .filter(godot::obj::Gd::is_instance_valid)
+        else {
+            return;
+        };
+        // `None` for a focus owner that is neither a `Tree` nor an `ItemList`
+        // — a Button, a RichTextLabel. Nothing is recorded, so this retries
+        // next keystroke; that costs two failed casts per key and only while
+        // a reservation is live.
+        let Some(previous) = set_allow_search(&control, false) else {
+            return;
+        };
+        log::debug!(
+            "sequence: suppressed type-to-search on {} (was {previous})",
+            control.get_class()
+        );
+        self.search_suppression = Some(SearchSuppression {
+            control: control.instance_id(),
+            previous,
+        });
+    }
+
+    /// Give back whatever `sync_search_suppression` took.
+    ///
+    /// Called on focus change, on teardown, on plugin disable and inside the
+    /// `panic_guard` recovery path. `allow_search` lives on a control that
+    /// outlives the plugin, so a missed restore is a permanent, unattributable
+    /// regression in the user's editor session.
+    pub(super) fn restore_search_suppression(&mut self) {
+        let Some(state) = self.search_suppression.take() else {
+            return;
+        };
+        let Ok(control) = Gd::<Control>::try_from_instance_id(state.control) else {
+            // Freed. Nothing to restore and nothing leaked — the flag lived on
+            // the object that is gone.
+            return;
+        };
+        if !control.is_instance_valid() {
+            return;
+        }
+        set_allow_search(&control, state.previous);
+    }
+
+    /// Fired by the shell timer after `timeoutlen` ms with a prefix pending.
+    ///
+    /// Two outcomes only. An exact match at the buffered prefix runs — that is
+    /// what makes `g` reachable at all when `gg` also exists. Otherwise the
+    /// buffer is dropped: there is **no replay channel** in Godot's `_input()`
+    /// stage, so the keys cannot be flushed back as literals the way Vim's
+    /// timeout does. `set_input_as_handled()` destroyed them, and re-injecting
+    /// through `Input::parse_input_event` would re-dispatch them in a later
+    /// frame against a focus owner that may have changed — a different and
+    /// unpredictable action, not a more faithful one.
+    pub(super) fn on_panel_timeout_impl(&mut self) {
+        let Some((candidates, matched)) = self.pending.on_timeout(&self.bindings, &self.actions)
+        else {
+            log::debug!("sequence: timeout flushed an incomplete prefix");
+            return;
+        };
+        let target = EditorInterface::singleton()
+            .get_base_control()
+            .and_then(|c| c.get_viewport())
+            .and_then(|vp| vp.gui_get_focus_owner())
+            .map(godot::obj::Gd::upcast::<Control>);
+        // There is no keystroke left to consume, so the disposition is
+        // irrelevant — but `dispose` is still the path, because `<void>` and
+        // the decline-and-fall-through rule must mean the same thing here as
+        // they do on a keystroke.
+        let disposition = resolve::dispose(&candidates, false, |candidate| {
+            self.run_candidate(candidate, target.clone())
+        });
+        log::trace!("sequence: timeout resolved {matched} -> {disposition:?}");
     }
 
     /// Sample the focus chain (cached) and classify it into a surface path.
@@ -212,6 +385,17 @@ impl GodotVimCore {
         };
         if self.chain_cache.as_ref().is_none_or(|c| c.key != key) {
             log::trace!("input: resampling focus chain");
+            // §5.10 — `pending` clears on focus-owner change and on config
+            // reload, and this key moves on both (`generation` is bumped by
+            // every index rebuild). A buffer that survived a focus change
+            // would resolve a `g` typed in the FileSystem dock against
+            // whatever has focus now; one that survived a reload would resolve
+            // against an index its surface may no longer exist in.
+            if self.pending.is_active() {
+                log::debug!("sequence: focus or index changed; dropping the pending prefix");
+                self.pending.clear();
+                self.stop_panel_timer();
+            }
             let chain = FocusChain::sample(viewport, key.attached, key.mode, key.prompt);
             self.chain_cache = Some(ChainCache { key, chain });
         } else if let Some(cached) = self.chain_cache.as_ref() {
@@ -227,8 +411,15 @@ impl GodotVimCore {
     /// Drop the cached chain. Called wherever a fact the probes read can
     /// change without the focus owner, the mode, the prompt or the index
     /// generation changing with it — teardown and re-enable, mainly.
+    ///
+    /// The pending prefix goes with it: this is the config-reload clearing
+    /// site (`rebuild_bindings` calls it), and a buffer outliving the index it
+    /// was opened against is exactly the hot-reload bug the generation key
+    /// exists to prevent.
     pub(super) fn invalidate_focus_chain(&mut self) {
         self.chain_cache = None;
+        self.pending.clear();
+        self.stop_panel_timer();
     }
 
     /// S4 — run every surface's `on_key` hook, deepest first.
@@ -572,6 +763,26 @@ impl GodotVimCore {
             controller.set_engine_sticky_column(grapheme_col);
         }
     }
+}
+
+/// Turn Godot's incremental type-to-search on or off, returning the previous
+/// value.
+///
+/// `None` for a control that has no such setting — a Button, a
+/// `RichTextLabel`. Both `Tree` and `ItemList` expose it, and both are
+/// tried because both are `VNAV` surfaces in a dock.
+fn set_allow_search(control: &Gd<Control>, allow: bool) -> Option<bool> {
+    if let Ok(mut tree) = control.clone().try_cast::<Tree>() {
+        let previous = tree.get_allow_search();
+        tree.set_allow_search(allow);
+        return Some(previous);
+    }
+    if let Ok(mut list) = control.clone().try_cast::<ItemList>() {
+        let previous = list.get_allow_search();
+        list.set_allow_search(allow);
+        return Some(previous);
+    }
+    None
 }
 
 /// Translate Godot's selection extents into Vim anchor/head and forward to the

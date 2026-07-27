@@ -434,6 +434,52 @@ impl BindingIndex {
         })
     }
 
+    /// Whether `surface` reserves any bare key at all.
+    ///
+    /// The predicate that scopes `Tree::set_allow_search(false)`: a control
+    /// whose surface stack reserves nothing keeps Godot's incremental
+    /// type-to-search untouched, which is every control in the shipped
+    /// zero-config keyset.
+    pub(crate) fn reserves_any(&self, surface: SurfaceId) -> bool {
+        self.bindings(surface)
+            .is_some_and(|b| b.slot_of.iter().any(|(lhs, _)| lhs.len() > 1))
+    }
+
+    /// Every bare key `surface` reserves, in slot-allocation order, without
+    /// repeats.
+    ///
+    /// The introspector's source: a reservation that `:panelmap` cannot print
+    /// is exactly the silent dead key this whole design exists to prevent.
+    pub(crate) fn reservations(&self, surface: SurfaceId) -> Vec<KeyEvent> {
+        let mut out: Vec<KeyEvent> = Vec::new();
+        let Some(bindings) = self.bindings(surface) else {
+            return out;
+        };
+        for (lhs, _) in &bindings.slot_of {
+            if lhs.len() <= 1 {
+                continue;
+            }
+            let Some(&first) = lhs.first() else { continue };
+            if !out.contains(&first) {
+                out.push(first);
+            }
+        }
+        out
+    }
+
+    /// Every live multi-key rule on `surface` whose LHS starts with `first`.
+    ///
+    /// What `:panelmap <key>` prints under a reservation, so "this key is
+    /// consumed and waits" always comes with "…for these".
+    pub(crate) fn sequences_from(
+        &self,
+        surface: SurfaceId,
+        first: KeyEvent,
+    ) -> impl Iterator<Item = &Rule> + '_ {
+        self.rules_on(surface)
+            .filter(move |rule| rule.lhs.len() > 1 && rule.lhs.first() == Some(&first))
+    }
+
     /// Every live rule, in slot-allocation order.
     pub(crate) fn rules(&self) -> impl Iterator<Item = &Rule> + '_ {
         self.slots

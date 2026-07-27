@@ -28,6 +28,9 @@
 //! - [`resolve`] — the dispatch model itself, as a pure function: the
 //!   leaf→root candidate walk, the arbitration seam, and the consumption
 //!   fold. Takes no `Gd<T>` and calls no Godot API.
+//! - [`sequence`] — pending prefixes: the only state the shell plane holds
+//!   between keystrokes, and the reservation model that makes it safe on a
+//!   host with no replay channel.
 //! - [`introspect`] — `:panelmap`, which ships in the same commit as the
 //!   cutover because a config surface with no way to see what is bound is how
 //!   silent dead keys happen.
@@ -40,5 +43,6 @@ pub(crate) mod keys;
 pub(crate) mod outcome;
 pub(crate) mod providers;
 pub(crate) mod resolve;
+pub(crate) mod sequence;
 pub(crate) mod specs;
 pub(crate) mod surface;

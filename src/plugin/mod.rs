@@ -50,6 +50,18 @@ struct PendingTooltip {
     phase: TooltipPhase,
 }
 
+/// A `Tree`/`ItemList` whose incremental type-to-search is suppressed.
+///
+/// Godot's `Tree` type-searches on bare printable keys, so a reserved prefix
+/// key would otherwise do both jobs at once: buffer in the shell plane and
+/// start a type-search in the control. The previous value is carried rather
+/// than assumed, because the user (or the editor) may have turned search off
+/// already and restoring `true` would be a behaviour change we never made.
+struct SearchSuppression {
+    control: InstanceId,
+    previous: bool,
+}
+
 #[derive(GodotClass)]
 #[class(tool, base=Node)]
 pub struct GodotVimCore {
@@ -65,6 +77,20 @@ pub struct GodotVimCore {
     ui: crate::ui::UiCoordinator,
     /// Fires after `timeoutlen` ms to resolve partially-matched key mappings.
     mapping_timer: Option<Gd<Timer>>,
+    /// The shell plane's own timeout timer — see `init_panel_timer` for why
+    /// this is not `mapping_timer`.
+    panel_timer: Option<Gd<Timer>>,
+    /// The shell plane's pending prefix buffer.
+    ///
+    /// Empty unless the user bound a multi-key `panelmap`: the shipped keyset
+    /// reserves nothing, so this costs one `Option` compare per keystroke and
+    /// nothing else. Cleared on execute, no-match, timeout, focus-owner
+    /// change, plugin disable and config reload — deliberately **not** on echo.
+    pending: crate::actions::sequence::Pending,
+    /// The one control whose incremental type-to-search we turned off because
+    /// its surface reserves a bare prefix key. See
+    /// `input::GodotVimCore::sync_search_suppression`.
+    search_suppression: Option<SearchSuppression>,
     settings: Option<crate::settings::SettingsSnapshot>,
     /// Lazily created on first `:mappings` invocation.
     mapping_dialog: Option<Gd<crate::ui::mapping_dialog::MappingDialog>>,
@@ -128,6 +154,9 @@ impl INode for GodotVimCore {
             last_editor_id: None,
             ui: crate::ui::UiCoordinator::new(),
             mapping_timer: None,
+            panel_timer: None,
+            pending: crate::actions::sequence::Pending::default(),
+            search_suppression: None,
             settings: None,
             mapping_dialog: None,
             caret_reconciler: caret_reconcile::CaretReconciler::new(),
@@ -164,6 +193,7 @@ impl INode for GodotVimCore {
                 self.controller = Some(VimController::new());
                 self.init_settings();
                 self.init_mapping_timer();
+                self.init_panel_timer();
                 self.init_fs_explorer_callables();
                 self.wired = false;
                 self.apply_enabled_state();
@@ -188,7 +218,13 @@ impl INode for GodotVimCore {
         panic_guard("exit_tree:detach", || self.detach(), ());
         panic_guard("exit_tree:signals", || self.disconnect_editor_signals(), ());
         panic_guard("exit_tree:settings", || self.teardown_settings(), ());
+        // Before the timers are freed and while the controls still exist:
+        // `allow_search` lives on the focused `Tree`, which outlives the
+        // plugin, so leaving it off would break type-to-search for the rest of
+        // the editor session.
+        panic_guard("exit_tree:sequence", || self.clear_pending_sequence(), ());
         panic_guard("exit_tree:timer", || self.teardown_mapping_timer(), ());
+        panic_guard("exit_tree:panel_timer", || self.teardown_panel_timer(), ());
         panic_guard(
             "exit_tree:dialog",
             || {
@@ -272,6 +308,19 @@ impl GodotVimCore {
         if !self.enabled {
             return;
         }
+        // §5.10's focus-owner clearing site, and deliberately BEFORE the
+        // controller guard below: a pending prefix and a suppressed
+        // `allow_search` are shell-plane state, and must be released when the
+        // user tabs away whether or not a script is open. The per-keystroke
+        // check in `sync_search_suppression` cannot cover this on its own —
+        // focus can move with no keystroke at all, and the shell timer would
+        // then fire into a control the sequence was never typed at, leaving a
+        // `Tree` unable to type-search until the next key.
+        panic_guard(
+            "on_focus_changed:sequence",
+            || self.clear_pending_sequence(),
+            (),
+        );
         if self.controller.is_none() {
             return;
         }
@@ -689,6 +738,32 @@ impl GodotVimCore {
         }
     }
 
+    /// The shell plane's timeout. Deliberately **not** guarded on
+    /// `self.controller.is_some()`: the headline capability of the sequence
+    /// phase is that a dock prefix resolves with no script open, and a
+    /// controller guard here would reintroduce exactly the dependency the
+    /// separate timer exists to remove.
+    #[func]
+    fn on_panel_timeout(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let ok = panic_guard(
+            "on_panel_timeout",
+            || {
+                self.on_panel_timeout_impl();
+                true
+            },
+            false,
+        );
+        if !ok {
+            // No engine was involved, so the controller needs no recovery —
+            // but the shell plane's own state does, and `allow_search` in
+            // particular lives on a control that outlives the plugin.
+            self.clear_pending_sequence();
+        }
+    }
+
     #[func]
     fn on_caret_changed(&mut self) {
         if self.controller.is_none() {
@@ -955,6 +1030,11 @@ impl GodotVimCore {
             }
         } else {
             panic_guard("disable:detach", || self.detach(), ());
+            // §5.10 — `pending` clears on plugin disable, and the suppressed
+            // `allow_search` comes back with it. A disabled plugin that left a
+            // dock Tree unable to type-search would be an invisible,
+            // unattributable regression.
+            panic_guard("disable:sequence", || self.clear_pending_sequence(), ());
             panic_guard("disable:signals", || self.disconnect_editor_signals(), ());
             panic_guard("disable:floating", || self.teardown_floating_window_tracking(), ());
             panic_guard("disable:fs", || self.fs_explorer.cleanup(), ());
@@ -1099,6 +1179,13 @@ impl GodotVimCore {
         if let Some(timer) = self.mapping_timer.as_mut() {
             timer.stop();
         }
+        // The shell plane's own state, on the same unconditional footing: a
+        // pending prefix that survived a panic would resolve against an index
+        // the recovery may have rebuilt, and a suppressed `allow_search` that
+        // survived would leave a dock Tree unable to type-search with no
+        // plugin state left to explain it. This is the `panic_guard` recovery
+        // path the design names explicitly.
+        panic_guard("recover:sequence", || self.clear_pending_sequence(), ());
         // Always reset — trivially infallible, must happen regardless of
         // whether recovery itself panicked.
         self.caret_reconciler.reset();
@@ -1109,6 +1196,64 @@ impl GodotVimCore {
         // panic recovery context.
         self.pending_tooltip = None;
         self.base_mut().set_process(false);
+    }
+
+    /// Drop the shell plane's between-keystroke state, whole.
+    ///
+    /// One function for all four clearing sites (teardown, disable, panic
+    /// recovery, timeout failure) because the three pieces must always move
+    /// together: a buffer with no timer never resolves, and a timer with no
+    /// buffer fires into nothing.
+    pub(super) fn clear_pending_sequence(&mut self) {
+        self.pending.clear();
+        if let Some(timer) = self.panel_timer.as_mut() {
+            timer.stop();
+        }
+        self.restore_search_suppression();
+    }
+
+    /// How long the shell timer waits, in ms.
+    ///
+    /// See [`crate::actions::sequence::timeoutlen_ms`] for the priority order.
+    /// The `SettingsSnapshot` arm is not a nicety: with no controller reachable
+    /// at all the engine cannot be asked, and that is precisely the state — no
+    /// script open, docks the only thing on screen — in which a panel sequence
+    /// is the only thing the user can do.
+    fn shell_timeoutlen_ms(&self) -> i64 {
+        crate::actions::sequence::timeoutlen_ms(
+            self.controller.as_ref().map(VimController::timeoutlen),
+            self.settings.as_ref().map(|s| s.timeoutlen),
+        )
+    }
+
+    /// Arm the shell timer for one `timeoutlen`.
+    pub(super) fn arm_panel_timer(&mut self) {
+        let ms = self.shell_timeoutlen_ms();
+        let Some(timer) = self.panel_timer.as_mut() else {
+            // No timer means the buffer would never resolve. Better to drop it
+            // than to leave keys silently eaten forever.
+            log::warn!("sequence: no shell timer; dropping the pending prefix");
+            self.pending.clear();
+            return;
+        };
+        timer.set_wait_time(ms as f64 / 1000.0);
+        timer.start();
+        let buffered: String = self
+            .pending
+            .keys()
+            .iter()
+            .map(vim_core::keymap::KeyEvent::to_vim_notation)
+            .collect();
+        log::trace!(
+            "sequence: shell timer armed ({ms}ms) on {} with '{buffered}'",
+            self.pending.surface().unwrap_or("<none>")
+        );
+    }
+
+    pub(super) fn stop_panel_timer(&mut self) {
+        if let Some(timer) = self.panel_timer.as_mut() {
+            timer.stop();
+        }
     }
 
     fn cancel_pending_tooltip(&mut self) {
