@@ -33,6 +33,7 @@ pub(crate) static SEARCHBOX: SurfaceSpec = SurfaceSpec {
             .then_some(Anchor::Node(0))
     },
     on_key: None,
+    refuses_positional: false,
     yields_to_engine: false,
 };
 

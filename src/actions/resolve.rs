@@ -1,0 +1,1232 @@
+//! The resolver: stages S5 through S8 of the dispatch model, as a pure
+//! function.
+//!
+//! Nothing here takes a `Gd<T>`, allocates a Godot object or calls a Godot
+//! API. That is the entire point: this crate is a `cdylib` GDExtension and
+//! cannot construct a `Gd<InputEventKey>` under `cargo test`, so every
+//! decision that lives inside a Godot type is a decision verified by hand in
+//! a running editor. Everything Godot-shaped happens in exactly two places —
+//! [`super::surface::FocusChain::sample`] on the way in and
+//! `set_input_as_handled()` on the way out — and both are the transport's
+//! business, not this module's.
+//!
+//! The walk is leaf→root over the declared surface path. For each surface it
+//! tries the probe list in priority order, and the FIRST exact trie hit that
+//! survives the capability gate wins. Four things that ordering encodes, each
+//! of which used to be an `if` in the dispatcher:
+//!
+//! - **Depth is specificity.** `dock.filesystem` is walked before `dock`
+//!   because it declares `dock` as its parent, which is what gives the
+//!   FileSystem keyset first refusal — replacing the hardcoded
+//!   `if fs_result.is_consumed()` branch.
+//! - **A capability miss is a declination.** It is skipped as if the trie had
+//!   said `NoMatch` and the walk continues, which is how `h`/`l` go inert on
+//!   an `ItemList` with no widget class named anywhere here.
+//! - **`RuleTarget::Native` terminates the walk**, and is emphatically not an
+//!   action that declines: a declining action would fall through to `panel`'s
+//!   `Consumption::Void` rule and consume the key anyway, silently defeating
+//!   the give-it-back-to-Godot escape hatch.
+//! - **Consumption is computed downstream of the outcome**, from the winning
+//!   rule's declared policy, never by the action.
+//!
+//! See `docs/DESIGN-rebindable-nav.md` §5.6 through §5.9.
+
+use compact_str::CompactString;
+use vim_core::keymap::{KeyEvent, TrieLookup};
+
+use super::action::{ActionId, ActionRegistry, ActionSpec, Params, RuleTarget};
+use super::bind::{BindingIndex, Consumption, Repeat};
+use super::keys::Probes;
+use super::outcome::Outcome;
+use super::surface::{Seal, SurfaceId, SurfacePath};
+
+/// What the transport does with the keystroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Call `set_input_as_handled()` on THIS transport's viewport.
+    Consume,
+    /// Do not consume. Godot's own handling proceeds, which for the primary
+    /// transport means the key goes on to `gui_input` and the engine.
+    Ignore,
+}
+
+/// Where a matched rule sends the keystroke.
+#[derive(Debug, Clone)]
+pub(crate) enum CandidateTarget {
+    /// One of the plugin's own registered verbs. The spec is copied out of
+    /// the registry so no registry borrow survives into `run`.
+    Action(ActionId, &'static ActionSpec),
+    /// One of Godot's own registered editor shortcuts, by path.
+    Shortcut(CompactString),
+}
+
+/// Compared by identity, not structurally: `ActionSpec` holds a `fn` pointer,
+/// which has no meaningful equality, and the dotted id is the stable name the
+/// whole design addresses a verb by.
+impl PartialEq for CandidateTarget {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Action(a, sa), Self::Action(b, sb)) => a == b && sa.id == sb.id,
+            (Self::Shortcut(a), Self::Shortcut(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CandidateTarget {}
+
+/// One thing the resolver decided could run, with the policy that governs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    /// The surface whose trie held the rule. Reported by `:panelmap`.
+    pub(crate) surface: SurfaceId,
+    pub(crate) target: CandidateTarget,
+    pub(crate) params: Params,
+    pub(crate) consume: Consumption,
+    pub(crate) repeat: Repeat,
+}
+
+/// Why the walk produced nothing.
+///
+/// A reason rather than a bare `None` because the introspector's whole job is
+/// to answer "why is my key dead?", and every one of these is a different
+/// answer with a different fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// The anchor surface is a `Barrier` — `foreign`, or the editor in an
+    /// insert-like mode. Nothing is intercepted there, ever.
+    Barrier,
+    /// A `Sealed` anchor swallowed a BARE key, which then falls through to
+    /// the control's own `gui_input`. A modifier-bearing key would have
+    /// continued to the forest root.
+    Sealed(SurfaceId),
+    /// A rule said `native` on this surface: the key is Godot's.
+    Native(SurfaceId),
+    /// The anchor yields to the engine and the engine claims this key — the
+    /// user's own `:map` wins.
+    Yielded(KeyEvent),
+    /// The whole path was walked and nothing matched.
+    Exhausted,
+}
+
+/// The resolver's verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolution {
+    /// Nothing to run, and why.
+    None(Stop),
+    /// Run these, deepest surface first, until one does not decline.
+    Run {
+        /// The probe that produced the match. S6 is evaluated on THIS key and
+        /// not on a re-derivation from the logical keycode: on a non-Latin
+        /// layout the two differ, and asking about the wrong one is what used
+        /// to deny Cyrillic users panel navigation from inside the editor.
+        matched: KeyEvent,
+        candidates: Vec<Candidate>,
+    },
+}
+
+/// Everything the resolver reads. Borrowed, never owned, and all of it plain
+/// data — a test constructs one from literals.
+pub(crate) struct ResolveInput<'a> {
+    pub(crate) probes: &'a Probes,
+    pub(crate) path: &'a SurfacePath,
+    pub(crate) index: &'a BindingIndex,
+    pub(crate) registry: &'a ActionRegistry,
+    /// `VimController::could_start_mapping`, inverted polarity included.
+    ///
+    /// The transport passes
+    /// `|k| controller.as_ref().is_some_and(|c| c.could_start_mapping(k))`,
+    /// which is the `is_none_or` at the old `input.rs:116` with the predicate
+    /// negated on both sides. Getting that flip wrong stops the plugin
+    /// navigating panels in exactly the state where nothing else can either:
+    /// no controller must mean INTERCEPT.
+    pub(crate) vim_claims: &'a dyn Fn(KeyEvent) -> bool,
+}
+
+/// Whether the vim engine claims `key` — the `vim_claims` predicate, with the
+/// polarity flip written down once.
+///
+/// The old dispatcher read
+/// `should_intercept = controller.is_none_or(|c| !c.could_start_mapping(k))`.
+/// Negating both sides gives `claims = controller.is_some_and(|c|
+/// c.could_start_mapping(k))`, and it is `is_some_and` — **not** `is_none_or`
+/// — precisely because the predicate inside was negated too. Get it backwards
+/// and "no controller" starts meaning "the engine claims everything", which
+/// stops the plugin navigating panels in exactly the state where nothing else
+/// can either: no script open, no controller attached, docks the only thing
+/// on screen.
+///
+/// Generic over the controller so the polarity is testable without a Godot
+/// runtime; the transport instantiates it at
+/// `VimController::could_start_mapping`.
+pub(crate) fn engine_claims<C>(
+    controller: Option<&C>,
+    key: KeyEvent,
+    could_start_mapping: impl Fn(&C, KeyEvent) -> bool,
+) -> bool {
+    controller.is_some_and(|c| could_start_mapping(c, key))
+}
+
+/// Resolve one keystroke against one surface path.
+pub(crate) fn resolve(input: &ResolveInput<'_>) -> Resolution {
+    // S3 — the barrier is a total hard stop. No hook, no lookup, no ancestor.
+    if input.path.seal == Seal::Barrier {
+        return Resolution::None(Stop::Barrier);
+    }
+
+    let (candidates, matched) = match walk_path(input) {
+        Ok(hit) => hit,
+        Err(stop) => return Resolution::None(stop),
+    };
+
+    // S6 — the editor arbitration seam. One gate, on the anchor surface,
+    // after resolution has produced a winner and before anything executes.
+    if input.path.anchor_yields_to_engine && (input.vim_claims)(matched) {
+        log::trace!("resolve: yielding {matched} to the vim engine");
+        return Resolution::None(Stop::Yielded(matched));
+    }
+
+    Resolution::Run {
+        matched,
+        candidates,
+    }
+}
+
+/// The leaf→root candidate walk (S5).
+fn walk_path(input: &ResolveInput<'_>) -> Result<(Vec<Candidate>, KeyEvent), Stop> {
+    // The positional probe is opt-in twice over: a rule on this surface must
+    // carry `<physical>`, AND the anchor must not refuse it wholesale.
+    let anchor_allows = !input.path.anchor_refuses_positional;
+
+    for &surface in &input.path.ids {
+        let positional = anchor_allows && input.index.has_physical_rule(surface);
+        for probe in input.probes.iter_scoped(positional) {
+            let TrieLookup::ExactOnly(entry) = input.index.lookup(surface, &[probe]) else {
+                // `Prefix` belongs to the sequence phase; `NoMatch` and any
+                // future variant are simply misses. Either way the next probe
+                // gets its turn, then the next surface.
+                continue;
+            };
+            let Some(rule) = BindingIndex::slot_in(entry).and_then(|s| input.index.rule_at(s))
+            else {
+                // A live trie entry with no live rule is a programming error
+                // in the index, not a user-reachable state. Treat it as a
+                // miss rather than consuming a key with nothing behind it.
+                log::error!("resolve: {surface} has a trie entry with no rule for {probe}");
+                continue;
+            };
+            match &rule.target {
+                // Terminates. NOT a declining action: a declining action
+                // would fall through to `panel`'s Void rule and consume.
+                RuleTarget::Native => return Err(Stop::Native(surface)),
+                RuleTarget::Action(id) => {
+                    let Some(spec) = input.registry.get(*id) else {
+                        log::error!("resolve: {surface} binds unregistered action id {}", id.0);
+                        continue;
+                    };
+                    // The capability gate, and the whole replacement for
+                    // `matches!(dock_kind, DockKind::Tree)`. A miss is skipped
+                    // AS IF NoMatch — the walk continues to the parent.
+                    if !input.path.caps.satisfies(spec.requires) {
+                        log::trace!(
+                            "resolve: {} gated out on {surface} — needs {:?}, path offers {:?}",
+                            spec.id,
+                            spec.requires,
+                            input.path.caps
+                        );
+                        continue;
+                    }
+                    return Ok((
+                        vec![Candidate {
+                            surface,
+                            target: CandidateTarget::Action(*id, spec),
+                            params: rule.params.clone(),
+                            consume: rule.consume,
+                            repeat: rule.repeat,
+                        }],
+                        probe,
+                    ));
+                }
+                // No `ActionSpec`, therefore no `requires`, therefore no
+                // capability gate. Stated so it reads as a decision.
+                RuleTarget::Shortcut(path) => {
+                    return Ok((
+                        vec![Candidate {
+                            surface,
+                            target: CandidateTarget::Shortcut(path.clone()),
+                            params: rule.params.clone(),
+                            consume: rule.consume,
+                            repeat: rule.repeat,
+                        }],
+                        probe,
+                    ));
+                }
+            }
+        }
+        // The seal is the deepest surface's, so this can only fire once —
+        // after the anchor has refused. One rule, three behaviours: `<CR>`
+        // still reaches the FS prompt's `text_submitted`, typing in a dock
+        // filter box still types, and Ctrl+hjkl still escapes both.
+        if input.path.seal == Seal::Sealed && !input.probes.has_command_modifier() {
+            return Err(Stop::Sealed(surface));
+        }
+    }
+    Err(Stop::Exhausted)
+}
+
+/// S7 and S8 — run the plan and compute consumption from it.
+///
+/// `run` is injected so the fold is testable without a Godot runtime; the
+/// transport passes a closure that builds an `ActionCtx` and calls the spec.
+///
+/// Consumption is computed **downstream** of the outcome, from the rule's
+/// declared policy — never by the action, which is the fifth joint the old
+/// match arms fused.
+pub(crate) fn dispose(
+    candidates: &[Candidate],
+    is_echo: bool,
+    mut run: impl FnMut(&Candidate) -> Outcome,
+) -> Disposition {
+    for candidate in candidates {
+        if is_echo && candidate.repeat == Repeat::Suppress {
+            // Consume WITHOUT running. Returning `Ignore` would leak the
+            // repeated Ctrl+J to Godot's own handling, which today's
+            // unconditional `set_input_as_handled()` never does; running it
+            // would queue a ~20/s storm of deferred `grab_focus` calls.
+            log::trace!("dispose: echo suppressed on {}", candidate.surface);
+            return Disposition::Consume;
+        }
+        let outcome = run(candidate);
+        if candidate.consume == Consumption::Void {
+            // Consumes AND terminates, even on `Declined`, even when `run`
+            // short-circuited because there was no target at all. This is the
+            // declarative form of the old `input.rs:126-134`, where
+            // `handle_window_nav`'s result was discarded and the key consumed
+            // regardless. Making it conditional leaks Ctrl+H/J/K/L to Godot.
+            return Disposition::Consume;
+        }
+        if outcome.is_consumed() {
+            return Disposition::Consume;
+        }
+        // Declined + Elastic → the next candidate, and if there is none, the
+        // key is not consumed and reaches Godot. That is what preserves `j`
+        // at the end of a list and Enter with nothing selected.
+    }
+    Disposition::Ignore
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::bind::{builtin_index, Rule};
+    use crate::actions::caps::Caps;
+    use crate::actions::specs;
+    use crate::actions::surface::{Anchor, Forest, SurfacePath};
+    use vim_core::keymap::{Key as VimKey, MappingOwner, Modifiers};
+
+    fn registry() -> ActionRegistry {
+        let mut r = ActionRegistry::new();
+        for spec in specs::SHIPPED {
+            r.register(spec);
+        }
+        r
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(VimKey::Char(c), Modifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(VimKey::Char(c), Modifiers::CTRL)
+    }
+
+    fn named(k: VimKey) -> KeyEvent {
+        KeyEvent::new(k, Modifiers::NONE)
+    }
+
+    fn probes(keys: &[KeyEvent]) -> Probes {
+        Probes::from_slice(keys)
+    }
+
+    /// A path as the forest would produce it, with the caps spelled out.
+    fn path(leaf: &'static str, caps: Caps) -> SurfacePath {
+        let forest = crate::actions::providers::forest();
+        let spec = forest.get(leaf).expect("declared surface");
+        SurfacePath {
+            ids: forest.path_from(leaf),
+            anchor: Anchor::Node(0),
+            caps,
+            seal: spec.seal,
+            anchor_yields_to_engine: spec.yields_to_engine,
+            anchor_refuses_positional: spec.refuses_positional,
+        }
+    }
+
+    const NEVER: &dyn Fn(KeyEvent) -> bool = &|_| false;
+    const ALWAYS: &dyn Fn(KeyEvent) -> bool = &|_| true;
+
+    fn run_on(p: &SurfacePath, keys: &[KeyEvent], claims: &dyn Fn(KeyEvent) -> bool) -> Resolution {
+        resolve_with(p, &probes(keys), claims)
+    }
+
+    /// As `run_on`, but with the LAST probe marked positional — the shape a
+    /// Dvorak / Colemak / AZERTY / QWERTZ keystroke really produces.
+    fn run_positional(
+        p: &SurfacePath,
+        keys: &[KeyEvent],
+        claims: &dyn Fn(KeyEvent) -> bool,
+    ) -> Resolution {
+        resolve_with(p, &Probes::from_slice_positional(keys), claims)
+    }
+
+    fn resolve_with(
+        p: &SurfacePath,
+        probes: &Probes,
+        claims: &dyn Fn(KeyEvent) -> bool,
+    ) -> Resolution {
+        let index = builtin_index(&registry());
+        let reg = registry();
+        resolve(&ResolveInput {
+            probes,
+            path: p,
+            index: &index,
+            registry: &reg,
+            vim_claims: claims,
+        })
+    }
+
+    fn action_of(res: &Resolution) -> Option<&'static str> {
+        match res {
+            Resolution::Run { candidates, .. } => match candidates.first()?.target {
+                CandidateTarget::Action(_, spec) => Some(spec.id),
+                CandidateTarget::Shortcut(_) => None,
+            },
+            Resolution::None(_) => None,
+        }
+    }
+
+    fn stop_of(res: &Resolution) -> Option<Stop> {
+        match res {
+            Resolution::None(stop) => Some(*stop),
+            Resolution::Run { .. } => None,
+        }
+    }
+
+    const TREE: Caps = Caps::VNAV.union(Caps::HIERARCHY).union(Caps::ACTIVATE);
+    const LIST: Caps = Caps::VNAV.union(Caps::ACTIVATE);
+
+    // ── The precedence table (§5.9), one row at a time ───────────────
+
+    #[test]
+    fn row3_a_barrier_resolves_nothing() {
+        // `foreign` and `editor.insert`. Ctrl+H is backspace in Insert mode
+        // and belongs to whatever text input has focus in a foreign control.
+        for leaf in ["foreign", "editor.insert"] {
+            let p = path(leaf, Caps::TEXTENTRY);
+            assert_eq!(
+                stop_of(&run_on(&p, &[ctrl('h')], NEVER)),
+                Some(Stop::Barrier),
+                "{leaf} must intercept nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn row4_the_deepest_surface_wins() {
+        // `d` is bound on dock.filesystem and nowhere else; `j` is bound on
+        // `dock`, the parent, and the walk reaches it. That depth IS the
+        // FileSystem-first refusal the old `if fs_result.is_consumed()` gave.
+        let fs = path("dock.filesystem", TREE | Caps::FILEOPS);
+        assert_eq!(
+            action_of(&run_on(&fs, &[ch('d')], NEVER)),
+            Some("godotvim.fs.delete")
+        );
+        assert_eq!(
+            action_of(&run_on(&fs, &[ch('j')], NEVER)),
+            Some("godotvim.item.next")
+        );
+    }
+
+    #[test]
+    fn row4_a_plain_dock_never_reaches_the_filesystem_keyset() {
+        let dock = path("dock", TREE);
+        assert_eq!(
+            stop_of(&run_on(&dock, &[ch('d')], NEVER)),
+            Some(Stop::Exhausted)
+        );
+        assert_eq!(
+            stop_of(&run_on(&dock, &[ch('a')], NEVER)),
+            Some(Stop::Exhausted)
+        );
+    }
+
+    #[test]
+    fn row5_the_as_typed_probe_beats_the_positional_one() {
+        // The user typed `/`; a physical position of `j` must not win. This
+        // is the shadowing bug that motivated one probe list per keyset.
+        let dock = path("dock", TREE);
+        assert_eq!(
+            action_of(&run_positional(&dock, &[ch('/'), ch('j')], NEVER)),
+            Some("godotvim.dock.search")
+        );
+    }
+
+    #[test]
+    fn row5_a_later_probe_recovers_a_non_latin_layout() {
+        let dock = path("dock", TREE);
+        assert_eq!(
+            action_of(&run_on(&dock, &[ch('о'), ch('j')], NEVER)),
+            Some("godotvim.item.next")
+        );
+    }
+
+    #[test]
+    fn row5_the_positional_probe_is_offered_only_where_a_rule_asks_for_it() {
+        // `dock <CR>` carries no `<physical>`, so a positional Enter cannot
+        // synthesize an activation the user never pressed. The rules that DO
+        // carry it keep working.
+        let dock = path("dock", TREE);
+        assert_eq!(
+            action_of(&run_positional(&dock, &[ch('z'), ch('j')], NEVER)),
+            Some("godotvim.item.next")
+        );
+    }
+
+    #[test]
+    fn row6_a_sealed_anchor_swallows_a_bare_key_and_passes_a_chord() {
+        let search = path("searchbox", Caps::TEXTENTRY);
+        // Typing into the filter box must reach the LineEdit.
+        assert_eq!(
+            stop_of(&run_on(&search, &[ch('x')], NEVER)),
+            Some(Stop::Sealed("searchbox"))
+        );
+        // Ctrl+hjkl escapes a filter box unconditionally.
+        assert_eq!(
+            action_of(&run_on(&search, &[ctrl('l')], NEVER)),
+            Some("godotvim.focus.right")
+        );
+    }
+
+    #[test]
+    fn row6_the_prompt_is_sealed_with_no_rules_at_all() {
+        // Bare `<CR>` stays unbound so `text_submitted` still fires, and bare
+        // `<Esc>` reaches the prompt's own `gui_input` transport.
+        let prompt = path("prompt", Caps::TEXTENTRY);
+        for key in [named(VimKey::Enter), named(VimKey::Escape), ch('a')] {
+            assert_eq!(
+                stop_of(&run_on(&prompt, &[key], NEVER)),
+                Some(Stop::Sealed("prompt")),
+                "{key} must reach the prompt LineEdit"
+            );
+        }
+        assert_eq!(
+            action_of(&run_on(&prompt, &[ctrl('k')], NEVER)),
+            Some("godotvim.focus.up")
+        );
+    }
+
+    #[test]
+    fn row7_a_capability_miss_skips_the_candidate_and_walks_on() {
+        // `l` needs HIERARCHY, which an ItemList does not offer. No widget
+        // class is named anywhere in the resolver to make this happen.
+        let list = path("dock", LIST);
+        assert_eq!(
+            stop_of(&run_on(&list, &[ch('l')], NEVER)),
+            Some(Stop::Exhausted)
+        );
+        let tree = path("dock", TREE);
+        assert_eq!(
+            action_of(&run_on(&tree, &[ch('l')], NEVER)),
+            Some("godotvim.item.expand")
+        );
+    }
+
+    #[test]
+    fn row7_a_rich_text_label_keeps_vertical_navigation() {
+        // The docs panel and the Output log are focusable RichTextLabels and
+        // j/k scroll them today. A "has a list" capability would have killed
+        // both silently.
+        let docs = path("dock", Caps::VNAV);
+        assert_eq!(
+            action_of(&run_on(&docs, &[ch('j')], NEVER)),
+            Some("godotvim.item.next")
+        );
+        // …but Enter has nothing to activate there.
+        assert_eq!(
+            stop_of(&run_on(&docs, &[named(VimKey::Enter)], NEVER)),
+            Some(Stop::Exhausted)
+        );
+    }
+
+    #[test]
+    fn row10_native_terminates_the_walk_instead_of_falling_through() {
+        // The distinction the design calls load-bearing: modelled as a
+        // declining action, `native` would fall through to `panel`'s Void
+        // rule and consume the key anyway.
+        let mut index = builtin_index(&registry());
+        index.upsert(Rule {
+            surface: "dock",
+            lhs: vec![ctrl('h')],
+            target: RuleTarget::Native,
+            params: Params::new(),
+            consume: Consumption::Elastic,
+            repeat: Repeat::Allow,
+            physical: false,
+            shift_tolerant: false,
+            nowait: false,
+            owner: MappingOwner::User,
+            desc: "give it back".into(),
+        });
+        let reg = registry();
+        let p = path("dock", TREE);
+        let probes = probes(&[ctrl('h')]);
+        let res = resolve(&ResolveInput {
+            probes: &probes,
+            path: &p,
+            index: &index,
+            registry: &reg,
+            vim_claims: NEVER,
+        });
+        assert_eq!(stop_of(&res), Some(Stop::Native("dock")));
+    }
+
+    #[test]
+    fn row11_the_editor_yields_a_key_the_engine_claims() {
+        let editor = path("editor.nav", Caps::empty());
+        // Without a user mapping the panel chord wins.
+        assert_eq!(
+            action_of(&run_on(&editor, &[ctrl('h')], NEVER)),
+            Some("godotvim.focus.left")
+        );
+        // With one, the user's `:map` wins and the key flows to gui_input.
+        assert_eq!(
+            stop_of(&run_on(&editor, &[ctrl('h')], ALWAYS)),
+            Some(Stop::Yielded(ctrl('h')))
+        );
+    }
+
+    #[test]
+    fn row11_arbitration_is_evaluated_on_the_key_that_matched() {
+        // Cyrillic: probe 1 is `<C-х>`, probe 2 recovers `<C-h>`. The engine
+        // must be asked about `<C-h>` — the one we would consume — not about
+        // the raw logical key, which is what used to deny Cyrillic users
+        // panel navigation from inside the editor.
+        let editor = path("editor.nav", Caps::empty());
+        let claims_h: &dyn Fn(KeyEvent) -> bool = &|k| k == ctrl('h');
+        assert_eq!(
+            stop_of(&run_on(&editor, &[ctrl('х'), ctrl('h')], claims_h)),
+            Some(Stop::Yielded(ctrl('h')))
+        );
+    }
+
+    #[test]
+    fn row11_only_the_editor_ever_asks_the_engine() {
+        // A key pressed while a Tree has focus is none of the engine's
+        // business, even when the engine would claim it.
+        let dock = path("dock", TREE);
+        assert_eq!(
+            action_of(&run_on(&dock, &[ctrl('h')], ALWAYS)),
+            Some("godotvim.focus.left")
+        );
+    }
+
+    // ── The arbitration polarity ─────────────────────────────────────
+
+    #[test]
+    fn no_controller_means_intercept() {
+        // THE flip. `is_none_or(|c| !claims)` inverted is
+        // `is_some_and(|c| claims)`, and writing `is_none_or` here instead
+        // would make a detached plugin yield every panel chord to an engine
+        // that is not there — no script open, docks the only thing on screen,
+        // and Ctrl+hjkl dead.
+        let never_asked = |_: &(), _: KeyEvent| panic!("must not consult a missing controller");
+        assert!(!engine_claims(None::<&()>, ctrl('h'), never_asked));
+    }
+
+    #[test]
+    fn a_controller_that_claims_the_key_wins() {
+        assert!(engine_claims(Some(&()), ctrl('h'), |_, _| true));
+        assert!(!engine_claims(Some(&()), ctrl('h'), |_, _| false));
+    }
+
+    #[test]
+    fn arbitration_asks_about_the_matched_key_only() {
+        // `could_start_mapping` covers prefixes as well as exact matches
+        // (`TrieLookup::Prefix != NoMatch`), so a user with
+        // `:nnoremap <C-h><C-h> …` keeps the key. The predicate is opaque to
+        // the resolver; what this pins is that it is called with the key that
+        // MATCHED and with nothing else.
+        let editor = path("editor.nav", Caps::empty());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let record: &dyn Fn(KeyEvent) -> bool = &|k| {
+            seen.borrow_mut().push(k);
+            false
+        };
+        run_on(&editor, &[ctrl('h')], record);
+        assert_eq!(seen.into_inner(), vec![ctrl('h')]);
+    }
+
+    #[test]
+    fn a_barrier_never_asks_the_engine_at_all() {
+        // Insert mode is a barrier, and Ctrl+H there is backspace. Asking the
+        // engine would be harmless; resolving at all would not be.
+        let insert = path("editor.insert", Caps::empty());
+        let never = |_: &(), _: KeyEvent| panic!("a barrier must not resolve");
+        assert!(!engine_claims(None::<&()>, ctrl('h'), never));
+        assert_eq!(
+            stop_of(&run_on(&insert, &[ctrl('h')], ALWAYS)),
+            Some(Stop::Barrier)
+        );
+    }
+
+    // ── The positional refusal (the P1 regression guard) ─────────────
+
+    #[test]
+    fn the_editor_refuses_the_positional_probe() {
+        // THE Dvorak guard. The QWERTY-H position emits `d`, so a Dvorak user
+        // pressing Ctrl+d produces probes [<C-d>, <C-h>]. Honouring the
+        // positional probe here converts half-page-down into panel-left.
+        let editor = path("editor.nav", Caps::empty());
+        assert_eq!(
+            stop_of(&run_positional(&editor, &[ctrl('d'), ctrl('h')], NEVER)),
+            Some(Stop::Exhausted),
+            "Ctrl+d in the editor must stay half-page-down"
+        );
+        // Colemak does the same to Ctrl+n (jump-forward) and Ctrl+e (scroll).
+        for chord in [ctrl('n'), ctrl('e')] {
+            assert_eq!(
+                stop_of(&run_positional(&editor, &[chord, ctrl('j')], NEVER)),
+                Some(Stop::Exhausted),
+                "{chord} in the editor must reach the engine"
+            );
+        }
+        // Every other surface honours it — that is what gives a Dvorak user
+        // cross-panel navigation by position from a dock.
+        let dock = path("dock", TREE);
+        assert_eq!(
+            action_of(&run_positional(&dock, &[ctrl('d'), ctrl('h')], NEVER)),
+            Some("godotvim.focus.left")
+        );
+    }
+
+    #[test]
+    fn the_editor_still_gets_the_latin_probe() {
+        // Refusing probe 3 must not cost probe 2: a Cyrillic Ctrl+х carries
+        // `latin_key`, which collapses to `<C-h>` as an ordinary (non
+        // positional) probe, so panel navigation from the editor survives.
+        let editor = path("editor.nav", Caps::empty());
+        assert_eq!(
+            action_of(&run_on(&editor, &[ctrl('х'), ctrl('h')], NEVER)),
+            Some("godotvim.focus.left")
+        );
+    }
+
+    // ── Consumption (§5.8) ───────────────────────────────────────────
+
+    fn void_plan() -> Vec<Candidate> {
+        vec![Candidate {
+            surface: "panel",
+            target: CandidateTarget::Action(ActionId(0), &specs::FOCUS_LEFT),
+            params: Params::new(),
+            consume: Consumption::Void,
+            repeat: Repeat::Suppress,
+        }]
+    }
+
+    fn elastic_plan() -> Vec<Candidate> {
+        vec![Candidate {
+            surface: "dock",
+            target: CandidateTarget::Action(ActionId(0), &specs::ITEM_NEXT),
+            params: Params::new(),
+            consume: Consumption::Elastic,
+            repeat: Repeat::Allow,
+        }]
+    }
+
+    #[test]
+    fn void_consumes_even_when_the_action_declines() {
+        // The no-focus-owner case, verbatim: `handle_window_nav` was never
+        // called and `set_input_as_handled()` fired anyway. Making this
+        // conditional leaks Ctrl+H/J/K/L to Godot.
+        let mut ran = 0;
+        let d = dispose(&void_plan(), false, |_| {
+            ran += 1;
+            Outcome::Declined
+        });
+        assert_eq!(d, Disposition::Consume);
+        assert_eq!(ran, 1, "Void still runs the action; it ignores the answer");
+    }
+
+    #[test]
+    fn elastic_does_not_consume_a_declination() {
+        // `j` at the end of an ItemList: Godot's own type-to-search and
+        // arrow handling must still see the key.
+        let d = dispose(&elastic_plan(), false, |_| Outcome::Declined);
+        assert_eq!(d, Disposition::Ignore);
+    }
+
+    #[test]
+    fn elastic_consumes_an_acceptance() {
+        for outcome in [Outcome::Handled, Outcome::FocusChanged] {
+            assert_eq!(
+                dispose(&elastic_plan(), false, |_| outcome),
+                Disposition::Consume
+            );
+        }
+    }
+
+    #[test]
+    fn declination_falls_through_to_the_next_candidate() {
+        let mut plan = elastic_plan();
+        plan.extend(void_plan());
+        let mut ran = Vec::new();
+        let d = dispose(&plan, false, |c| {
+            ran.push(c.surface);
+            Outcome::Declined
+        });
+        assert_eq!(ran, vec!["dock", "panel"], "the walk must continue");
+        assert_eq!(d, Disposition::Consume, "…and Void still terminates it");
+    }
+
+    #[test]
+    fn an_exhausted_plan_consumes_nothing() {
+        assert_eq!(
+            dispose(&[], false, |_| Outcome::Handled),
+            Disposition::Ignore
+        );
+    }
+
+    #[test]
+    fn a_suppressed_echo_consumes_without_running() {
+        let mut ran = 0;
+        let d = dispose(&void_plan(), true, |_| {
+            ran += 1;
+            Outcome::Handled
+        });
+        assert_eq!(d, Disposition::Consume, "an echo must not leak to Godot");
+        assert_eq!(ran, 0, "…and must not queue another grab_focus");
+    }
+
+    #[test]
+    fn an_allowed_echo_runs_normally() {
+        // Held `j`/`k` auto-repeat in a dock is desirable and is preserved.
+        let mut ran = 0;
+        let d = dispose(&elastic_plan(), true, |_| {
+            ran += 1;
+            Outcome::Handled
+        });
+        assert_eq!(d, Disposition::Consume);
+        assert_eq!(ran, 1);
+    }
+
+    // ── The full shipped default set, resolved ───────────────────────
+
+    #[test]
+    fn the_four_panel_chords_resolve_from_every_non_barrier_surface() {
+        let wanted = [
+            (ctrl('h'), "godotvim.focus.left"),
+            (ctrl('j'), "godotvim.focus.down"),
+            (ctrl('k'), "godotvim.focus.up"),
+            (ctrl('l'), "godotvim.focus.right"),
+        ];
+        for leaf in [
+            "dock.filesystem",
+            "dock",
+            "searchbox",
+            "prompt",
+            "unknown",
+            "panel",
+            "editor.nav",
+        ] {
+            let p = path(leaf, Caps::all());
+            for (key, id) in wanted {
+                assert_eq!(
+                    action_of(&run_on(&p, &[key], NEVER)),
+                    Some(id),
+                    "{key} must reach {id} from {leaf}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_panel_chords_are_void_and_norepeat_wherever_they_resolve() {
+        let p = path("unknown", Caps::empty());
+        let Resolution::Run { candidates, .. } = run_on(&p, &[ctrl('h')], NEVER) else {
+            panic!("Ctrl+h must resolve with no focus owner at all");
+        };
+        assert_eq!(candidates[0].consume, Consumption::Void);
+        assert_eq!(candidates[0].repeat, Repeat::Suppress);
+        assert_eq!(candidates[0].surface, "panel");
+    }
+
+    #[test]
+    fn the_filesystem_keyset_needs_fileops() {
+        // Without the grant, `panelmap dock a godotvim.fs.create` on a Scene
+        // tree would create files at res:// root.
+        let no_grant = SurfacePath {
+            caps: TREE,
+            ..path("dock.filesystem", TREE)
+        };
+        for key in ['a', 'd', 'r', 'y', 'R'] {
+            assert_eq!(
+                stop_of(&run_on(&no_grant, &[ch(key)], NEVER)),
+                Some(Stop::Exhausted),
+                "{key} must be gated out without FILEOPS"
+            );
+        }
+    }
+
+    #[test]
+    fn the_search_box_tolerates_shift_where_a_dock_does_not() {
+        let search = path("searchbox", Caps::TEXTENTRY);
+        let shift_enter = KeyEvent::new(VimKey::Enter, Modifiers::SHIFT);
+        assert_eq!(
+            action_of(&run_on(&search, &[shift_enter], NEVER)),
+            Some("godotvim.search.accept")
+        );
+        let dock = path("dock", TREE);
+        assert_eq!(
+            stop_of(&run_on(&dock, &[shift_enter], NEVER)),
+            Some(Stop::Exhausted),
+            "Shift+Enter is inert in a dock"
+        );
+    }
+
+    #[test]
+    fn every_shipped_default_resolves_to_a_registered_verb() {
+        // Anti-drift: a default that loads but names nothing is a key that
+        // consumes and does nothing.
+        let index = builtin_index(&registry());
+        let reg = registry();
+        assert!(!index.is_empty());
+        for rule in index.rules() {
+            let RuleTarget::Action(id) = rule.target else {
+                continue;
+            };
+            assert!(
+                reg.get(id).is_some(),
+                "{:?} on {} names no spec",
+                rule.lhs,
+                rule.surface
+            );
+        }
+    }
+
+    #[test]
+    fn the_forest_audit_is_clean() {
+        let errors = Forest::audit(&crate::actions::providers::forest());
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    // ── Chain → classify → resolve, the way the dispatcher does it ───
+    //
+    // Everything above builds a `SurfacePath` by hand. These start from a
+    // literal `FocusChain` and go through the real classifier, which is what
+    // catches a surface whose probe and whose rules disagree.
+
+    mod end_to_end {
+        use super::*;
+        use crate::actions::surface::fixtures::{code_edit, id, item_list, plain, tree};
+        use crate::actions::surface::FocusChain;
+        use vim_core::primitives::{Mode, Operator, VisualType};
+
+        const ATTACHED: i64 = 7;
+
+        fn editor(mode: Option<Mode>) -> FocusChain {
+            FocusChain {
+                nodes: vec![code_edit(ATTACHED), plain("CodeTextEditor", 8)],
+                attached_editor: Some(id(ATTACHED)),
+                editor_mode: mode,
+                ..Default::default()
+            }
+        }
+
+        fn resolve_chain(
+            chain: &FocusChain,
+            keys: &[KeyEvent],
+            claims: &dyn Fn(KeyEvent) -> bool,
+        ) -> Resolution {
+            let path = crate::actions::providers::forest()
+                .classify(chain)
+                .expect("the shipped forest is total");
+            resolve_with(&path, &Probes::from_slice(keys), claims)
+        }
+
+        #[test]
+        fn insert_like_modes_never_intercept_the_panel_chords() {
+            // Ctrl+H is backspace, Ctrl+J is newline, Ctrl+K is a digraph.
+            // Select is in this list deliberately: it is insert-like, and
+            // treating it as a nav mode would make Ctrl+H navigate panels
+            // while the user is replacing a selection.
+            for mode in [
+                Mode::Insert,
+                Mode::Replace,
+                Mode::VirtualReplace,
+                Mode::CommandLine,
+                Mode::Select(VisualType::Char),
+                Mode::Select(VisualType::Line),
+                Mode::Select(VisualType::Block),
+            ] {
+                for key in [ctrl('h'), ctrl('j'), ctrl('k'), ctrl('l')] {
+                    assert_eq!(
+                        stop_of(&resolve_chain(&editor(Some(mode)), &[key], NEVER)),
+                        Some(Stop::Barrier),
+                        "{mode:?} must not intercept {key}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn nav_modes_do_intercept_the_panel_chords() {
+            for mode in [
+                Mode::Normal,
+                Mode::Visual(VisualType::Char),
+                Mode::OperatorPending(Operator::Delete),
+            ] {
+                assert_eq!(
+                    action_of(&resolve_chain(&editor(Some(mode)), &[ctrl('h')], NEVER)),
+                    Some("godotvim.focus.left"),
+                    "{mode:?} must navigate"
+                );
+            }
+        }
+
+        #[test]
+        fn no_controller_at_all_still_intercepts() {
+            // `editor_mode == None` maps to `editor.nav`, not to the barrier
+            // — the `is_none_or` polarity, seen from the surface side.
+            assert_eq!(
+                action_of(&resolve_chain(&editor(None), &[ctrl('h')], NEVER)),
+                Some("godotvim.focus.left")
+            );
+        }
+
+        #[test]
+        fn a_foreign_text_input_is_never_touched() {
+            // A Project Settings LineEdit: no sibling nav control, so it is
+            // `foreign`, so it is a Barrier. Consuming Ctrl+H mid-word is the
+            // regression this exists to prevent.
+            let foreign = FocusChain {
+                nodes: vec![
+                    crate::actions::surface::fixtures::line_edit(1),
+                    plain("VBoxContainer", 2),
+                ],
+                ..Default::default()
+            };
+            for key in [ctrl('h'), ch('j'), named(VimKey::Escape)] {
+                assert_eq!(
+                    stop_of(&resolve_chain(&foreign, &[key], NEVER)),
+                    Some(Stop::Barrier),
+                    "{key} must reach the LineEdit"
+                );
+            }
+        }
+
+        #[test]
+        fn a_non_attached_code_edit_is_foreign() {
+            let theirs = FocusChain {
+                nodes: vec![code_edit(99)],
+                attached_editor: Some(id(ATTACHED)),
+                editor_mode: Some(Mode::Normal),
+                ..Default::default()
+            };
+            assert_eq!(
+                stop_of(&resolve_chain(&theirs, &[ctrl('h')], NEVER)),
+                Some(Stop::Barrier)
+            );
+        }
+
+        #[test]
+        fn no_focus_owner_still_reaches_the_panel_chords() {
+            let nothing = FocusChain::default();
+            let Resolution::Run { candidates, .. } = resolve_chain(&nothing, &[ctrl('j')], NEVER)
+            else {
+                panic!("Ctrl+j must resolve with no focus owner at all");
+            };
+            assert_eq!(candidates[0].surface, "panel");
+            assert_eq!(candidates[0].consume, Consumption::Void);
+            // …and it consumes even though there is no target to move to.
+            assert_eq!(
+                dispose(&candidates, false, |_| Outcome::Declined),
+                Disposition::Consume
+            );
+        }
+
+        #[test]
+        fn the_filesystem_dock_gets_first_refusal_by_depth_alone() {
+            let fs = FocusChain {
+                nodes: vec![
+                    tree("FileSystemTree", 1),
+                    plain("SplitContainer", 2),
+                    plain("FileSystemDock", 3),
+                ],
+                in_filesystem_dock: true,
+                ..Default::default()
+            };
+            for (key, want) in [
+                ('a', "godotvim.fs.create"),
+                ('d', "godotvim.fs.delete"),
+                ('r', "godotvim.fs.rename"),
+                ('y', "godotvim.fs.yank_path"),
+                ('R', "godotvim.fs.refresh"),
+            ] {
+                assert_eq!(
+                    action_of(&resolve_chain(&fs, &[ch(key)], NEVER)),
+                    Some(want),
+                    "{key} must resolve on dock.filesystem"
+                );
+            }
+            // …while the generic dock keyset still falls through to `dock`.
+            assert_eq!(
+                action_of(&resolve_chain(&fs, &[ch('j')], NEVER)),
+                Some("godotvim.item.next")
+            );
+        }
+
+        #[test]
+        fn the_same_widget_outside_the_filesystem_dock_has_no_file_keyset() {
+            // The Scene tree. Without the `dock.filesystem` grant, `a` must
+            // not create files — `get_selected_path` returns None there and
+            // `begin_create` would fall back to `res://` root.
+            let scene = FocusChain {
+                nodes: vec![tree("SceneTreeEditor", 1), plain("SceneTreeDock", 2)],
+                ..Default::default()
+            };
+            for key in ['a', 'd', 'r', 'y', 'R'] {
+                assert_eq!(
+                    stop_of(&resolve_chain(&scene, &[ch(key)], NEVER)),
+                    Some(Stop::Exhausted),
+                    "{key} must be unbound outside the FileSystem dock"
+                );
+            }
+        }
+
+        #[test]
+        fn hierarchy_keys_go_inert_on_a_list_and_live_on_a_tree() {
+            let list = FocusChain {
+                nodes: vec![item_list("ItemList", 1), plain("VBoxContainer", 2)],
+                ..Default::default()
+            };
+            let a_tree = FocusChain {
+                nodes: vec![tree("Tree", 1), plain("VBoxContainer", 2)],
+                ..Default::default()
+            };
+            for key in ['h', 'l'] {
+                assert_eq!(
+                    stop_of(&resolve_chain(&list, &[ch(key)], NEVER)),
+                    Some(Stop::Exhausted),
+                    "{key} must be inert on an ItemList"
+                );
+                assert!(
+                    action_of(&resolve_chain(&a_tree, &[ch(key)], NEVER)).is_some(),
+                    "{key} must work on a Tree"
+                );
+            }
+            // j/k work on both, which is the point of naming the bit VNAV.
+            for chain in [&list, &a_tree] {
+                assert_eq!(
+                    action_of(&resolve_chain(chain, &[ch('j')], NEVER)),
+                    Some("godotvim.item.next")
+                );
+            }
+        }
+
+        /// Every `FocusChain` field a probe reads, and what invalidates it in
+        /// `plugin::input::ChainKey`.
+        ///
+        /// Sampling walks the scene tree and asks six `is_class` questions
+        /// per node, so it is cached — which makes "did we key the cache on
+        /// everything a probe reads?" a correctness question with teeth. Each
+        /// case below varies exactly one field and asserts the classification
+        /// moves, which is what makes that field probe-relevant; the comment
+        /// on each names the cache-key component that covers it.
+        ///
+        /// A field added here with no cache-key component is a stale
+        /// classification: the sharpest instance is `editor_mode`, which
+        /// changes WITHOUT the focus owner changing, so keying on focus alone
+        /// would leave `Normal` behind after the user typed `i` and
+        /// `editor.insert` would stop being a barrier while Ctrl+H is
+        /// backspace.
+        #[test]
+        fn every_probe_relevant_fact_moves_the_classification() {
+            let forest = crate::actions::providers::forest();
+            let ids = |chain: &FocusChain| forest.classify(chain).expect("total").ids;
+
+            // `nodes` — keyed by the focus owner's InstanceId.
+            let empty = FocusChain::default();
+            let with_tree = FocusChain {
+                nodes: vec![tree("Tree", 1)],
+                ..Default::default()
+            };
+            assert_ne!(ids(&empty), ids(&with_tree));
+
+            // `attached_editor` — keyed directly.
+            let code = FocusChain {
+                nodes: vec![code_edit(ATTACHED)],
+                editor_mode: Some(Mode::Normal),
+                ..Default::default()
+            };
+            let attached = FocusChain {
+                attached_editor: Some(id(ATTACHED)),
+                ..code.clone()
+            };
+            assert_ne!(ids(&code), ids(&attached));
+
+            // `editor_mode` — keyed directly, and the one that changes with
+            // no focus change at all.
+            let inserting = FocusChain {
+                editor_mode: Some(Mode::Insert),
+                ..attached.clone()
+            };
+            assert_ne!(ids(&attached), ids(&inserting));
+
+            // `in_filesystem_dock` — a pure function of the focus owner, so
+            // the focus InstanceId covers it.
+            let fs = FocusChain {
+                in_filesystem_dock: true,
+                ..with_tree.clone()
+            };
+            assert_ne!(ids(&with_tree), ids(&fs));
+
+            // `sibling_nav_control` — likewise a function of the focus owner.
+            let bare_line = FocusChain {
+                nodes: vec![crate::actions::surface::fixtures::line_edit(1)],
+                ..Default::default()
+            };
+            let filter_box = FocusChain {
+                sibling_nav_control: Some(id(9)),
+                ..bare_line.clone()
+            };
+            assert_ne!(ids(&bare_line), ids(&filter_box));
+
+            // `is_plugin_prompt` — keyed by the prompt LineEdit's InstanceId,
+            // which is what `FocusChain::sample` compares the focus owner to.
+            let prompt = FocusChain {
+                is_plugin_prompt: true,
+                ..bare_line.clone()
+            };
+            assert_ne!(ids(&bare_line), ids(&prompt));
+        }
+
+        #[test]
+        fn a_focused_button_in_a_dock_still_gets_the_panel_chords() {
+            // …and nothing else. Widening the `dock` probe to reach it would
+            // wake the dead `find_best_nav_target` recursion and move a Tree
+            // the user is not focused on.
+            let button = FocusChain {
+                nodes: vec![plain("Button", 1), plain("HBoxContainer", 2)],
+                ..Default::default()
+            };
+            assert_eq!(
+                action_of(&resolve_chain(&button, &[ctrl('l')], NEVER)),
+                Some("godotvim.focus.right")
+            );
+            assert_eq!(
+                stop_of(&resolve_chain(&button, &[ch('j')], NEVER)),
+                Some(Stop::Exhausted)
+            );
+        }
+    }
+}

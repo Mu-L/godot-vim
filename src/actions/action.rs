@@ -223,6 +223,14 @@ pub(crate) struct ActionCtx<'a> {
     pub(crate) params: Params,
     /// Records side effects instead of performing them, under test.
     pub(crate) recorder: Option<&'a mut Vec<Effect>>,
+    /// The FileSystem dock's prompt/executor state.
+    ///
+    /// Borrowed field-by-field rather than as `&mut GodotVimCore`, and that
+    /// is deliberate: `run` is called from inside `handle_input_impl`, which
+    /// already holds `&mut self`, and handing an action the whole plugin
+    /// would make every re-entrancy question a runtime one. `None` on the
+    /// host transport, where an action that needs it declines.
+    fs: Option<&'a mut crate::navigation::FileSystemExplorer>,
 }
 
 /// One observable side effect of running an action.
@@ -258,7 +266,14 @@ impl<'a> ActionCtx<'a> {
             target,
             params,
             recorder: None,
+            fs: None,
         }
+    }
+
+    /// Lend the FileSystem explorer for the duration of one dispatch.
+    pub(crate) fn with_fs(mut self, fs: &'a mut crate::navigation::FileSystemExplorer) -> Self {
+        self.fs = Some(fs);
+        self
     }
 
     /// A context that records side effects rather than performing them.
@@ -268,11 +283,17 @@ impl<'a> ActionCtx<'a> {
             target: None,
             params: Params::new(),
             recorder: Some(sink),
+            fs: None,
         }
     }
 
     pub(crate) fn target(&self) -> Option<&Gd<Control>> {
         self.target.as_ref()
+    }
+
+    /// The FileSystem explorer, when this transport lends one.
+    pub(crate) fn fs(&mut self) -> Option<&mut crate::navigation::FileSystemExplorer> {
+        self.fs.as_deref_mut()
     }
 
     /// Emit a Godot signal, or record the intent under test.

@@ -26,6 +26,10 @@ pub(crate) enum WindowNavDirection {
 ///
 /// Requires Ctrl and nothing else: `Ctrl+hjkl` is the panel chord, while
 /// bare `hjkl` belongs to whichever dock has focus.
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 fn direction_for(key: KeyEvent) -> Option<WindowNavDirection> {
     if key.modifiers() != Modifiers::CTRL {
         return None;
@@ -50,20 +54,12 @@ fn direction_for(key: KeyEvent) -> Option<WindowNavDirection> {
 /// engine about *that* key — not the raw logical keycode — when deciding
 /// whether a user mapping claims it. Asking about the wrong one is what used
 /// to deny Cyrillic users panel navigation from inside the editor.
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 pub(crate) fn resolve_panel_key(probes: &Probes) -> Option<(KeyEvent, WindowNavDirection)> {
     probes.resolve(|k| direction_for(k).map(|dir| (k, dir)))
-}
-
-/// As [`resolve_panel_key`], but refusing the US-QWERTY positional guess.
-///
-/// Used when focus is the attached editor, where every key already has a
-/// meaning. On Dvorak the QWERTY-H position emits `d`, so honouring the
-/// positional probe would turn `Ctrl+d` (half-page down) into panel-left;
-/// Colemak does the same to `Ctrl+n` and `Ctrl+e`. Non-Latin layouts lose
-/// nothing — `resolve_ctrl_key` already resolves those to a Latin key as
-/// probe 1.
-pub(crate) fn resolve_panel_key_typed(probes: &Probes) -> Option<(KeyEvent, WindowNavDirection)> {
-    probes.resolve_typed(|k| direction_for(k).map(|dir| (k, dir)))
 }
 
 #[derive(Debug)]

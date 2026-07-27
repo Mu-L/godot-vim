@@ -25,12 +25,20 @@
 //! - [`bind`] — the binding plane: one `MappingTrie` per surface over a side
 //!   arena of rules, and the registration-time validation that keeps a typo
 //!   from becoming a silent dead key.
+//! - [`resolve`] — the dispatch model itself, as a pure function: the
+//!   leaf→root candidate walk, the arbitration seam, and the consumption
+//!   fold. Takes no `Gd<T>` and calls no Godot API.
+//! - [`introspect`] — `:panelmap`, which ships in the same commit as the
+//!   cutover because a config surface with no way to see what is bound is how
+//!   silent dead keys happen.
 
 pub(crate) mod action;
 pub(crate) mod bind;
 pub(crate) mod caps;
+pub(crate) mod introspect;
 pub(crate) mod keys;
 pub(crate) mod outcome;
 pub(crate) mod providers;
+pub(crate) mod resolve;
 pub(crate) mod specs;
 pub(crate) mod surface;

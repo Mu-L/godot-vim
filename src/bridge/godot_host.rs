@@ -51,6 +51,13 @@ pub(crate) enum PendingUiAction {
         name: compact_str::CompactString,
         count: u32,
     },
+    /// `:panelmap` / `:panelmap <lhs>` — the panel-binding introspector.
+    ///
+    /// Carries the raw argument text, never a parsed key or a surface id, for
+    /// the same reason [`PendingUiAction::RunRegistryAction`] carries a name:
+    /// `bridge` must not depend on `crate::actions`. The plane lives on
+    /// `GodotVimCore`, so the parse and the report both happen after the hop.
+    PanelCommand(compact_str::CompactString),
     PerfReport,
     PerfReset,
     ShowTooltip {
@@ -357,6 +364,27 @@ impl GodotHost {
                 }
                 "perf reset" => {
                     self.pending_ui_actions.push(PendingUiAction::PerfReset);
+                    return HostResult::Success {
+                        id: request.id(),
+                        message: None,
+                    };
+                }
+                // Matched before the generic fallthrough so `:panelmap` can
+                // never be shadowed by a custom-command chain, and matched on
+                // the exact word plus a space so `:panelmapfoo` is still an
+                // ordinary E492.
+                "panelmap" => {
+                    self.pending_ui_actions
+                        .push(PendingUiAction::PanelCommand(String::new().into()));
+                    return HostResult::Success {
+                        id: request.id(),
+                        message: None,
+                    };
+                }
+                cmd_str if cmd_str.starts_with("panelmap ") => {
+                    self.pending_ui_actions.push(PendingUiAction::PanelCommand(
+                        compact_str::CompactString::from(&cmd_str["panelmap ".len()..]),
+                    ));
                     return HostResult::Success {
                         id: request.id(),
                         message: None,

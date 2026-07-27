@@ -42,6 +42,7 @@ pub(crate) static PROMPT: SurfaceSpec = SurfaceSpec {
     // at index 0, and a chain can carry a stale flag with an empty node list.
     probe: |chain| (chain.is_plugin_prompt && chain.focus().is_some()).then_some(Anchor::Node(0)),
     on_key: None,
+    refuses_positional: false,
     yields_to_engine: false,
 };
 

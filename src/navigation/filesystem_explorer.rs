@@ -19,7 +19,7 @@ use crate::bridge::godot_calls;
 use crate::scene_tree::find_child_of_type;
 
 use super::dock::DockInputResult;
-use super::focus::DockKind;
+use super::dock::DockKind;
 
 /// Tracks what the shared LineEdit prompt is doing.
 enum PromptMode {
@@ -67,58 +67,47 @@ impl FileSystemExplorer {
         self.active_control = None;
     }
 
-    pub(crate) fn handle_key(
-        &mut self,
-        probes: &Probes,
-        control: &Gd<Control>,
-        kind: DockKind,
-    ) -> DockInputResult {
+    /// The `dock.filesystem` surface's `on_key` hook.
+    ///
+    /// Runs once per keystroke for every key that reaches the FileSystem
+    /// dock, **before** any binding is looked up and regardless of whether
+    /// one matches — which is exactly where the old `handle_key` ran it
+    /// (`validate_cache()` and the dismiss both preceded the modifier filter,
+    /// so Alt+X in the FS dock already auto-dismissed).
+    ///
+    /// If the prompt is visible but the Tree/ItemList has focus (not our
+    /// LineEdit), the user moved away mid-prompt: auto-dismiss the orphan.
+    /// Leaving it alive means `dismiss_prompt` will later
+    /// `call_deferred("grab_focus")` back to a stale control and steal focus
+    /// from wherever the user has since gone.
+    ///
+    /// Idempotent and cheap, as the hook contract requires: key-repeat echo
+    /// events reach it too, and `prompt_mode` guards the dismiss.
+    pub(crate) fn on_key_tick(&mut self) {
         self.validate_cache();
-
-        // If the prompt is visible but the Tree/ItemList has focus (not our
-        // LineEdit), the user clicked away mid-prompt. Auto-dismiss.
         if !matches!(self.prompt_mode, PromptMode::Inactive) {
             self.dismiss_prompt();
         }
-
-        let action = resolve_fs_action(probes);
-
-        match action {
-            FsAction::Create => self.begin_create(control, kind),
-            FsAction::Delete => self.begin_delete(control, kind),
-            FsAction::Rename => self.begin_rename(control, kind),
-            FsAction::YankPath => self.yank_path(control, kind),
-            FsAction::Refresh => self.refresh(),
-            FsAction::None => DockInputResult::Declined,
-        }
     }
 
-    pub(crate) fn is_prompt_active(&self, line_edit: &Gd<LineEdit>) -> bool {
-        match &self.prompt {
-            Some(prompt) if prompt.is_instance_valid() => {
-                prompt.instance_id() == line_edit.instance_id()
-            }
-            _ => false,
-        }
+    /// The prompt `LineEdit`'s instance id, when one exists and is live.
+    ///
+    /// Fed to [`crate::actions::surface::FocusChain::sample`] so the `prompt`
+    /// surface can be recognized by instance identity — which is what lets it
+    /// probe ahead of `searchbox` and `foreign`, either of which would
+    /// otherwise claim a bare `LineEdit`.
+    pub(crate) fn prompt_instance(&self) -> Option<InstanceId> {
+        self.prompt
+            .as_ref()
+            .filter(|p| p.is_instance_valid())
+            .map(Gd::instance_id)
     }
 
-    fn yank_path(&self, control: &Gd<Control>, kind: DockKind) -> DockInputResult {
-        if let Some(path) = get_selected_path(control, kind) {
-            DisplayServer::singleton().clipboard_set(&GString::from(&path));
-            log::info!("filesystem_explorer: yanked path '{}'", path);
-        }
-        DockInputResult::Handled
-    }
-
-    fn refresh(&self) -> DockInputResult {
-        if let Some(mut fs) = EditorInterface::singleton().get_resource_filesystem() {
-            fs.scan();
-            log::info!("filesystem_explorer: triggered filesystem scan");
-        }
-        DockInputResult::Handled
-    }
-
-    fn begin_create(&mut self, control: &Gd<Control>, kind: DockKind) -> DockInputResult {
+    pub(crate) fn begin_create(
+        &mut self,
+        control: &Gd<Control>,
+        kind: DockKind,
+    ) -> DockInputResult {
         let target_dir = match get_selected_path(control, kind) {
             Some(path) if path.ends_with('/') => path,
             Some(path) => parent_dir(&path),
@@ -126,16 +115,6 @@ impl FileSystemExplorer {
         };
         self.active_control = Some(control.clone());
         self.show_prompt("New: ", None, PromptMode::Create { target_dir });
-        DockInputResult::Handled
-    }
-
-    fn begin_delete(&mut self, _control: &Gd<Control>, _kind: DockKind) -> DockInputResult {
-        trigger_dock_shortcut(godot_calls::SHORTCUT_FS_DELETE);
-        DockInputResult::Handled
-    }
-
-    fn begin_rename(&mut self, _control: &Gd<Control>, _kind: DockKind) -> DockInputResult {
-        trigger_dock_shortcut(godot_calls::SHORTCUT_FS_RENAME);
         DockInputResult::Handled
     }
 
@@ -372,6 +351,10 @@ enum FsAction {
 /// Shift is a *discriminant* here, not a filter: `R` refreshes while `r`
 /// renames. Because `bridge::input` folds Shift into the character itself,
 /// that distinction is carried by the char, not by a modifier bit.
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 fn fs_action_for(key: KeyEvent) -> Option<FsAction> {
     if key.modifiers() != Modifiers::NONE {
         return None;
@@ -387,8 +370,51 @@ fn fs_action_for(key: KeyEvent) -> Option<FsAction> {
 }
 
 /// Resolve a keystroke to a FileSystem-dock action, probe by probe.
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 fn resolve_fs_action(probes: &Probes) -> FsAction {
     probes.resolve(fs_action_for).unwrap_or(FsAction::None)
+}
+
+/// `y` — copy the selected path to the clipboard.
+///
+/// A free function rather than a method because it reads nothing from the
+/// explorer's own state. That is what makes `godotvim.fs.yank_path` honestly
+/// `host_invocable`: `:action godotvim.fs.yank_path` needs a focused dock
+/// widget, which it takes as an argument, and nothing else.
+///
+/// `Handled` even when nothing is selected — verbatim from the original: the
+/// key IS the FileSystem dock's, whether or not there was a path to copy.
+pub(crate) fn yank_selected_path(control: &Gd<Control>, kind: DockKind) -> DockInputResult {
+    if let Some(path) = get_selected_path(control, kind) {
+        DisplayServer::singleton().clipboard_set(&GString::from(&path));
+        log::info!("filesystem_explorer: yanked path '{}'", path);
+    }
+    DockInputResult::Handled
+}
+
+/// `d` — delegate to Godot's own FileSystem-dock delete, confirmation dialog
+/// and all.
+pub(crate) fn delete_selected() -> DockInputResult {
+    trigger_dock_shortcut(godot_calls::SHORTCUT_FS_DELETE);
+    DockInputResult::Handled
+}
+
+/// `r` — delegate to Godot's own FileSystem-dock rename.
+pub(crate) fn rename_selected() -> DockInputResult {
+    trigger_dock_shortcut(godot_calls::SHORTCUT_FS_RENAME);
+    DockInputResult::Handled
+}
+
+/// `R` — rescan `res://`.
+pub(crate) fn scan_filesystem() -> DockInputResult {
+    if let Some(mut fs) = EditorInterface::singleton().get_resource_filesystem() {
+        fs.scan();
+        log::info!("filesystem_explorer: triggered filesystem scan");
+    }
+    DockInputResult::Handled
 }
 
 pub(crate) fn is_in_filesystem_dock(control: &Gd<Control>) -> bool {

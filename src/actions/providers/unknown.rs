@@ -46,6 +46,7 @@ pub(crate) static UNKNOWN: SurfaceSpec = SurfaceSpec {
         })
     },
     on_key: None,
+    refuses_positional: false,
     yields_to_engine: false,
 };
 

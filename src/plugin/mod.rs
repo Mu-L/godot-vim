@@ -88,6 +88,15 @@ pub struct GodotVimCore {
     /// provider tables into the same registry; nothing about the dispatcher
     /// changes when they do.
     actions: crate::actions::action::ActionRegistry,
+    /// Which key, on which surface, means which verb.
+    ///
+    /// Rebuilt from the provider defaults (and, from the config phase, the
+    /// resolved vimrc) whenever config is sourced; `generation` bumps with
+    /// every rebuild, which is what invalidates the sampled focus chain.
+    bindings: crate::actions::bind::BindingIndex,
+    /// The focus chain, sampled once per distinct focus/mode/prompt state
+    /// rather than once per keystroke. See `plugin::input::ChainCache`.
+    chain_cache: Option<input::ChainCache>,
     /// Desired master-enable state (mirrors plugins/GodotVim/enabled).
     enabled: bool,
     /// Disabled->enabled EDGE detector (NOT a correctness gate): apply_enabled_state
@@ -100,6 +109,15 @@ pub struct GodotVimCore {
 impl INode for GodotVimCore {
     fn init(base: Base<Node>) -> Self {
         install_panic_hook();
+        // Registry first, then the index over it: `builtin_index` rejects a
+        // default naming an unregistered action, which is the load-time check
+        // that keeps a typo from becoming a key that consumes and does
+        // nothing.
+        let mut actions = crate::actions::action::ActionRegistry::new();
+        for spec in crate::actions::specs::SHIPPED {
+            actions.register(spec);
+        }
+        let bindings = crate::actions::bind::builtin_index(&actions);
         Self {
             base,
             controller: None,
@@ -115,13 +133,9 @@ impl INode for GodotVimCore {
             processing_key: false,
             fs_explorer: crate::navigation::FileSystemExplorer::new(),
             langmap: None,
-            actions: {
-                let mut r = crate::actions::action::ActionRegistry::new();
-                for spec in crate::actions::specs::SHIPPED {
-                    r.register(spec);
-                }
-                r
-            },
+            actions,
+            bindings,
+            chain_cache: None,
             enabled: true,
             wired: false,
         }
@@ -969,6 +983,9 @@ impl GodotVimCore {
             PendingUiAction::RunRegistryAction { name, count } => {
                 self.run_registry_action(&name, count);
             }
+            PendingUiAction::PanelCommand(args) => {
+                self.panel_command(&args);
+            }
             PendingUiAction::OpenMappingDialog => {
                 let resolved = self.resolve_config_path();
 
@@ -1200,6 +1217,7 @@ impl GodotVimCore {
             // must be reconciled here too. Returning early without this leaves
             // a stale table after a vimrc is deleted.
             self.rebuild_langmap();
+            self.rebuild_bindings();
             return false;
         };
         let project_vimrc = self
@@ -1218,7 +1236,91 @@ impl GodotVimCore {
             }
         }
         self.rebuild_langmap();
+        self.rebuild_bindings();
         true
+    }
+
+    /// Rebuild the panel binding index, atomically.
+    ///
+    /// Deliberately **outside** the `if let Some(text)` above and run on the
+    /// no-file path too: `apply_vimrc_policy` returns `None` under
+    /// `ProjectVimrc::Disabled` and `read_file` returns `None` when there is
+    /// no vimrc at all, so the naive placement means a security setting — or
+    /// simply having no config — destroys the builtin Ctrl+hjkl defaults.
+    ///
+    /// The user layer is not read here yet; that is the config phase's work.
+    /// What ships now is the rebuild *seam*, so that adding the second layer
+    /// is one call and not a restructuring: build a fresh index, then swap,
+    /// so one broken line can never leave a half-built table live.
+    fn rebuild_bindings(&mut self) {
+        let generation = self.bindings.generation.wrapping_add(1);
+        let mut index = crate::actions::bind::builtin_index(&self.actions);
+        index.generation = generation;
+        self.bindings = index;
+        // The chain cache is keyed on the generation, so this is belt and
+        // braces — but a cache that outlives its index is the kind of bug
+        // that only shows up after a hot reload.
+        self.invalidate_focus_chain();
+        log::debug!(
+            "panelmap: rebuilt {} binding(s) at generation {generation}",
+            self.bindings.len()
+        );
+    }
+
+    /// `:panelmap` and `:panelmap <lhs>` — the introspector.
+    ///
+    /// Printed with `godot_print!` rather than `log::info!` and to the Output
+    /// panel rather than the status bar, for two separate reasons: the
+    /// default `log` level is Off, so a `log::` call reaches nobody by
+    /// default; and a resolution trace is a dozen lines, which the one-line
+    /// status bar cannot show.
+    fn panel_command(&mut self, args: &str) {
+        let args = args.trim();
+        if args.is_empty() {
+            godot_print!(
+                "{}",
+                crate::actions::introspect::list_report(&self.bindings, &self.actions)
+            );
+            return;
+        }
+        // Sampled against the CURRENT focus, which is the whole point: the
+        // answer to "why is my key dead" depends on where the keystroke would
+        // land, and by the time the user has typed `:panelmap d` the command
+        // line owns focus. That is a real caveat and the report prints the
+        // chain it used so the user can see it.
+        let chain = EditorInterface::singleton()
+            .get_base_control()
+            .and_then(|c| c.get_viewport())
+            .map(|vp| {
+                crate::actions::surface::FocusChain::sample(
+                    &vp,
+                    self.attached_editor
+                        .as_ref()
+                        .filter(|e| e.is_instance_valid())
+                        .map(Gd::instance_id),
+                    self.controller.as_ref().map(VimController::mode),
+                    self.fs_explorer.prompt_instance(),
+                )
+            })
+            .unwrap_or_default();
+        let Some(path) = self.bindings.forest().classify(&chain) else {
+            godot_warn!("panelmap: no surface claimed the current focus");
+            return;
+        };
+        let controller = self.controller.as_ref();
+        let claims =
+            |k: vim_core::keymap::KeyEvent| controller.is_some_and(|c| c.could_start_mapping(k));
+        godot_print!(
+            "{}",
+            crate::actions::introspect::explain_report(
+                args,
+                &chain,
+                &path,
+                &self.bindings,
+                &self.actions,
+                &claims,
+            )
+        );
     }
 
     /// Run a shell-side action invoked by name rather than by keystroke.
@@ -1256,7 +1358,12 @@ impl GodotVimCore {
 
         let mut params = crate::actions::action::Params::new();
         params.set_int("count", i64::from(count));
-        let mut cx = crate::actions::action::ActionCtx::new(target, params);
+        // The explorer is lent here too, so `host_invocable: true` on
+        // `godotvim.fs.create` is honest: the prompt it opens is owned by
+        // `self.fs_explorer`, and without the loan the action would decline
+        // from the command line while working from a key.
+        let mut cx =
+            crate::actions::action::ActionCtx::new(target, params).with_fs(&mut self.fs_explorer);
         let outcome = self.actions.run(id, &mut cx);
         log::debug!("action: '{name}' -> {outcome:?}");
     }

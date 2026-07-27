@@ -50,6 +50,7 @@ pub(crate) static DOCK: SurfaceSpec = SurfaceSpec {
     grants: |_| Caps::empty(),
     probe: |chain| focuses_nav_widget(chain).then_some(Anchor::Node(0)),
     on_key: None,
+    refuses_positional: false,
     yields_to_engine: false,
 };
 

@@ -402,6 +402,19 @@ impl BindingIndex {
         }
     }
 
+    /// The live rule at one exact `(surface, lhs)`, if there is one.
+    ///
+    /// Goes through the trie rather than scanning `slot_of`, so `<nowait>`
+    /// and prefix semantics are the trie's answer here exactly as they are in
+    /// the resolver's walk — the introspector must not be able to report a
+    /// rule the walk would not reach.
+    pub(crate) fn rule_for(&self, surface: SurfaceId, lhs: &[KeyEvent]) -> Option<&Rule> {
+        match self.lookup(surface, lhs) {
+            TrieLookup::ExactOnly(entry) => Self::slot_in(entry).and_then(|s| self.rule_at(s)),
+            _ => None,
+        }
+    }
+
     /// The live rule a slot names, if it has not been unmapped.
     pub(crate) fn rule_at(&self, slot: SlotId) -> Option<&Rule> {
         let index = (*self.slots.get(slot.0 as usize)?)?;
@@ -426,6 +439,30 @@ impl BindingIndex {
         self.slots
             .iter()
             .filter_map(|slot| self.arena.get((*slot)? as usize))
+    }
+
+    /// Whether any live rule on `surface` opted into the US-QWERTY positional
+    /// probe.
+    ///
+    /// This is where `<physical>`'s scoping is *enforced*: probes 1 and 2 are
+    /// offered on every surface, probe 3 only where a rule asked for it. It
+    /// is what keeps a Dvorak `Ctrl+d` from becoming panel-left on a surface
+    /// that binds nothing positionally, and what confines the QWERTZ `z`
+    /// alias to the fourteen rules that carry the flag.
+    ///
+    /// Computed rather than cached: `surfaces` is a linear scan over ~8
+    /// entries and `slot_of` over ~5, both once per surface per keystroke,
+    /// and a cache is a second source of truth that a `panelunmap` can
+    /// desynchronize.
+    pub(crate) fn has_physical_rule(&self, surface: SurfaceId) -> bool {
+        self.rules()
+            .any(|rule| rule.surface == surface && rule.physical)
+    }
+
+    /// Every live rule on one surface, in slot-allocation order. For the
+    /// introspector, which lists per surface in forest order.
+    pub(crate) fn rules_on(&self, surface: SurfaceId) -> impl Iterator<Item = &Rule> + '_ {
+        self.rules().filter(move |rule| rule.surface == surface)
     }
 
     pub(crate) fn len(&self) -> usize {

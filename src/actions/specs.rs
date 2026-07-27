@@ -18,6 +18,7 @@ use super::outcome::Outcome;
 use crate::navigation::dock_nav::{
     handle_hierarchy, handle_navigation, HierarchyAction, NavDirection,
 };
+use crate::navigation::window::{WindowNavDirection, WindowNavResult};
 
 /// Run a nav executor against the context's target, translating its `bool`
 /// into the tri-state. `false` means "nothing to move to" — the end of a
@@ -121,20 +122,42 @@ pub(crate) static ITEM_ACTIVATE: ActionSpec = ActionSpec {
 // ── Cross-panel focus ────────────────────────────────────────────────────
 //
 // These require NO capability. That is what lets them still fire when there
-// is no focus owner at all — the case the dispatcher must consume for.
-//
-// Bodies are not moved yet: they need the viewport and plugin handles that
-// `ActionCtx` gains with the surface plane. Until then they return
-// `Declined`, NOT `Handled` — a stub that consumes a key and reports success
-// destroys the keystroke and does nothing, which is strictly worse than the
-// action not existing. The live dispatch path still calls the originals.
+// is no focus owner at all — the case the dispatcher must consume for. The
+// `cx.target()` guard below is the verbatim transcription of the old
+// `input.rs:127-130`, where `handle_window_nav` was skipped with no focus
+// owner and `set_input_as_handled()` fired anyway; `Consumption::Void` on the
+// four `panel` rules supplies the consume that `:132` supplied.
+
+/// Directional cross-panel movement.
+///
+/// The `Declined` on a miss is not busywork even though every shipped binding
+/// for it is `Void`: a user who writes `panelmap panel <M-h> godotvim.focus.left`
+/// gets an elastic rule, and then "no panel that way" must leave the chord to
+/// Godot rather than swallowing it.
+fn focus_dir(cx: &mut ActionCtx<'_>, direction: WindowNavDirection) -> Outcome {
+    let Some(target) = cx.target().cloned() else {
+        return Outcome::Declined;
+    };
+    match crate::navigation::handle_window_nav(&target, direction) {
+        WindowNavResult::Focused => Outcome::FocusChanged,
+        WindowNavResult::Ignored => Outcome::Declined,
+    }
+}
+
+fn focus_cycle(cx: &mut ActionCtx<'_>, action: crate::effects::WindowNavAction) -> Outcome {
+    let Some(target) = cx.target().cloned() else {
+        return Outcome::Declined;
+    };
+    crate::navigation::handle_window_nav_action(&target, action);
+    Outcome::FocusChanged
+}
 
 pub(crate) static FOCUS_LEFT: ActionSpec = ActionSpec {
     id: "godotvim.focus.left",
     desc: "Move focus to the panel on the left",
     requires: Caps::empty(),
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |cx| focus_dir(cx, WindowNavDirection::Left),
 };
 
 pub(crate) static FOCUS_RIGHT: ActionSpec = ActionSpec {
@@ -142,7 +165,7 @@ pub(crate) static FOCUS_RIGHT: ActionSpec = ActionSpec {
     desc: "Move focus to the panel on the right",
     requires: Caps::empty(),
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |cx| focus_dir(cx, WindowNavDirection::Right),
 };
 
 pub(crate) static FOCUS_UP: ActionSpec = ActionSpec {
@@ -150,7 +173,7 @@ pub(crate) static FOCUS_UP: ActionSpec = ActionSpec {
     desc: "Move focus to the panel above",
     requires: Caps::empty(),
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |cx| focus_dir(cx, WindowNavDirection::Up),
 };
 
 pub(crate) static FOCUS_DOWN: ActionSpec = ActionSpec {
@@ -158,7 +181,7 @@ pub(crate) static FOCUS_DOWN: ActionSpec = ActionSpec {
     desc: "Move focus to the panel below",
     requires: Caps::empty(),
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |cx| focus_dir(cx, WindowNavDirection::Down),
 };
 
 pub(crate) static FOCUS_CYCLE_NEXT: ActionSpec = ActionSpec {
@@ -166,7 +189,7 @@ pub(crate) static FOCUS_CYCLE_NEXT: ActionSpec = ActionSpec {
     desc: "Cycle focus to the next panel",
     requires: Caps::empty(),
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |cx| focus_cycle(cx, crate::effects::WindowNavAction::CycleNext),
 };
 
 pub(crate) static FOCUS_CYCLE_PREV: ActionSpec = ActionSpec {
@@ -174,7 +197,7 @@ pub(crate) static FOCUS_CYCLE_PREV: ActionSpec = ActionSpec {
     desc: "Cycle focus to the previous panel",
     requires: Caps::empty(),
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |cx| focus_cycle(cx, crate::effects::WindowNavAction::CyclePrev),
 };
 
 pub(crate) static FOCUS_EDITOR: ActionSpec = ActionSpec {
@@ -182,7 +205,10 @@ pub(crate) static FOCUS_EDITOR: ActionSpec = ActionSpec {
     desc: "Return focus to the script editor",
     requires: Caps::empty(),
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    // Needs no target: it locates the script editor itself, and declines when
+    // there is none — which is why `Caps::ESCAPE` was deleted as a gate with
+    // no possible grantor.
+    run: |_cx| crate::navigation::dock::handle_escape_from_dock(),
 };
 
 // ── Dock filter box ──────────────────────────────────────────────────────
@@ -190,9 +216,17 @@ pub(crate) static FOCUS_EDITOR: ActionSpec = ActionSpec {
 pub(crate) static DOCK_SEARCH: ActionSpec = ActionSpec {
     id: "godotvim.dock.search",
     desc: "Focus the dock's filter box",
+    // No capability: the depth-20 sibling DFS runs once per `/` press and
+    // declines when it finds nothing, which is a better gate than any bit —
+    // it asks the actual scene tree rather than the widget class.
     requires: Caps::empty(),
     host_invocable: false,
-    run: |_cx| Outcome::Declined,
+    run: |cx| {
+        let Some(target) = cx.target().cloned() else {
+            return Outcome::Declined;
+        };
+        crate::navigation::dock::handle_slash(&target)
+    },
 };
 
 pub(crate) static SEARCH_ACCEPT: ActionSpec = ActionSpec {
@@ -200,20 +234,59 @@ pub(crate) static SEARCH_ACCEPT: ActionSpec = ActionSpec {
     desc: "Leave the filter box, keeping the filter",
     requires: Caps::TEXTENTRY,
     host_invocable: false,
-    run: |_cx| Outcome::Declined,
+    run: |cx| {
+        let Some(target) = cx.target().cloned() else {
+            return Outcome::Declined;
+        };
+        crate::navigation::dock::leave_search(&target)
+    },
 };
 
 // ── FileSystem operations ────────────────────────────────────────────────
 //
 // `host_invocable` because each can locate its own target, so `:action
 // godotvim.fs.create` works from the editor as well as from the dock.
+//
+// Only `create` needs `&mut FileSystemExplorer` — it owns the prompt — and
+// only the key transports lend one (`ActionCtx::with_fs`). The other four are
+// free functions over the target, which is what makes `host_invocable: true`
+// honest for them rather than aspirational.
+
+/// The focused control and the signal contract it follows.
+///
+/// `Declined` on a missing `DockKind` reproduces the old dispatch
+/// precondition exactly: `FocusContext::Dock(kind, control)` could only be
+/// constructed for a Tree, ItemList or RichTextLabel, so `handle_key` was
+/// unreachable for anything else.
+fn dock_target(
+    cx: &mut ActionCtx<'_>,
+) -> Option<(
+    godot::prelude::Gd<godot::classes::Control>,
+    crate::navigation::dock::DockKind,
+)> {
+    let target = cx.target().cloned()?;
+    let kind = crate::navigation::dock::dock_kind_of(&target)?;
+    Some((target, kind))
+}
 
 pub(crate) static FS_CREATE: ActionSpec = ActionSpec {
     id: "godotvim.fs.create",
     desc: "Create a file or folder",
     requires: Caps::FILEOPS,
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |cx| {
+        let Some((target, kind)) = dock_target(cx) else {
+            return Outcome::Declined;
+        };
+        let Some(fs) = cx.fs() else {
+            // The host transport lends no explorer. Decline loudly rather
+            // than half-running: `begin_create` without the prompt would
+            // report success and show nothing.
+            log::warn!("godotvim.fs.create: no FileSystem explorer on this transport");
+            return Outcome::Declined;
+        };
+        fs.begin_create(&target, kind)
+    },
 };
 
 pub(crate) static FS_DELETE: ActionSpec = ActionSpec {
@@ -221,7 +294,7 @@ pub(crate) static FS_DELETE: ActionSpec = ActionSpec {
     desc: "Delete the selected path",
     requires: Caps::FILEOPS,
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |_cx| crate::navigation::filesystem_explorer::delete_selected(),
 };
 
 pub(crate) static FS_RENAME: ActionSpec = ActionSpec {
@@ -229,7 +302,7 @@ pub(crate) static FS_RENAME: ActionSpec = ActionSpec {
     desc: "Rename the selected path",
     requires: Caps::FILEOPS,
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |_cx| crate::navigation::filesystem_explorer::rename_selected(),
 };
 
 pub(crate) static FS_YANK_PATH: ActionSpec = ActionSpec {
@@ -237,7 +310,12 @@ pub(crate) static FS_YANK_PATH: ActionSpec = ActionSpec {
     desc: "Copy the selected path to the clipboard",
     requires: Caps::FILEOPS,
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |cx| {
+        let Some((target, kind)) = dock_target(cx) else {
+            return Outcome::Declined;
+        };
+        crate::navigation::filesystem_explorer::yank_selected_path(&target, kind)
+    },
 };
 
 pub(crate) static FS_REFRESH: ActionSpec = ActionSpec {
@@ -245,7 +323,7 @@ pub(crate) static FS_REFRESH: ActionSpec = ActionSpec {
     desc: "Rescan the filesystem",
     requires: Caps::FILEOPS,
     host_invocable: true,
-    run: |_cx| Outcome::Declined,
+    run: |_cx| crate::navigation::filesystem_explorer::scan_filesystem(),
 };
 
 /// Every shipped action.
@@ -460,23 +538,50 @@ mod tests {
     }
 
     #[test]
-    fn no_shipped_stub_consumes_a_key() {
-        // A body not yet moved must DECLINE. Handled means "consume the key
-        // and report success", so a stub returning it destroys the keystroke.
+    fn an_action_with_no_target_declines() {
+        // The no-focus-owner path, which is a real and mandatory state:
+        // `Anchor::Rootless` reaches `panel`'s Ctrl+hjkl rules with
+        // `cx.target()` at `None`. Every body that needs a control must open
+        // with a `let ... else { return Declined }`, because `Handled` means
+        // "consume the key AND report success" — which would destroy the
+        // keystroke and do nothing.
+        //
+        // `Consumption::Void` is what still consumes there; the action's
+        // honesty and the rule's policy are two separate decisions, and this
+        // asserts the first.
+        //
+        // Excluded: the three targetless FileSystem verbs. They reach
+        // `EditorInterface::singleton()` unconditionally, which panics
+        // outside a running editor — that is what makes them
+        // `host_invocable` and is asserted by shape, in `SHIPPED`, rather
+        // than by running them.
         let mut effects = Vec::new();
         let r = registry();
         for name in [
             "godotvim.focus.left",
+            "godotvim.focus.right",
+            "godotvim.focus.up",
+            "godotvim.focus.down",
             "godotvim.focus.cycle_next",
+            "godotvim.focus.cycle_prev",
             "godotvim.dock.search",
             "godotvim.search.accept",
             "godotvim.fs.create",
-            "godotvim.fs.refresh",
+            "godotvim.fs.yank_path",
+            "godotvim.item.next",
+            "godotvim.item.prev",
+            "godotvim.item.collapse",
+            "godotvim.item.expand",
+            "godotvim.item.activate",
         ] {
             let id = r.id_of(name).unwrap();
             let mut cx = ActionCtx::recording(&mut effects);
             assert_eq!(r.run(id, &mut cx), Outcome::Declined, "{name} must decline");
         }
+        assert!(
+            effects.is_empty(),
+            "a targetless action must not emit anything: {effects:?}"
+        );
     }
 
     #[test]

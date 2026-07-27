@@ -347,6 +347,22 @@ pub(crate) struct SurfaceSpec {
     /// rather than on a binding is what makes the `editor.nav`/`panel`
     /// duplication gap unrepresentable.
     pub(crate) yields_to_engine: bool,
+    /// `true` on `editor.nav` only, and not settable from config. When the
+    /// ANCHOR surface declares it, the US-QWERTY positional probe is withheld
+    /// from every surface on the path — even from a rule that carries
+    /// `<physical>`.
+    ///
+    /// This is the surface-plane transcription of `resolve_panel_key_typed`
+    /// (`src/plugin/input.rs:151-155`), and it is a guard, not a preference.
+    /// On Dvorak the QWERTY-H position emits `d`, so honouring the positional
+    /// probe inside the attached editor turns `Ctrl+d` — half-page-down —
+    /// into panel-left; Colemak does the same to `Ctrl+n` and `Ctrl+e`. It
+    /// lives on the surface rather than on the rule because the reason is a
+    /// property of *where* the key was pressed: inside the editor every chord
+    /// already has a meaning worth protecting, and a positional guess is a
+    /// guess about intent that must never outrank it. Non-Latin layouts lose
+    /// nothing — `resolve_ctrl_key` resolves those to a Latin key as probe 1.
+    pub(crate) refuses_positional: bool,
 }
 
 impl std::fmt::Debug for SurfaceSpec {
@@ -371,6 +387,11 @@ pub(crate) struct SurfacePath {
     pub(crate) seal: Seal,
     /// `yields_to_engine` of the deepest surface only.
     pub(crate) anchor_yields_to_engine: bool,
+    /// `refuses_positional` of the deepest surface only. Withholds probe 3
+    /// from the whole walk, not merely from the anchor's own rules — the
+    /// `<C-h>` rule lives on `panel`, which is the surface a positional guess
+    /// from inside the editor would reach.
+    pub(crate) anchor_refuses_positional: bool,
 }
 
 /// The declared parent relation over a set of surfaces, in probe order.
@@ -466,6 +487,7 @@ impl Forest {
             caps,
             seal: spec.seal,
             anchor_yields_to_engine: spec.yields_to_engine,
+            anchor_refuses_positional: spec.refuses_positional,
         })
     }
 
@@ -695,6 +717,7 @@ mod tests {
         probe: |_| None,
         on_key: None,
         yields_to_engine: false,
+        refuses_positional: false,
     };
     static CHILD: SurfaceSpec = SurfaceSpec {
         id: "t.child",
@@ -704,6 +727,7 @@ mod tests {
         probe: |chain| chain.focus().map(|_| Anchor::Node(0)),
         on_key: None,
         yields_to_engine: false,
+        refuses_positional: false,
     };
     static ORPHAN: SurfaceSpec = SurfaceSpec {
         id: "t.orphan",
@@ -713,6 +737,7 @@ mod tests {
         probe: |_| None,
         on_key: None,
         yields_to_engine: false,
+        refuses_positional: false,
     };
 
     #[test]

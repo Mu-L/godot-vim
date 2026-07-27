@@ -55,6 +55,13 @@ pub(crate) static EDITOR_NAV: SurfaceSpec = SurfaceSpec {
     // parent. That is what makes the editor/panel duplication gap
     // unrepresentable rather than assertion-checked.
     yields_to_engine: true,
+    // The other half of "the editor already has a meaning for every chord".
+    // `panel`'s four rules carry `<physical>`, and this surface's declared
+    // parent IS `panel`, so without this flag a Dvorak `Ctrl+d` would reach
+    // `panel <C-h>` by position and become panel-left instead of half-page
+    // down. Verbatim transcription of the `resolve_panel_key_typed` branch at
+    // `src/plugin/input.rs:151-155`.
+    refuses_positional: true,
 };
 
 pub(crate) static EDITOR_INSERT: SurfaceSpec = SurfaceSpec {
@@ -70,6 +77,8 @@ pub(crate) static EDITOR_INSERT: SurfaceSpec = SurfaceSpec {
     },
     on_key: None,
     yields_to_engine: false,
+    // Moot — a Barrier resolves nothing — but stated rather than inherited.
+    refuses_positional: true,
 };
 
 pub(crate) const PROVIDER: Provider = Provider {

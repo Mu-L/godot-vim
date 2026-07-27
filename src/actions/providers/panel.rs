@@ -32,6 +32,7 @@ pub(crate) static PANEL: SurfaceSpec = SurfaceSpec {
     // upward walk.
     probe: |_| None,
     on_key: None,
+    refuses_positional: false,
     yields_to_engine: false,
 };
 

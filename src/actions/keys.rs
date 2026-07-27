@@ -79,7 +79,33 @@ impl Probes {
 
     /// Probes in priority order, highest first.
     pub(crate) fn iter(&self) -> impl Iterator<Item = KeyEvent> + '_ {
-        self.buf.iter().flatten().copied()
+        self.iter_scoped(true)
+    }
+
+    /// Probes in priority order, admitting the US-QWERTY positional guess
+    /// only when `positional` is true.
+    ///
+    /// The resolver asks per *surface*: probe 3 is offered only where the
+    /// binding index holds a `<physical>`-flagged rule, and never at all on a
+    /// surface that refuses it. One function so [`Self::iter`] and
+    /// [`Self::iter_typed`] cannot drift from the scoped form the walk uses.
+    pub(crate) fn iter_scoped(&self, positional: bool) -> impl Iterator<Item = KeyEvent> + '_ {
+        let stop = if positional {
+            self.buf.len()
+        } else {
+            self.positional.map_or(self.buf.len(), usize::from)
+        };
+        self.buf.iter().take(stop).flatten().copied()
+    }
+
+    /// Whether any probe carries a command chord (Ctrl/Alt/Meta).
+    ///
+    /// The `Sealed` discriminator: a bare key stops at the anchor and falls
+    /// through to the control's own `gui_input`, while a modifier-bearing key
+    /// continues up the forest to `panel`. Shift is deliberately not a
+    /// command modifier — it is folded into the character.
+    pub(crate) fn has_command_modifier(&self) -> bool {
+        self.iter().any(|k| k.modifiers().intersects(CMD_MODS))
     }
 
     /// Probes excluding the US-QWERTY positional guess.
@@ -91,20 +117,20 @@ impl Probes {
     /// Vim chords into panel navigation. Non-Latin layouts are unaffected:
     /// `resolve_ctrl_key` already resolves those to a Latin key as probe 1,
     /// and `latin_key` covers the unmodified case as probe 2.
+    #[allow(
+        dead_code,
+        reason = "the resolver scopes probe 3 per surface via `iter_scoped`; this is the \
+                  named form the design and the probe-order tests speak in"
+    )]
     pub(crate) fn iter_typed(&self) -> impl Iterator<Item = KeyEvent> + '_ {
-        let stop = self.positional.map_or(3, usize::from);
-        self.buf.iter().take(stop).flatten().copied()
-    }
-
-    /// As [`Self::resolve`], but refusing the positional guess.
-    pub(crate) fn resolve_typed<T>(
-        &self,
-        mut table: impl FnMut(KeyEvent) -> Option<T>,
-    ) -> Option<T> {
-        self.iter_typed().find_map(&mut table)
+        self.iter_scoped(false)
     }
 
     /// The as-typed interpretation, if the event decoded at all.
+    #[allow(
+        dead_code,
+        reason = "the probe-pipeline tests assert against it; dispatch reads the whole list"
+    )]
     pub(crate) fn primary(&self) -> Option<KeyEvent> {
         self.buf[0]
     }
@@ -123,6 +149,19 @@ impl Probes {
         self.iter().find_map(&mut table)
     }
 
+    /// A one-entry probe list holding exactly `key`, canonicalized.
+    ///
+    /// For the introspector and nothing else. `:panelmap <C-h>` is a written
+    /// key, not a keystroke: there is no scan code and no layout to derive a
+    /// Latin collapse or a US-QWERTY position from, so synthesizing probes 2
+    /// and 3 would be inventing an answer. The report says so rather than
+    /// pretending the list is complete.
+    pub(crate) fn from_key(key: KeyEvent) -> Self {
+        let mut p = Self::default();
+        p.push(canonicalize(key), false);
+        p
+    }
+
     /// Build a probe list directly. Test-only: production probes always come
     /// from [`probes`] so the pipeline stays the single source of truth.
     #[cfg(test)]
@@ -130,6 +169,20 @@ impl Probes {
         let mut p = Self::default();
         for &k in keys {
             p.push(k, false);
+        }
+        p
+    }
+
+    /// As [`Self::from_slice`], but marking the LAST entry as the US-QWERTY
+    /// positional guess — the shape `probes_from_parts` produces on Dvorak,
+    /// Colemak, AZERTY and QWERTZ. Test-only, and the only way to exercise
+    /// the surfaces that refuse probe 3.
+    #[cfg(test)]
+    pub(crate) fn from_slice_positional(keys: &[KeyEvent]) -> Self {
+        let mut p = Self::default();
+        let last = keys.len().saturating_sub(1);
+        for (i, &k) in keys.iter().enumerate() {
+            p.push(k, i == last && keys.len() > 1);
         }
         p
     }

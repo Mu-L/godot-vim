@@ -242,7 +242,10 @@ fn handle_host_pending_ui_action(
         | PendingUiAction::ShowTooltip { .. }
         // Must be forwarded, not handled here: running an ActionSpec needs
         // `&mut GodotVimCore`, which this scope does not have.
-        | PendingUiAction::RunRegistryAction { .. } => {
+        | PendingUiAction::RunRegistryAction { .. }
+        // Same reason: the binding index and the surface forest both live on
+        // `GodotVimCore`. Swallowed here, `:panelmap` would print nothing.
+        | PendingUiAction::PanelCommand(..) => {
             ctx.transient.pending_ui_actions.push(action);
         }
         PendingUiAction::ShowUndoTree => {

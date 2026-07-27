@@ -50,7 +50,20 @@ pub(crate) static DOCK_FILESYSTEM: SurfaceSpec = SurfaceSpec {
     probe: |chain| {
         (chain.in_filesystem_dock && focuses_nav_widget(chain)).then_some(Anchor::Node(0))
     },
-    on_key: None,
+    // The one shipped hook, and it belongs to no binding: the stale-prompt
+    // auto-dismiss that used to sit at the top of `FileSystemExplorer::
+    // handle_key`, before the modifier filter and before any key was
+    // resolved. Extracting the keyset into rules would otherwise have lost
+    // it, and it is reachable for MORE keys here than it was there —
+    // `should_intercept_hjkl` used to return before the dock arm ran, so
+    // Ctrl+L with the create prompt open moved focus away and left the prompt
+    // pointing at a Tree it would later steal focus back to.
+    on_key: Some(|cx| {
+        if let Some(fs) = cx.fs() {
+            fs.on_key_tick();
+        }
+    }),
+    refuses_positional: false,
     yields_to_engine: false,
 };
 

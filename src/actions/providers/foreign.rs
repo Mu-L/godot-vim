@@ -58,6 +58,7 @@ pub(crate) static FOREIGN: SurfaceSpec = SurfaceSpec {
         None
     },
     on_key: None,
+    refuses_positional: false,
     yields_to_engine: false,
 };
 

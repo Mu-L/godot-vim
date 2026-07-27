@@ -6,30 +6,78 @@
 // without calling .apply_ui_update() or .discard() is a compile-time error.
 #![deny(unused_must_use)]
 
-use godot::classes::{CodeEdit, EditorInterface, InputEvent, InputEventKey};
+use godot::classes::{CodeEdit, Control, EditorInterface, InputEvent, InputEventKey, Viewport};
 use godot::global::Key;
 use godot::prelude::*;
 
+use crate::actions::action::{ActionCtx, Params};
+use crate::actions::outcome::Outcome;
+use crate::actions::resolve::{
+    self, Candidate, CandidateTarget, Disposition, Resolution, ResolveInput,
+};
+use crate::actions::surface::{FocusChain, Seal, SurfacePath};
 use crate::bridge;
 use crate::controller::VimController;
-use crate::navigation::{self, classify_focus, FocusContext};
 use crate::ui::UiCoordinator;
 
 use super::outcome::EngineOutcome;
 use super::processing_guard::ProcessingKeyGuard;
 use super::GodotVimCore;
 
+/// The sampled chain, and the state it was sampled against.
+///
+/// `FocusChain::sample` walks the focus owner's ancestors and asks each one
+/// six `is_class` questions, then runs an unbounded `is_ancestor_of` and, for
+/// a `LineEdit`, a depth-20 sibling DFS. That is far too much to do at the OS
+/// key-repeat rate, so it is done once per *distinct* key below and reused.
+///
+/// Every field of the key is a fact a probe reads. `editor_mode` is in there
+/// for a reason worth stating: a mode change does **not** change the focus
+/// owner, so keying on focus alone would leave a stale `Normal` behind when
+/// the user typed `i` — and `editor.insert` would stop being a barrier while
+/// Ctrl+H is backspace. Caching the expensive half and re-stamping the cheap
+/// half would work equally well; keying on all of it is simpler and cannot
+/// silently miss a field.
+#[derive(Debug)]
+pub(super) struct ChainCache {
+    key: ChainKey,
+    chain: FocusChain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainKey {
+    focus: Option<InstanceId>,
+    attached: Option<InstanceId>,
+    mode: Option<vim_core::primitives::Mode>,
+    prompt: Option<InstanceId>,
+    /// Bumped whenever the binding index is rebuilt, which is what makes a
+    /// config reload invalidate the cache.
+    generation: u64,
+}
+
 impl GodotVimCore {
-    /// Global `input()` handler (Godot stage 1 -- fires before `gui_input`).
+    /// Global `input()` handler (Godot stage 1 — fires before `gui_input`).
     ///
-    /// Intercepts two categories before they reach the Vim engine or native controls:
-    /// 1. **Cross-panel navigation** (Ctrl+hjkl) -- consumed from all contexts
-    ///    except Foreign text input, so Godot never handles these keys natively.
-    /// 2. **Dock/search navigation** (j/k/h/l/Enter/Esc) -- only when focus is
-    ///    on a navigable dock or search box.
+    /// The staged model of `docs/DESIGN-rebindable-nav.md` §5, in order:
+    /// transport guards → surface sampling → barrier → probes → per-surface
+    /// hooks → resolution → arbitration → execution → consumption.
     ///
-    /// Editor-context keys fall through to the per-editor `gui_input` pipeline.
+    /// Nothing here knows what a dock is, which widget classes navigate, or
+    /// which key does what. It samples where the keystroke is, asks the
+    /// binding plane what that means, runs the answer, and applies the
+    /// answer's declared consumption policy. Adding a panel touches this
+    /// function zero times.
+    ///
+    /// # Ordering note
+    ///
+    /// The design lists key identity (S1) before sampling (S2); this samples
+    /// first and decodes after the barrier check. The two are observably
+    /// identical — building a probe list has no side effects — and the swap
+    /// buys back the early return the old dispatcher had: typing in Insert
+    /// mode or inside a foreign `LineEdit` hits a `Barrier` and never runs
+    /// `translate_key` a second time at the OS repeat rate.
     pub(super) fn handle_input_impl(&mut self, event: Gd<InputEvent>) {
+        // ── S0: transport guards, unchanged ──────────────────────────
         if !self.enabled {
             return;
         }
@@ -39,10 +87,8 @@ impl GodotVimCore {
         if !key_event.is_pressed() {
             return;
         }
-
-        let keycode = key_event.get_keycode();
         if matches!(
-            keycode,
+            key_event.get_keycode(),
             Key::SHIFT
                 | Key::CTRL
                 | Key::ALT
@@ -61,143 +107,187 @@ impl GodotVimCore {
             return;
         };
 
-        // Phase 1: decide, holding only an immutable borrow of self.attached_editor.
-        let (attached_id, stale) = match self.attached_editor.as_ref() {
-            Some(e) if e.is_instance_valid() => (Some(e.instance_id()), false),
-            Some(_) => (None, true), // editor freed externally (e.g. a foreign addon closed its view)
-            None => (None, false),
-        };
-        // Phase 2: borrow released — now safe to take &mut self.
+        // Stale-editor self-heal. Phase 1 holds only an immutable borrow of
+        // `attached_editor`; phase 2 releases it before taking `&mut self`.
+        let stale = matches!(self.attached_editor.as_ref(), Some(e) if !e.is_instance_valid());
         if stale {
-            // Deref-free self-heal: drop the stale handle. detach() is self-completing (Task 3).
+            // Deref-free: drop the stale handle. `detach()` is self-completing.
             self.detach();
             self.last_editor_id = None;
         }
-        let context = classify_focus(&viewport, attached_id);
 
-        // Consume Ctrl+hjkl for cross-panel navigation, with mode awareness:
-        // - Foreign: never intercept (user is typing in a non-Vim text input)
-        // - Editor in Insert/Replace/CommandLine/Select: don't intercept —
-        //   Ctrl+H=backspace, Ctrl+J=newline, Ctrl+K=digraph are Vim bindings
-        // - Editor in Normal/Visual/OP: intercept — no Vim Ctrl+hjkl bindings
-        // - Dock/Search/Unknown: always intercept
-        let is_ctrl_only = key_event.is_ctrl_pressed()
-            && !key_event.is_alt_pressed()
-            && !key_event.is_meta_pressed()
-            && !key_event.is_shift_pressed();
+        // ── S2: sample the chain (cached) and classify it ────────────
+        let Some(path) = self.surface_path(&viewport) else {
+            // Unreachable with the shipped forest — `unknown` probes
+            // unconditionally — but a third-party forest with no total probe
+            // must not consume the key.
+            log::error!("input: no surface claimed the focus chain");
+            return;
+        };
 
-        // One key vocabulary for every shell-side handler below; each tries
-        // the probes in priority order against its own whole keyset. See
-        // `crate::actions::keys`.
-        //
-        // Decoded lazily and only where a decision depends on it. Everything
-        // this function can still do from here needs either the panel chord
-        // (gated on `is_ctrl_only`) or a dock/search-box context; for anything
-        // else both `should_intercept_hjkl` and `consumed` are false and the
-        // handler is a no-op. Decoding unconditionally would run
-        // `translate_key` a second time on every keystroke editor-wide — it
-        // already runs once per key in `gui_input` — at the OS repeat rate.
-        if !is_ctrl_only
-            && !matches!(
-                context,
-                FocusContext::Dock(..) | FocusContext::SearchBox(..)
-            )
-        {
+        // ── S3: a barrier is a total hard stop, before any hook ──────
+        if path.seal == Seal::Barrier {
             return;
         }
+
+        // ── S1: one key vocabulary for the whole shell-side surface ──
         let probes = crate::actions::keys::probes(&key_event, self.langmap.as_ref());
         if probes.is_empty() {
             return;
         }
-        let should_intercept_hjkl = is_ctrl_only
-            && match context {
-                FocusContext::Foreign => false,
-                FocusContext::Editor => {
-                    self.controller.as_ref().is_none_or(|c| {
-                        let mode = c.mode();
-                        let is_nav_mode = matches!(
-                            mode,
-                            vim_core::primitives::Mode::Normal
-                                | vim_core::primitives::Mode::Visual(_)
-                                | vim_core::primitives::Mode::OperatorPending(_)
-                        );
-                        // Select mode intentionally excluded — it's insert-like,
-                        // so Ctrl+H/J/K/L should reach the engine (backspace,
-                        // newline, etc.), not navigate panels.
-                        if !is_nav_mode {
-                            return false;
-                        }
-                        // User mappings take priority over panel navigation.
-                        // If the mapping trie has an entry for this Ctrl+hjkl key,
-                        // let it flow through to gui_input where the mapping system
-                        // handles it.
-                        // Ask the engine about the interpretation we would
-                        // actually consume, not the raw logical keycode — on a
-                        // non-Latin layout those differ, and asking about the
-                        // wrong one denied panel navigation from the editor.
-                        match navigation::window::resolve_panel_key_typed(&probes) {
-                            Some((matched, _)) => !c.could_start_mapping(matched),
-                            None => false, // not a panel chord — don't intercept
-                        }
-                    })
-                }
-                FocusContext::Dock(..) | FocusContext::SearchBox(..) | FocusContext::Unknown => {
-                    true
-                }
-            };
-        if should_intercept_hjkl {
-            // Editor focus refuses the positional guess (see
-            // `resolve_panel_key_typed`); every other context honours it.
-            let resolved = if matches!(context, FocusContext::Editor) {
-                navigation::window::resolve_panel_key_typed(&probes)
-            } else {
-                navigation::window::resolve_panel_key(&probes)
-            };
-            if let Some((_, direction)) = resolved {
-                if let Some(focus_owner) = viewport.gui_get_focus_owner() {
-                    let control: Gd<godot::classes::Control> = focus_owner.upcast();
-                    let _ = navigation::handle_window_nav(&control, direction);
-                }
-                log::trace!("input: Ctrl+hjkl consumed key={:?}", probes.primary());
-                viewport.set_input_as_handled();
-                return;
-            }
-        }
+        let is_echo = key_event.is_echo();
 
-        let consumed = match context {
-            FocusContext::Editor | FocusContext::Foreign | FocusContext::Unknown => false,
-            FocusContext::Dock(kind, control) => {
-                let result = if navigation::is_in_filesystem_dock(&control) {
-                    let fs_result = self.fs_explorer.handle_key(&probes, &control, kind);
-                    if fs_result.is_consumed() {
-                        log::trace!("input: filesystem explorer consumed key={:?}", keycode);
-                        fs_result
-                    } else {
-                        navigation::handle_dock_input(control, &probes, kind, &self.actions)
-                    }
-                } else {
-                    navigation::handle_dock_input(control, &probes, kind, &self.actions)
-                };
-                if result.is_consumed() {
-                    log::trace!("input: dock navigation consumed key={:?}", keycode);
-                }
-                result.is_consumed()
-            }
-            FocusContext::SearchBox(line_edit) => {
-                if self.fs_explorer.is_prompt_active(&line_edit) {
-                    false
-                } else {
-                    let result = navigation::handle_search_input(&line_edit, &probes);
-                    if result.is_consumed() {
-                        log::trace!("input: search box consumed key={:?}", keycode);
-                    }
-                    result.is_consumed()
-                }
-            }
+        // ── S4: per-surface hooks, before any lookup ─────────────────
+        self.run_surface_hooks(&path, &viewport);
+
+        // ── S5/S6: resolve, then arbitrate ───────────────────────────
+        let resolution = {
+            let controller = self.controller.as_ref();
+            // The polarity flip lives in `engine_claims`, written down once
+            // and unit-tested there: no controller must mean INTERCEPT.
+            let claims = |k: vim_core::keymap::KeyEvent| {
+                resolve::engine_claims(controller, k, VimController::could_start_mapping)
+            };
+            resolve::resolve(&ResolveInput {
+                probes: &probes,
+                path: &path,
+                index: &self.bindings,
+                registry: &self.actions,
+                vim_claims: &claims,
+            })
+        };
+        let Resolution::Run {
+            matched,
+            candidates,
+        } = resolution
+        else {
+            return;
         };
 
-        if consumed {
+        // ── S7/S8: run the plan, then apply its consumption policy ───
+        let target = viewport
+            .gui_get_focus_owner()
+            .map(godot::obj::Gd::upcast::<Control>);
+        let disposition = resolve::dispose(&candidates, is_echo, |candidate| {
+            self.run_candidate(candidate, target.clone())
+        });
+
+        // ── S9: commit on THIS transport's viewport ──────────────────
+        if disposition == Disposition::Consume {
+            log::trace!(
+                "input: consumed {matched} via {}",
+                candidates.first().map_or("<none>", |c| c.surface)
+            );
             viewport.set_input_as_handled();
+        }
+    }
+
+    /// Sample the focus chain (cached) and classify it into a surface path.
+    ///
+    /// Classifies against the index's OWN forest rather than a fresh
+    /// `providers::forest()`: that constructor allocates a `Vec` of every
+    /// declared surface, and this runs at the OS key-repeat rate. Reading the
+    /// index's copy also guarantees the classification and the trie lookups
+    /// that follow agree about what the forest is.
+    fn surface_path(&mut self, viewport: &Gd<Viewport>) -> Option<SurfacePath> {
+        self.refresh_focus_chain(viewport);
+        let chain = &self.chain_cache.as_ref()?.chain;
+        self.bindings.forest().classify(chain)
+    }
+
+    /// Re-sample the chain if anything a probe reads has changed.
+    fn refresh_focus_chain(&mut self, viewport: &Gd<Viewport>) {
+        let key = ChainKey {
+            focus: viewport
+                .gui_get_focus_owner()
+                .map(|owner| owner.instance_id()),
+            attached: self
+                .attached_editor
+                .as_ref()
+                .filter(|e| e.is_instance_valid())
+                .map(Gd::instance_id),
+            mode: self.controller.as_ref().map(VimController::mode),
+            prompt: self.fs_explorer.prompt_instance(),
+            generation: self.bindings.generation,
+        };
+        if self.chain_cache.as_ref().is_none_or(|c| c.key != key) {
+            log::trace!("input: resampling focus chain");
+            let chain = FocusChain::sample(viewport, key.attached, key.mode, key.prompt);
+            self.chain_cache = Some(ChainCache { key, chain });
+        } else if let Some(cached) = self.chain_cache.as_ref() {
+            // A hit whose chain disagrees with its own key means the key and
+            // the sampler read different things — the exact desync that would
+            // leave `editor.insert` classified as `editor.nav`. Cheap enough
+            // to assert on every keystroke in a debug build.
+            debug_assert_eq!(cached.chain.attached_editor, key.attached);
+            debug_assert_eq!(cached.chain.editor_mode, key.mode);
+        }
+    }
+
+    /// Drop the cached chain. Called wherever a fact the probes read can
+    /// change without the focus owner, the mode, the prompt or the index
+    /// generation changing with it — teardown and re-enable, mainly.
+    pub(super) fn invalidate_focus_chain(&mut self) {
+        self.chain_cache = None;
+    }
+
+    /// S4 — run every surface's `on_key` hook, deepest first.
+    ///
+    /// Before any lookup and regardless of whether a binding matches, because
+    /// the one shipped hook belongs to no binding: it is the FileSystem
+    /// dock's stale-prompt auto-dismiss, which used to run at the top of
+    /// `handle_key` for every key including modified ones.
+    fn run_surface_hooks(&mut self, path: &SurfacePath, viewport: &Gd<Viewport>) {
+        // Collected first: the forest lookup borrows `self.bindings` and the
+        // hook takes `&mut self.fs_explorer`. `ArrayVec`-free because the
+        // shipped forest declares exactly one hook and the common case
+        // allocates nothing at all — `Vec::new()` on the empty path.
+        let hooks: Vec<fn(&mut ActionCtx<'_>)> = path
+            .ids
+            .iter()
+            .filter_map(|id| self.bindings.forest().get(id).and_then(|spec| spec.on_key))
+            .collect();
+        if hooks.is_empty() {
+            return;
+        }
+        let target = viewport
+            .gui_get_focus_owner()
+            .map(godot::obj::Gd::upcast::<Control>);
+        let mut cx = ActionCtx::new(target, Params::new()).with_fs(&mut self.fs_explorer);
+        for hook in hooks {
+            hook(&mut cx);
+        }
+    }
+
+    /// S7 — run one candidate.
+    ///
+    /// The `&'static ActionSpec` is copied out of the resolution rather than
+    /// re-read from the registry, so no registry borrow spans the call and
+    /// the action is free to take `&mut` on the plugin's own fields.
+    fn run_candidate(&mut self, candidate: &Candidate, target: Option<Gd<Control>>) -> Outcome {
+        match &candidate.target {
+            CandidateTarget::Action(_, spec) => {
+                let mut cx =
+                    ActionCtx::new(target, candidate.params.clone()).with_fs(&mut self.fs_explorer);
+                let outcome = (spec.run)(&mut cx);
+                log::trace!("input: {} -> {outcome:?}", spec.id);
+                outcome
+            }
+            CandidateTarget::Shortcut(path) => {
+                // Deliberately not implemented at this phase. Delegating to
+                // one of Godot's own shortcuts means re-injecting an event
+                // into the same `_input` flush that dispatched it, and
+                // `Input::parse_input_event` appends to the list
+                // `flush_buffered_events` is draining — an unguarded
+                // delegation is a hard editor hang, not a slow loop. The
+                // registration-time cycle audit, the injection fingerprint
+                // and the per-frame budget that make it safe are a phase of
+                // their own; until then the rule declines and the key
+                // reaches Godot, which is the failure direction that loses
+                // nothing. No shipped default uses this target.
+                log::warn!("input: <Shortcut>({path}) targets are not dispatched yet");
+                Outcome::Declined
+            }
         }
     }
 

@@ -1,24 +1,28 @@
-//! Top-level dock input dispatcher.
+//! The dock executors, and the decision tables they replaced.
 //!
-//! Routes plain (unmodified) keystrokes to dock navigation handlers based on
-//! the focused control's `DockKind`. This gives Vim-style j/k/h/l navigation
-//! within Godot's Tree, ItemList, and RichTextLabel dock controls, plus `/`
-//! to focus the dock's search box and `ESC` to return to the code editor.
+//! Vim-style j/k/h/l navigation within Godot's Tree, ItemList and
+//! RichTextLabel dock controls, plus `/` to focus the dock's search box and
+//! `ESC` to return to the code editor. Every one of these is now reached by
+//! NAME through an `ActionSpec`, resolved from the `dock` surface's binding
+//! trie — the dispatcher no longer knows this file exists.
 //!
-//! Modified keys (Ctrl/Alt/Meta/Shift) always pass through: Ctrl+hjkl is
-//! intercepted at a higher priority in `input.rs` for cross-panel navigation.
+//! # Why the old resolvers are still here
+//!
+//! [`resolve_dock_key`] and [`resolve_search_key`] have no production caller
+//! any more; the binding index is the live table. They stay because P0's
+//! characterization suite is the acceptance gate for the cutover and pins
+//! them by name — including the two asymmetries a unified dispatcher is most
+//! tempted to erase: a dock rejects every modifier *including Shift*, while
+//! the search box tolerates Shift and rejects only Ctrl/Alt/Meta. Deleting
+//! them would delete the proof that the new table says the same thing.
 
 use godot::classes::{CodeEdit, Control, EditorInterface, Node};
 use godot::prelude::*;
 use vim_core::keymap::{Key as VimKey, KeyEvent, Modifiers};
 
-use crate::actions::action::{ActionCtx, ActionRegistry, Params};
-use crate::actions::caps::Caps;
 use crate::actions::keys::{Probes, CMD_MODS};
-use crate::actions::specs;
 
 use super::dock_search::{find_sibling_nav_control, find_sibling_search_box};
-use super::focus::DockKind;
 use crate::scene_tree::{find_child_of_type, MAX_DISCOVERY_DEPTH};
 
 /// Retained so every existing call site compiles unchanged.
@@ -28,8 +32,31 @@ use crate::scene_tree::{find_child_of_type, MAX_DISCOVERY_DEPTH};
 /// which is why the `Ignored` → `Declined` rename had to land first.
 pub(crate) use crate::actions::outcome::Outcome as DockInputResult;
 
+/// The dock widgets whose *signal contracts* differ.
+///
+/// Moved here when `focus.rs` was deleted rather than dying with
+/// `FocusContext`, because the distinction is real at the Godot API level and
+/// not merely a dispatch convenience: `Tree::item_activated` takes **no**
+/// parameters while `ItemList::item_activated` takes an index
+/// (godot `scene/gui/tree.cpp:7534` vs `scene/gui/item_list.cpp:2486`).
+/// Emitting the wrong arity is not a no-op — it is
+/// `CALL_ERROR_TOO_MANY_ARGUMENTS`, and the editor's handler does not run.
+///
+/// It is NOT a classification: which surface a control belongs to is the
+/// binding plane's question, answered by `Caps` and the surface forest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockKind {
+    Tree,
+    ItemList,
+    RichTextLabel,
+}
+
 /// Direction for hjkl dock navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 enum DockHjkl {
     Down,
     Up,
@@ -40,6 +67,10 @@ enum DockHjkl {
 /// What a plain (unmodified) keystroke resolves to in a dock, before any
 /// widget is touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 enum DockKeyAction {
     Hjkl(DockHjkl),
     Slash,
@@ -53,6 +84,10 @@ enum DockKeyAction {
 /// Docks reject **every** modifier, Shift included — a modified key belongs
 /// to the editor or the IDE, not here. The search box is deliberately more
 /// permissive; see [`resolve_search_key`].
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 fn dock_action_for(key: KeyEvent) -> Option<DockKeyAction> {
     if key.modifiers() != Modifiers::NONE {
         return None;
@@ -76,73 +111,17 @@ fn dock_action_for(key: KeyEvent) -> Option<DockKeyAction> {
 /// under the old per-arm fallback the hjkl arm consulted the physical keycode
 /// and returned before the arm owning `Key::SLASH` was reached, so on a layout
 /// whose QWERTY-J position emits `/` the filter box was unreachable.
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 fn resolve_dock_key(probes: &Probes) -> DockKeyAction {
     probes
         .resolve(dock_action_for)
         .unwrap_or(DockKeyAction::None)
 }
 
-pub(crate) fn handle_dock_input(
-    focused: Gd<Control>,
-    probes: &Probes,
-    dock_kind: DockKind,
-    registry: &ActionRegistry,
-) -> DockInputResult {
-    log::trace!(
-        "dock_input: key={:?} kind={:?}",
-        probes.primary(),
-        dock_kind
-    );
-
-    // One ordered probe list covers the whole keyset; see `actions::keys`.
-    // Enter and Escape never receive a positional probe — that is enforced in
-    // `probes_from_parts`, not left to chance.
-    let action = resolve_dock_key(probes);
-    if let DockKeyAction::Hjkl(direction) = action {
-        // Dispatch through the action plane. The capability gate is what makes
-        // `h`/`l` inert on a list with no hierarchy — no `DockKind` match arm
-        // here, and no widget class named anywhere in this function.
-        // Named by static, not by string literal: a typo would otherwise
-        // compile clean, miss the registry, and silently kill hjkl in every
-        // dock with a green test suite.
-        let spec = match direction {
-            DockHjkl::Down => &specs::ITEM_NEXT,
-            DockHjkl::Up => &specs::ITEM_PREV,
-            DockHjkl::Left => &specs::ITEM_COLLAPSE,
-            DockHjkl::Right => &specs::ITEM_EXPAND,
-        };
-        let Some(id) = registry.id_of(spec.id) else {
-            log::error!("dock_input: {} is not registered", spec.id);
-            return DockInputResult::Declined;
-        };
-        // Capability gate lives HERE, on the binding path — never inside
-        // `registry.run`. An action invoked by name from the command line has
-        // no sampled widget and must not be filtered by one.
-        let caps = caps_of(&focused);
-        if !registry.caps_allow(id, caps) {
-            return DockInputResult::Declined;
-        }
-        let mut cx = ActionCtx::new(Some(focused), Params::new());
-        return registry.run(id, &mut cx);
-    }
-
-    match action {
-        DockKeyAction::Slash => handle_slash(&focused),
-        DockKeyAction::Enter => handle_enter(&focused, dock_kind),
-        DockKeyAction::Escape => handle_escape_from_dock(),
-        // Hjkl already returned above; None falls through.
-        DockKeyAction::Hjkl(_) | DockKeyAction::None => DockInputResult::Declined,
-    }
-}
-
 /// Classify a control into the dock kind whose signal contract it follows.
-///
-/// Survives the eventual deletion of `FocusContext` because the distinction
-/// is real at the Godot API level, not merely a dispatch convenience:
-/// `Tree::item_activated` takes **no** parameters while
-/// `ItemList::item_activated` takes an index (godot `scene/gui/tree.cpp:7534`
-/// vs `scene/gui/item_list.cpp:2486`). Emitting the wrong arity is not a
-/// no-op — it is `CALL_ERROR_TOO_MANY_ARGUMENTS`, and the handler does not run.
 pub(crate) fn dock_kind_of(control: &Gd<Control>) -> Option<DockKind> {
     let node = control.clone().upcast::<Node>();
     if node.is_class("Tree") {
@@ -156,19 +135,14 @@ pub(crate) fn dock_kind_of(control: &Gd<Control>) -> Option<DockKind> {
     }
 }
 
-/// Capabilities the focused control contributes.
-///
-/// Uses `is_class` so the inheritance chain is walked — `FileSystemTree` is a
-/// `Tree`, `FileSystemList` is an `ItemList`.
-fn caps_of(control: &Gd<Control>) -> Caps {
-    let node = control.clone().upcast::<Node>();
-    Caps::of_control(|class| node.is_class(class))
-}
-
 /// Resolve a keystroke inside a dock search box.
 ///
 /// What a keystroke resolves to while a dock's filter `LineEdit` has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 enum SearchKeyAction {
     /// Return focus to the sibling nav control, preserving the filter text.
     LeaveSearch,
@@ -185,6 +159,10 @@ enum SearchKeyAction {
 /// costs nothing here: Enter and Escape are named keys, and a named key never
 /// receives a positional probe, so probes 2 and 3 can only ever produce
 /// characters this table does not bind.
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 fn search_action_for(key: KeyEvent) -> Option<SearchKeyAction> {
     if key.modifiers().intersects(CMD_MODS) {
         return None;
@@ -195,38 +173,37 @@ fn search_action_for(key: KeyEvent) -> Option<SearchKeyAction> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "the live table is the binding index; this is P0's characterization oracle"
+)]
 fn resolve_search_key(probes: &Probes) -> SearchKeyAction {
     probes
         .resolve(search_action_for)
         .unwrap_or(SearchKeyAction::None)
 }
 
-/// Only intercepts ESC and Enter from dock search boxes — all other keys
-/// pass through for normal typing. Both keys return focus to the sibling
-/// nav control (Tree/ItemList), preserving the search filter text.
-pub(crate) fn handle_search_input(
-    line_edit: &Gd<godot::classes::LineEdit>,
-    probes: &Probes,
-) -> DockInputResult {
-    let action = resolve_search_key(probes);
-
-    match action {
-        SearchKeyAction::LeaveSearch => {
-            let control: Gd<Control> = line_edit.clone().upcast();
-            if let Some(nav) = find_sibling_nav_control(&control) {
-                defer_grab_focus(&nav);
-                DockInputResult::FocusChanged
-            } else {
-                // No sibling nav control — fall back to the script editor.
-                handle_escape_from_dock()
-            }
-        }
-        SearchKeyAction::None => DockInputResult::Declined,
+/// Leave a dock's filter box, keeping the filter text.
+///
+/// The executor behind `godotvim.search.accept`, reached from the `searchbox`
+/// surface by `<CR>` and `<Esc>` — both of which tolerate Shift, which is why
+/// those two rules and only those two carry the `<shift>` flag.
+///
+/// Escape does **not** clear the filter; it returns focus to the sibling nav
+/// control with the text intact, and falls back to the script editor when the
+/// dock has no nav control to return to.
+pub(crate) fn leave_search(focused: &Gd<Control>) -> DockInputResult {
+    if let Some(nav) = find_sibling_nav_control(focused) {
+        defer_grab_focus(&nav);
+        DockInputResult::FocusChanged
+    } else {
+        // No sibling nav control — fall back to the script editor.
+        handle_escape_from_dock()
     }
 }
 
 /// `/` — Vim-style "search": focus the dock's filter/search LineEdit.
-fn handle_slash(focused: &Gd<Control>) -> DockInputResult {
+pub(crate) fn handle_slash(focused: &Gd<Control>) -> DockInputResult {
     if let Some(search_box) = find_sibling_search_box(focused) {
         defer_grab_focus(&search_box);
         let mut node: Gd<Node> = search_box.clone().upcast();
@@ -281,7 +258,7 @@ fn defer_grab_focus(target: &Gd<impl Inherits<Node>>) {
 ///
 /// Tries CodeEdit first (the primary editing surface), then TextEdit (shader
 /// editors), then the editor container itself as a last resort.
-fn handle_escape_from_dock() -> DockInputResult {
+pub(crate) fn handle_escape_from_dock() -> DockInputResult {
     let interface = EditorInterface::singleton();
     let Some(script_editor) = interface.get_script_editor() else {
         return DockInputResult::Declined;
