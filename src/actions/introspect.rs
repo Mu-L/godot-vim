@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 use vim_core::keymap::{KeyEvent, MappingOwner};
 
 use super::action::{ActionRegistry, RuleTarget};
-use super::bind::{BindingIndex, Consumption, Repeat, Rule};
+use super::bind::{BindingIndex, Consumption, PanelDiagnostic, Repeat, Rule};
 use super::keys::{parse_lhs, Probes};
 use super::resolve::{resolve, CandidateTarget, Resolution, ResolveInput, Stop};
 use super::surface::{Anchor, FocusChain, Seal, SurfacePath};
@@ -82,13 +82,25 @@ fn owner_label(owner: &MappingOwner) -> String {
     }
 }
 
-/// `:panelmap` with no arguments — every live binding, by surface.
+/// `:panelmap` with no arguments — every live binding, by surface, and every
+/// line of the user's config that did not become one.
 ///
 /// Surfaces are listed in forest (probe) order, and rules within a surface in
 /// slot-allocation order, because both are deterministic and neither is a
 /// hash iteration. The introspector's golden snapshots depend on that, and so
 /// does a user diffing two runs.
-pub(crate) fn list_report(index: &BindingIndex, registry: &ActionRegistry) -> String {
+///
+/// `diagnostics` is the residue of `bind::apply_text` over the vimrc. It is a
+/// parameter rather than something read off the index because a rejected line
+/// installs nothing — there is no rule to hang it on, which is precisely why
+/// it was invisible: the only other place it went was a `log::warn!`, and the
+/// default Log Level is Off. A rejected binding the user cannot read about is
+/// the same as a silent dead key.
+pub(crate) fn list_report(
+    index: &BindingIndex,
+    registry: &ActionRegistry,
+    diagnostics: &[PanelDiagnostic],
+) -> String {
     let mut out = String::new();
     out.push_str("--- panel bindings ---\n");
     let mut total = 0_usize;
@@ -136,6 +148,16 @@ pub(crate) fn list_report(index: &BindingIndex, registry: &ActionRegistry) -> St
         }
     }
     let _ = writeln!(out, "--- {total} binding(s) ---");
+    if !diagnostics.is_empty() {
+        let _ = writeln!(
+            out,
+            "--- {} rejected line(s) — these bound NOTHING ---",
+            diagnostics.len()
+        );
+        for diagnostic in diagnostics {
+            let _ = writeln!(out, "  {diagnostic}");
+        }
+    }
     out
 }
 
@@ -266,7 +288,15 @@ pub(crate) fn explain_report(
                     },
                 ),
                 RuleTarget::Native => "native — hands the key back and stops the walk".to_string(),
-                RuleTarget::Shortcut(p) => format!("eligible (editor shortcut {p})"),
+                // Not "eligible". `run_candidate` declines every `<Shortcut>`
+                // unconditionally, so a report that called this eligible was
+                // actively confirming a key that can never fire. Registration
+                // refuses such a rule now, so this arm is only reachable for a
+                // rule installed through `upsert` — but the introspector must
+                // not be the one that lies about it.
+                RuleTarget::Shortcut(p) => {
+                    format!("NOT DISPATCHED — editor shortcut {p} always declines")
+                }
             };
             let _ = writeln!(
                 out,
@@ -297,7 +327,9 @@ pub(crate) fn explain_report(
             for candidate in &candidates {
                 let name = match &candidate.target {
                     CandidateTarget::Action(_, spec) => spec.id.to_string(),
-                    CandidateTarget::Shortcut(p) => format!("<Shortcut>({p})"),
+                    CandidateTarget::Shortcut(p) => {
+                        format!("<Shortcut>({p}) — NOT DISPATCHED, always declines")
+                    }
                 };
                 let consumption = match candidate.consume {
                     Consumption::Void => {
@@ -357,6 +389,7 @@ fn explain_stop(stop: Stop) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::action::Params;
     use crate::actions::bind::builtin_index;
     use crate::actions::caps::Caps;
     use crate::actions::providers;
@@ -396,6 +429,77 @@ mod tests {
         }
     }
 
+    /// What `plugin::input::run_candidate` can actually *do* with a target,
+    /// modelled arm for arm.
+    ///
+    /// A stand-in rather than the real thing because `run_candidate` takes
+    /// `Gd<Control>` and cannot be constructed under `cargo test` in a
+    /// cdylib. Exhaustive on purpose: a fourth `RuleTarget` added without a
+    /// decision here fails to compile, which is the only way this stays
+    /// honest.
+    const fn dispatcher_can_fire(target: &RuleTarget) -> bool {
+        match target {
+            // Built into an `ActionCtx` and run.
+            RuleTarget::Action(_) => true,
+            // Terminates the walk before `run_candidate` is reached at all —
+            // deliberately, and the report says so in its own words.
+            RuleTarget::Native => false,
+            // `log::warn!` (Log Level defaults to Off) then
+            // `Outcome::Declined`, unconditionally.
+            RuleTarget::Shortcut(_) => false,
+        }
+    }
+
+    fn explain_with(
+        index: &BindingIndex,
+        lhs: &str,
+        chain: &FocusChain,
+        claims: &dyn Fn(KeyEvent) -> bool,
+    ) -> String {
+        let reg = registry();
+        let path = providers::forest().classify(chain).expect("total probe");
+        explain_report(lhs, chain, &path, index, &reg, claims)
+    }
+
+    #[test]
+    fn the_report_calls_a_key_eligible_exactly_when_the_dispatcher_can_fire_it() {
+        // The anti-drift pair. `<Shortcut>` used to print as
+        // "eligible (editor shortcut …)" while `run_candidate` declined it
+        // unconditionally — the introspector actively confirming a dead key,
+        // which is the exact failure the introspector exists to prevent.
+        // Installed through `upsert` rather than `try_insert` because
+        // registration now refuses the undispatched targets; the report must
+        // still be honest about a rule that reached the index some other way.
+        let reg = registry();
+        let targets = [
+            RuleTarget::Action(reg.id_of("godotvim.item.next").expect("shipped verb")),
+            RuleTarget::Native,
+            RuleTarget::Shortcut("filesystem_dock/rename".into()),
+        ];
+        for target in targets {
+            let mut index = builtin_index(&reg);
+            index.upsert(Rule {
+                surface: "dock",
+                lhs: vec![KeyEvent::new(VimKey::Char('q'), Modifiers::NONE)],
+                target: target.clone(),
+                params: Params::new(),
+                consume: Consumption::Elastic,
+                repeat: Repeat::Allow,
+                physical: false,
+                shift_tolerant: false,
+                nowait: false,
+                owner: MappingOwner::User,
+                desc: "under test".into(),
+            });
+            let report = explain_with(&index, "q", &fs_chain(), NEVER);
+            assert_eq!(
+                report.contains("eligible"),
+                dispatcher_can_fire(&target),
+                "the report and the dispatcher disagree about {target:?}:\n{report}"
+            );
+        }
+    }
+
     fn editor_chain(mode: Option<vim_core::primitives::Mode>) -> FocusChain {
         FocusChain {
             nodes: vec![code_edit(7), plain("CodeTextEditor", 8)],
@@ -410,7 +514,7 @@ mod tests {
     #[test]
     fn the_listing_is_a_golden_snapshot_of_the_shipped_keyset() {
         let reg = registry();
-        let report = list_report(&builtin_index(&reg), &reg);
+        let report = list_report(&builtin_index(&reg), &reg, &[]);
         insta_like(&report);
     }
 
@@ -639,12 +743,59 @@ panel  (parent: -, seal: Open)
     }
 
     #[test]
+    fn a_rejected_vimrc_line_is_printed_by_the_listing() {
+        // `binding_diagnostics` was written by `rebuild_bindings` and read by
+        // nothing — three references in the whole tree, all of them writes.
+        // The only other channel was `log::warn!`, and the default Log Level
+        // is Off, so every accepted residual was silent BY CONSTRUCTION
+        // rather than merely by log level. `:checkhealth`, which the design
+        // names 39 times as the mitigation for exactly this, does not exist.
+        //
+        // One good line and one malformed one, the way a real vimrc arrives:
+        // the good one must still install (warn-and-skip is per line) and the
+        // bad one must be visible to a user who types `:panelmap`.
+        let reg = registry();
+        let mut index = builtin_index(&reg);
+        let mut diagnostics = Vec::new();
+        crate::actions::bind::apply_text(
+            &mut index,
+            &reg,
+            "panelmap dock q godotvim.item.activate\n\
+             panelmap dock w godotvim.item.nextt",
+            &MappingOwner::User,
+            "user://.godot-vimrc",
+            crate::actions::bind::Provenance::User,
+            &mut diagnostics,
+        );
+        assert_eq!(diagnostics.len(), 1, "one bad line, one diagnostic");
+
+        let report = list_report(&index, &reg, &diagnostics);
+        assert!(
+            report.contains("rejected line(s)"),
+            "the listing must announce the rejects:\n{report}"
+        );
+        assert!(
+            report.contains("user://.godot-vimrc:2: no action named 'godotvim.item.nextt'"),
+            "the diagnostic must name the file, the line and the cause:\n{report}"
+        );
+        // …and the good line is still there, unaffected.
+        assert!(report.contains("dock q godotvim.item.activate"), "{report}");
+    }
+
+    #[test]
+    fn a_clean_config_prints_no_rejection_section_at_all() {
+        let reg = registry();
+        let report = list_report(&builtin_index(&reg), &reg, &[]);
+        assert!(!report.contains("rejected"), "{report}");
+    }
+
+    #[test]
     fn shift_folding_is_visible_in_the_listing() {
         // `R` and `r` are two keys, not one key plus a modifier. If the
         // listing rendered `<S-r>` the user would copy back a binding that
         // can never fire.
         let reg = registry();
-        let report = list_report(&builtin_index(&reg), &reg);
+        let report = list_report(&builtin_index(&reg), &reg, &[]);
         assert!(report.contains("dock.filesystem R godotvim.fs.refresh"));
         assert!(!report.contains("<S-r>"));
         assert!(!report.contains("<S-R>"));
@@ -681,7 +832,7 @@ panel  (parent: -, seal: Open)
             "panelmap dock gg godotvim.item.prev\n\
              panelmap dock gj godotvim.item.next",
         );
-        let report = list_report(&index, &reg);
+        let report = list_report(&index, &reg, &[]);
         assert!(
             report.contains(
                 "reserves g    (consumed bare on dock, then waits timeoutlen for: gg, gj)"
@@ -696,7 +847,7 @@ panel  (parent: -, seal: Open)
         // reservations means no `set_allow_search(false)` and no pending
         // buffer for a user who never bound a sequence.
         let reg = registry();
-        let report = list_report(&builtin_index(&reg), &reg);
+        let report = list_report(&builtin_index(&reg), &reg, &[]);
         assert!(!report.contains("reserves"), "{report}");
     }
 
@@ -726,7 +877,7 @@ panel  (parent: -, seal: Open)
         // the trie can never be the listing's source of truth. This is the
         // regression guard for reading the RHS instead of the arena.
         let reg = registry();
-        let report = list_report(&builtin_index(&reg), &reg);
+        let report = list_report(&builtin_index(&reg), &reg, &[]);
         assert!(!report.contains("<Action>("), "{report}");
     }
 

@@ -52,8 +52,8 @@ use vim_core::keymap::{KeyEvent, TrieLookup, MAX_KEY_SEQUENCE_LEN};
 use super::action::ActionRegistry;
 use super::bind::BindingIndex;
 use super::caps::Caps;
-use super::resolve::{hit_from, Candidate, Hit, ResolveInput};
-use super::surface::{Seal, SurfaceId, SurfacePath};
+use super::resolve::{hit_from, walk_scope, Candidate, Hit, ResolveInput};
+use super::surface::{SurfaceId, SurfacePath};
 
 /// What the sequence layer decided about one keystroke.
 ///
@@ -150,6 +150,22 @@ impl Pending {
             }
             return self.extend(input);
         }
+        if is_echo {
+            // An echo can never OPEN a buffer. Without this the timer becomes
+            // a metronome: `on_timeout` runs the prefix's exact-match action
+            // and clears the buffer, the key is still held, and the next echo
+            // reaches `open()`, which finds the key reserved, buffers it and
+            // re-arms the timer — so the action re-fires once per
+            // `timeoutlen`, forever. `<norepeat>` cannot stop it either;
+            // `Repeat::Suppress` is only read in [`super::resolve::dispose`],
+            // which this path never reaches.
+            //
+            // `Passthrough` rather than `Echo` so the held key still reaches
+            // Godot's own repeat handling — the elastic default, and what
+            // `an_echo_with_no_buffer_open_is_an_ordinary_passthrough` already
+            // guarantees for every unreserved key.
+            return SeqStep::Passthrough;
+        }
         self.open(input)
     }
 
@@ -167,46 +183,86 @@ impl Pending {
     /// unrepresentable. It is named here rather than left implicit: a future
     /// phase that relaxes the registration guard must add the gate here too,
     /// or a reserved key would be consumed out from under a user's own `:map`.
+    /// Probe-major for the same reason [`super::resolve::walk_path`] is: probe
+    /// priority outranks surface depth. A reservation reached by physical
+    /// position on `dock.filesystem` must not swallow a key the user actually
+    /// typed and `dock` reserves.
     fn open(&mut self, input: &ResolveInput<'_>) -> SeqStep {
-        for &surface in &input.path.ids {
-            let positional =
-                !input.path.anchor_refuses_positional && input.index.has_physical_rule(surface);
-            for probe in input.probes.iter_scoped(positional) {
-                // THE anti-speculation pair. `is_reserved` reads the live slot
-                // table; the `Prefix` answer reads the trie's shape. They are
-                // redundant *by construction* today — every trie child comes
-                // from a `slot_of` entry — and both are kept on purpose:
-                // `is_reserved` is the fact `:panelmap` prints, and buffering
-                // on a different fact than the one the introspector announces
-                // is how a reservation becomes unexplainable. The equivalence
-                // is pinned by `a_trie_prefix_always_means_a_printed_reservation`.
-                //
-                // Together they are the reason nothing is consumed
-                // speculatively: an unreserved key creates no state and goes
-                // on to the single-key walk and then to Godot, which is what
-                // keeps a `Tree`'s incremental type-to-search alive.
-                if !input.index.is_reserved(surface, probe) {
-                    continue;
+        let (scope, _sealed) = walk_scope(input);
+
+        // ── Pass 1: what the user typed, leaf→root ───────────────────
+        for probe in input.probes.iter_typed() {
+            for &surface in scope {
+                if let Some(step) = self.try_reserve(input, surface, probe) {
+                    return step;
                 }
-                let TrieLookup::Prefix { .. } = input.index.lookup(surface, &[probe]) else {
-                    // `<nowait>` makes the trie promote the shorter LHS to
-                    // `ExactOnly` even though `dd` shares the prefix, so `d`
-                    // fires immediately. Fall through to the single-key walk,
-                    // which finds it.
-                    continue;
-                };
-                self.keys.push(probe);
-                self.surface = Some(surface);
-                self.caps = input.path.caps;
-                log::trace!("sequence: {surface} reserved {probe}; buffering");
-                return SeqStep::Buffered;
             }
-            // The seal is the deepest surface's, so this can only fire once.
-            if input.path.seal == Seal::Sealed && !input.probes.has_command_modifier() {
-                break;
+        }
+
+        // ── Pass 2: the US-QWERTY positional guess ───────────────────
+        if input.path.anchor_refuses_positional {
+            return SeqStep::Passthrough;
+        }
+        let Some(probe) = input.probes.positional() else {
+            return SeqStep::Passthrough;
+        };
+        for &surface in scope {
+            // Per RULE, not per surface: the reservation is created by the
+            // multi-key rules that start with this key, so it is those rules'
+            // own `<physical>` that decides whether a physical position may
+            // open the buffer. `has_physical_rule` stays only as the cheap
+            // bail-out ahead of the scan.
+            if !input.index.has_physical_rule(surface) {
+                continue;
+            }
+            if !input
+                .index
+                .sequences_from(surface, probe)
+                .any(|rule| rule.physical)
+            {
+                continue;
+            }
+            if let Some(step) = self.try_reserve(input, surface, probe) {
+                return step;
             }
         }
         SeqStep::Passthrough
+    }
+
+    /// Open the buffer if `probe` is a live reservation on `surface`.
+    fn try_reserve(
+        &mut self,
+        input: &ResolveInput<'_>,
+        surface: SurfaceId,
+        probe: KeyEvent,
+    ) -> Option<SeqStep> {
+        // THE anti-speculation pair. `is_reserved` reads the live slot table;
+        // the `Prefix` answer reads the trie's shape. They are redundant *by
+        // construction* today — every trie child comes from a `slot_of` entry
+        // — and both are kept on purpose: `is_reserved` is the fact
+        // `:panelmap` prints, and buffering on a different fact than the one
+        // the introspector announces is how a reservation becomes
+        // unexplainable. The equivalence is pinned by
+        // `a_trie_prefix_always_means_a_printed_reservation`.
+        //
+        // Together they are the reason nothing is consumed speculatively: an
+        // unreserved key creates no state and goes on to the single-key walk
+        // and then to Godot, which is what keeps a `Tree`'s incremental
+        // type-to-search alive.
+        if !input.index.is_reserved(surface, probe) {
+            return None;
+        }
+        // `<nowait>` makes the trie promote the shorter LHS to `ExactOnly`
+        // even though `dd` shares the prefix, so `d` fires immediately. Fall
+        // through to the single-key walk, which finds it.
+        let TrieLookup::Prefix { .. } = input.index.lookup(surface, &[probe]) else {
+            return None;
+        };
+        self.keys.push(probe);
+        self.surface = Some(surface);
+        self.caps = input.path.caps;
+        log::trace!("sequence: {surface} reserved {probe}; buffering");
+        Some(SeqStep::Buffered)
     }
 
     /// Rule 2's second half: extend an open buffer.
@@ -223,38 +279,75 @@ impl Pending {
             self.clear();
             return SeqStep::DeadPrefix(surface);
         }
-        let positional =
-            !input.path.anchor_refuses_positional && input.index.has_physical_rule(surface);
-        for probe in input.probes.iter_scoped(positional) {
-            self.keys.push(probe);
-            match input.index.lookup(surface, &self.keys) {
-                TrieLookup::ExactOnly(entry) => {
-                    let hit = hit_from(input.index, input.registry, self.caps, surface, entry);
-                    self.clear();
-                    return match hit {
-                        Hit::Run(candidate) => SeqStep::Run(vec![candidate], probe),
-                        // Both terminal-but-nothing-to-run cases collapse
-                        // here, and both consume. `native` in particular
-                        // cannot do its job at the end of a sequence: the
-                        // prefix keys are already destroyed, so "hand the key
-                        // back to Godot" would hand back a fragment.
-                        Hit::Native | Hit::Miss => {
-                            log::debug!("sequence: {surface} completed with nothing runnable");
-                            SeqStep::DeadPrefix(surface)
-                        }
-                    };
-                }
-                TrieLookup::Prefix { .. } => return SeqStep::Buffered,
-                // `NoMatch`, and any future variant: this probe does not
-                // continue the sequence. Un-push and let the next probe try.
-                _ => {
-                    self.keys.pop();
+        // Probes 1–2 first and unconditionally, then the positional guess —
+        // the same two passes the resolver walks, for the same reason. Only
+        // one surface is in play here, so the passes differ from the resolver
+        // only in what gates pass 2.
+        for probe in input.probes.iter_typed() {
+            if let Some(step) = self.try_continue(input, surface, probe) {
+                return step;
+            }
+        }
+        if !input.path.anchor_refuses_positional {
+            if let Some(probe) = input.probes.positional() {
+                // Per RULE: the continuation the guess would take must itself
+                // carry `<physical>`. `has_physical_rule` is the cheap
+                // bail-out ahead of the scan and nothing more.
+                let next = [self.keys.as_slice(), &[probe]].concat();
+                if input.index.has_physical_rule(surface)
+                    && input
+                        .index
+                        .rules_on(surface)
+                        .any(|rule| rule.physical && rule.lhs.starts_with(&next))
+                {
+                    if let Some(step) = self.try_continue(input, surface, probe) {
+                        return step;
+                    }
                 }
             }
         }
         log::debug!("sequence: dead prefix on {surface}");
         self.clear();
         SeqStep::DeadPrefix(surface)
+    }
+
+    /// Push `probe` onto the buffer and read the trie's answer, un-pushing if
+    /// the sequence does not continue that way.
+    ///
+    /// `None` means "this probe is not a continuation" — the caller tries the
+    /// next one. Every `Some` is terminal for this keystroke.
+    fn try_continue(
+        &mut self,
+        input: &ResolveInput<'_>,
+        surface: SurfaceId,
+        probe: KeyEvent,
+    ) -> Option<SeqStep> {
+        self.keys.push(probe);
+        match input.index.lookup(surface, &self.keys) {
+            TrieLookup::ExactOnly(entry) => {
+                let hit = hit_from(input.index, input.registry, self.caps, surface, entry);
+                self.clear();
+                Some(match hit {
+                    Hit::Run(candidate) => SeqStep::Run(vec![candidate], probe),
+                    // Both terminal-but-nothing-to-run cases collapse here,
+                    // and both consume. `native` in particular cannot do its
+                    // job at the end of a sequence: the prefix keys are
+                    // already destroyed, so "hand the key back to Godot" would
+                    // hand back a fragment.
+                    Hit::Native | Hit::Miss => {
+                        log::debug!("sequence: {surface} completed with nothing runnable");
+                        SeqStep::DeadPrefix(surface)
+                    }
+                })
+            }
+            TrieLookup::Prefix { .. } => Some(SeqStep::Buffered),
+            // `NoMatch`, and any future variant: this probe does not continue
+            // the sequence. Un-push and let the next probe try.
+            _ => {
+                self.keys.pop();
+                None
+            }
+        }
     }
 
     /// The shell timer fired: resolve whatever is buffered, then clear.
@@ -678,6 +771,62 @@ mod tests {
         }
         let step = press(&mut pending, &index, &reg, &p, ch('g'));
         assert_eq!(ran(&step), Some("godotvim.item.prev"));
+    }
+
+    #[test]
+    fn a_held_prefix_key_cannot_re_open_the_buffer_after_a_timeout() {
+        // THE runaway. `step` used to consult `is_echo` only inside
+        // `if self.is_active()`, so the sequence was: press `g` → Buffered;
+        // timeoutlen elapses → `on_timeout` runs `dock g` and CLEARS the
+        // buffer; the key is still held, so the next auto-repeat echo reaches
+        // `open()`, which never looked at `is_echo`, found `g` reserved,
+        // buffered it and re-armed the timer — and the whole cycle repeated
+        // once per `timeoutlen` for as long as the key was held. `<norepeat>`
+        // could not stop it: `Repeat::Suppress` is only read in `dispose`,
+        // which this path never reaches. For a destructive verb that is
+        // repeated destruction from a single held key.
+        //
+        // `Passthrough` rather than `Echo` so the held key still reaches
+        // Godot's own repeat handling, matching the elastic default.
+        let index = index_with(
+            "panelmap dock g godotvim.item.prev\n\
+             panelmap dock gg godotvim.item.next",
+        );
+        let reg = registry();
+        let p = path("dock", TREE);
+        let mut pending = Pending::default();
+
+        assert_eq!(
+            press(&mut pending, &index, &reg, &p, ch('g')),
+            SeqStep::Buffered
+        );
+        // The timer fires: the exact match at the buffered prefix runs and
+        // the buffer is dropped.
+        assert!(
+            pending.on_timeout(&index, &reg).is_some(),
+            "`dock g` is an exact match under the `gg` prefix"
+        );
+        assert!(!pending.is_active());
+
+        // The key was never released, so every subsequent event is an echo.
+        for _ in 0..5 {
+            assert_eq!(
+                press_echo(&mut pending, &index, &reg, &p, ch('g'), true),
+                SeqStep::Passthrough,
+                "a held prefix key must not re-open the buffer"
+            );
+            assert!(
+                !pending.is_active(),
+                "…and must not re-arm the timer either"
+            );
+            assert!(pending.keys().is_empty());
+        }
+
+        // A genuine press still opens it.
+        assert_eq!(
+            press(&mut pending, &index, &reg, &p, ch('g')),
+            SeqStep::Buffered
+        );
     }
 
     #[test]

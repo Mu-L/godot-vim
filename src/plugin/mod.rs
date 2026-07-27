@@ -1423,10 +1423,13 @@ impl GodotVimCore {
         }
         for d in &diagnostics {
             // Warn-and-skip per line: one bad binding must not cost the user
-            // the rest of their config. The introspector surfaces these too,
-            // because a diagnostic nobody can read is the same as a silent
-            // dead key.
-            log::warn!("panelmap: {d:?}");
+            // the rest of their config. The log is the *secondary* channel and
+            // always has been — the default Log Level is Off, so a diagnostic
+            // that went only here reached nobody. `:panelmap` with no argument
+            // prints the same list, which is what makes the claim below true
+            // rather than aspirational: a diagnostic nobody can read is the
+            // same as a silent dead key.
+            log::warn!("panelmap: {d}");
         }
         self.binding_diagnostics = diagnostics;
 
@@ -1468,7 +1471,11 @@ impl GodotVimCore {
         if args.is_empty() {
             godot_print!(
                 "{}",
-                crate::actions::introspect::list_report(&self.bindings, &self.actions)
+                crate::actions::introspect::list_report(
+                    &self.bindings,
+                    &self.actions,
+                    &self.binding_diagnostics,
+                )
             );
             return;
         }

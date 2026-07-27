@@ -130,6 +130,28 @@ pub(crate) enum RuleReject {
     MultiKeyOnEditorPath(SurfaceId),
     /// The first key starts a vim-core grammar sequence.
     VimGrammarPrefix(KeyEvent),
+    /// The surface is reached by an explicit transport lookup rather than by
+    /// classifying a focus chain, so it never carries a [`super::caps::Caps`]
+    /// grant — and the action needs one.
+    ///
+    /// `editor.completion` is the only such surface today. Its transport
+    /// (`GodotVimCore::completion_binding`) hands the spec straight to
+    /// `process_cycle`, which runs it with `ActionCtx::new(None, …)`; there is
+    /// no walked path, therefore no `caps.satisfies(spec.requires)` gate, and
+    /// the ctx-free FS verbs never read their ctx at all. Without this,
+    /// `panelmap editor.completion <C-y> godotvim.fs.delete` loaded with no
+    /// diagnostic and deleted a file from a keystroke typed in a script.
+    UnsatisfiableCapability {
+        surface: SurfaceId,
+        action: CompactString,
+    },
+    /// The target parses and registers, but nothing on this surface's
+    /// transport can dispatch it — so the key would be permanently dead while
+    /// `:panelmap` reported it as eligible.
+    UndispatchedTarget {
+        surface: SurfaceId,
+        target: CompactString,
+    },
 }
 
 impl std::fmt::Display for RuleReject {
@@ -153,6 +175,17 @@ impl std::fmt::Display for RuleReject {
                 "'{}' begins a Vim command sequence; binding it here would \
                  destroy the key that follows it",
                 k.to_vim_notation()
+            ),
+            Self::UnsatisfiableCapability { surface, action } => write!(
+                f,
+                "surface '{surface}' is reached by an explicit transport lookup, never by \
+                 classifying the focus chain, so it grants no capabilities; \
+                 '{action}' declares requirements that can never be satisfied there"
+            ),
+            Self::UndispatchedTarget { surface, target } => write!(
+                f,
+                "surface '{surface}' has no transport that can dispatch '{target}', \
+                 so the key would be consumed and do nothing"
             ),
         }
     }
@@ -251,13 +284,80 @@ impl BindingIndex {
             .any(|editor| self.forest.is_ancestor_or_self(surface, editor))
     }
 
+    /// Whether `surface` is reached only by an explicit lookup from a
+    /// transport, never by classifying a focus chain.
+    ///
+    /// Structural rather than a hand-maintained list: an isolated node — no
+    /// declared parent and no declared child — cannot appear on a
+    /// [`super::surface::SurfacePath`] unless its own probe claims the chain,
+    /// and a surface whose probe claims would be the anchor and would carry
+    /// that anchor's grants. `editor.completion` is the only non-`Barrier`
+    /// surface in that position today, and `panel` — the other surface with no
+    /// parent — is excluded correctly because it is the root of everything
+    /// else.
+    ///
+    /// What follows from it is the whole reason it exists: such a surface has
+    /// no `caps`, because there is no classified path to compute them from, so
+    /// an action with a non-empty `requires` bound there can never satisfy its
+    /// own gate — and the transport, having no path either, never asks.
+    fn transport_only(&self, surface: SurfaceId) -> bool {
+        self.forest
+            .get(surface)
+            .is_some_and(|spec| spec.parent.is_none())
+            && !self
+                .forest
+                .ids()
+                .any(|id| self.forest.get(id).and_then(|s| s.parent) == Some(surface))
+    }
+
     /// Validate and install a rule. The only entry point user input reaches.
-    pub(crate) fn try_insert(&mut self, rule: Rule) -> Result<(), RuleReject> {
+    ///
+    /// The registry is a parameter rather than a field because the index owns
+    /// no verbs: it is asked here for exactly one thing, whether the target's
+    /// declared `requires` can ever be satisfied where the rule is being put.
+    pub(crate) fn try_insert(
+        &mut self,
+        rule: Rule,
+        registry: &ActionRegistry,
+    ) -> Result<(), RuleReject> {
         let Some(spec) = self.forest.get(rule.surface) else {
             return Err(RuleReject::UnknownSurface(rule.surface.into()));
         };
         if spec.seal == Seal::Barrier {
             return Err(RuleReject::BarrierSurface(rule.surface));
+        }
+        // V-DISPATCH: refuse at registration what no transport can honour.
+        // The alternative is not "it quietly does nothing" — it is a rule that
+        // `:panelmap` reports as eligible and that either fires with no gate
+        // at all or never fires. Both are the silent dead key this design
+        // exists to prevent, and one of them deletes files.
+        match &rule.target {
+            RuleTarget::Action(id) if self.transport_only(rule.surface) => {
+                let unsatisfiable = registry
+                    .get(*id)
+                    .is_none_or(|action| !action.requires.is_empty());
+                if unsatisfiable {
+                    return Err(RuleReject::UnsatisfiableCapability {
+                        surface: rule.surface,
+                        action: registry.name_of(*id).unwrap_or("<unregistered>").into(),
+                    });
+                }
+            }
+            // `<Shortcut>(path)` is parsed, registered and printed as
+            // eligible, and then `run_candidate` unconditionally declines it
+            // after a `log::warn!` nobody sees — the default Log Level is Off.
+            // With `<void>` that is a permanently dead key the introspector
+            // actively confirms will work. Delegating to Godot's own shortcuts
+            // needs a cycle audit and an injection budget it does not have
+            // yet; until then the honest answer is at registration, not at
+            // dispatch.
+            RuleTarget::Shortcut(path) => {
+                return Err(RuleReject::UndispatchedTarget {
+                    surface: rule.surface,
+                    target: format!("<Shortcut>({path})").into(),
+                });
+            }
+            _ => {}
         }
         if self.editor_reachable(rule.surface) {
             if rule.lhs.len() > 1 {
@@ -635,9 +735,8 @@ pub(crate) fn apply_text(
         let outcome = match parse_panel_line(line) {
             Ok(None) => continue,
             Err(error) => Err(RuleReject::Parse(error)),
-            Ok(Some(PanelLine::Map(map))) => {
-                rule_from(&map, registry, index.forest(), owner).and_then(|r| index.try_insert(r))
-            }
+            Ok(Some(PanelLine::Map(map))) => rule_from(&map, registry, index.forest(), owner)
+                .and_then(|r| index.try_insert(r, registry)),
             Ok(Some(PanelLine::Unmap { surface, lhs })) => {
                 let declared = index.forest().ids().find(|id| *id == surface.as_str());
                 match declared {
@@ -1627,16 +1726,110 @@ mod tests {
     }
 
     #[test]
-    fn a_shortcut_target_carries_its_path() {
+    fn a_shortcut_target_is_refused_because_nothing_dispatches_it() {
+        // `run_candidate` returns `Outcome::Declined` for every `<Shortcut>`
+        // after a `log::warn!` nobody sees — the default Log Level is Off — so
+        // the rule loaded cleanly, printed as "eligible" in `:panelmap`, and
+        // was a permanently dead key the introspector actively confirmed would
+        // work. With `<void>` it swallowed the key as well. The parser still
+        // understands the syntax (see `config::panelmap`); what changed is
+        // that the plane refuses to pretend it can honour it.
         let mut index = empty_index();
+        assert_eq!(
+            user_reject(
+                &mut index,
+                "panelmap dock.filesystem <C-r> <Shortcut>(filesystem_dock/rename)"
+            ),
+            Some(RuleReject::UndispatchedTarget {
+                surface: "dock.filesystem",
+                target: "<Shortcut>(filesystem_dock/rename)".into(),
+            })
+        );
+        assert!(
+            resolve(&index, "dock.filesystem", &[ctrl('r')]).is_none(),
+            "nothing may be inserted"
+        );
+        // The example the debugger provider's own docs use, from the surface
+        // the docs use it on.
+        assert!(user_reject(
+            &mut index,
+            "panelmap dock.debugger s <Shortcut>(debugger/step_over)"
+        )
+        .is_some());
+        assert!(resolve(&index, "dock.debugger", &[ch('s')]).is_none());
+    }
+
+    #[test]
+    fn a_transport_only_surface_refuses_a_verb_it_could_never_gate() {
+        // THE file-deleting one. `editor.completion` is reached by an explicit
+        // lookup from `handle_gui_input_impl`, never by classifying a chain,
+        // so there is no `SurfacePath` and therefore no `Caps` — the
+        // capability gate every walked surface gets at `hit_from` structurally
+        // cannot run. `godotvim.fs.delete` is
+        // `run: |_cx| filesystem_explorer::delete_selected()`: it never reads
+        // its ctx and drives Godot's own FileSystem delete, so a `<C-y>` typed
+        // in a script with the popup up deleted a file. It loaded with zero
+        // diagnostics.
+        let mut index = empty_index();
+        let mut diagnostics = Vec::new();
+        apply_text(
+            &mut index,
+            &registry(),
+            "panelmap editor.completion <C-y> godotvim.fs.delete",
+            &MappingOwner::User,
+            "test",
+            Provenance::User,
+            &mut diagnostics,
+        );
+        assert_eq!(diagnostics.len(), 1, "exactly one diagnostic");
+        assert_eq!(
+            diagnostics[0].reject,
+            RuleReject::UnsatisfiableCapability {
+                surface: "editor.completion",
+                action: "godotvim.fs.delete".into(),
+            }
+        );
+        assert!(
+            resolve(&index, "editor.completion", &[ctrl('y')]).is_none(),
+            "no rule may be installed"
+        );
+
+        // …and the verbs that surface is FOR still install. All six shipped
+        // completion verbs declare `requires: Caps::empty()`, which is what
+        // makes the rule "empty requires only" rather than "no rules here".
         user_ok(
             &mut index,
-            "panelmap dock.filesystem <C-r> <Shortcut>(filesystem_dock/rename)",
+            "panelmap editor.completion <C-y> godotvim.completion.confirm",
         );
-        assert_eq!(
-            resolve(&index, "dock.filesystem", &[ctrl('r')]).map(|r| r.target.clone()),
-            Some(RuleTarget::Shortcut("filesystem_dock/rename".into()))
-        );
+        assert!(resolve(&index, "editor.completion", &[ctrl('y')]).is_some());
+    }
+
+    #[test]
+    fn a_capability_bearing_verb_is_still_fine_on_a_classified_surface() {
+        // The guard on the guard: `transport_only` must not catch `panel`,
+        // which has no parent either but is the root of the whole forest.
+        let mut index = empty_index();
+        user_ok(&mut index, "panelmap panel <C-y> godotvim.item.next");
+        assert!(resolve(&index, "panel", &[ctrl('y')]).is_some());
+    }
+
+    #[test]
+    fn every_shipped_completion_default_still_loads() {
+        // The count the reject must not move: eight rules on
+        // `editor.completion`, six distinct verbs, every one `Caps::empty()`.
+        let index = builtin_index(&registry());
+        assert_eq!(index.rules_on("editor.completion").count(), 8);
+        let reg = registry();
+        for rule in index.rules_on("editor.completion") {
+            let RuleTarget::Action(id) = rule.target else {
+                panic!("a completion default must target an action");
+            };
+            assert!(
+                reg.get(id).is_some_and(|s| s.requires.is_empty()),
+                "{:?} needs capabilities this surface cannot grant",
+                rule.lhs
+            );
+        }
     }
 
     // ── The trie contract this index is built on ─────────────────────

@@ -85,17 +85,31 @@ impl Probes {
     /// Probes in priority order, admitting the US-QWERTY positional guess
     /// only when `positional` is true.
     ///
-    /// The resolver asks per *surface*: probe 3 is offered only where the
-    /// binding index holds a `<physical>`-flagged rule, and never at all on a
-    /// surface that refuses it. One function so [`Self::iter`] and
-    /// [`Self::iter_typed`] cannot drift from the scoped form the walk uses.
+    /// A **filter**, not a truncation. The distinction is not cosmetic: the
+    /// positional probe is not always last in `buf` — a keystroke whose Latin
+    /// collapse duplicates probe 1 leaves the position at index 1 with room
+    /// after it — so `take(positional_index)` meant "everything before the
+    /// guess" rather than "everything that is not the guess", and would drop a
+    /// legitimate probe that happened to sit behind it. Excluding exactly the
+    /// one flagged entry is what makes [`Self::iter_typed`] mean "probes 1 and
+    /// 2" as the module header promises.
     pub(crate) fn iter_scoped(&self, positional: bool) -> impl Iterator<Item = KeyEvent> + '_ {
-        let stop = if positional {
-            self.buf.len()
-        } else {
-            self.positional.map_or(self.buf.len(), usize::from)
-        };
-        self.buf.iter().take(stop).flatten().copied()
+        let skip = if positional { None } else { self.positional };
+        self.buf
+            .iter()
+            .enumerate()
+            .filter(move |&(i, _)| skip != Some(i as u8))
+            .filter_map(|(_, k)| *k)
+    }
+
+    /// The US-QWERTY positional guess on its own, if this keystroke has one.
+    ///
+    /// The resolver's second pass takes exactly this key and walks the whole
+    /// surface path with it, which is what makes the guess strictly
+    /// lower-priority than every typed interpretation on every surface —
+    /// rather than lower-priority only within one surface's turn.
+    pub(crate) fn positional(&self) -> Option<KeyEvent> {
+        self.buf[usize::from(self.positional?)]
     }
 
     /// Whether any probe carries a command chord (Ctrl/Alt/Meta).
@@ -108,20 +122,16 @@ impl Probes {
         self.iter().any(|k| k.modifiers().intersects(CMD_MODS))
     }
 
-    /// Probes excluding the US-QWERTY positional guess.
+    /// Probes excluding the US-QWERTY positional guess — probes 1 and 2.
     ///
-    /// Use this wherever the key already has a meaning worth protecting.
-    /// Inside the attached editor a Dvorak `Ctrl+d` is half-page-down and a
-    /// Colemak `Ctrl+n` is jump-forward; both sit at QWERTY hjkl positions,
-    /// so honouring the positional probe there would silently convert core
-    /// Vim chords into panel navigation. Non-Latin layouts are unaffected:
-    /// `resolve_ctrl_key` already resolves those to a Latin key as probe 1,
-    /// and `latin_key` covers the unmodified case as probe 2.
-    #[allow(
-        dead_code,
-        reason = "the resolver scopes probe 3 per surface via `iter_scoped`; this is the \
-                  named form the design and the probe-order tests speak in"
-    )]
+    /// The resolver's first pass. Use this wherever the key already has a
+    /// meaning worth protecting: inside the attached editor a Dvorak `Ctrl+d`
+    /// is half-page-down and a Colemak `Ctrl+n` is jump-forward; both sit at
+    /// QWERTY hjkl positions, so honouring the positional probe there would
+    /// silently convert core Vim chords into panel navigation. Non-Latin
+    /// layouts are unaffected: `resolve_ctrl_key` already resolves those to a
+    /// Latin key as probe 1, and `latin_key` covers the unmodified case as
+    /// probe 2.
     pub(crate) fn iter_typed(&self) -> impl Iterator<Item = KeyEvent> + '_ {
         self.iter_scoped(false)
     }

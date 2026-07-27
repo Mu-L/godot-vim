@@ -38,9 +38,12 @@ use super::{GodotVimCore, SearchSuppression};
 enum Plan {
     /// Nothing runs and nothing is consumed: Godot's own handling proceeds.
     Drop,
-    /// Consume, and touch neither the timer nor the buffer. The echo arm — not
-    /// restarting the timer is what stops a held prefix key from keeping the
-    /// buffer alive forever.
+    /// Consume, and touch neither the timer nor the buffer. The echo arm, and
+    /// half of what stops a held prefix key from keeping the buffer alive
+    /// forever: it does not restart the timer. The other half is in
+    /// [`crate::actions::sequence::Pending::step`], which refuses to
+    /// *open* a buffer on an echo — without that, a timeout that clears the
+    /// buffer simply lets the next echo start a new one.
     Swallow,
     /// Consume and (re)arm the shell timer: a prefix is pending.
     Arm,
@@ -509,7 +512,23 @@ impl GodotVimCore {
             .bindings
             .rule_for(crate::actions::providers::completion::SURFACE, &lhs)?;
         match rule.target {
-            crate::actions::action::RuleTarget::Action(id) => self.actions.get(id),
+            crate::actions::action::RuleTarget::Action(id) => self
+                .actions
+                .get(id)
+                // THE gate every walked surface gets at `resolve.rs`'s
+                // `hit_from`, and that this transport structurally cannot: it
+                // has no classified path, so it has no `Caps` to satisfy
+                // anything with. Empty `requires` is therefore the only
+                // requirement it can honour, and anything else must not run —
+                // `process_cycle` calls `(spec.run)` with
+                // `ActionCtx::new(None, …)`, and the ctx-free FS verbs never
+                // read their ctx at all, so `godotvim.fs.delete` bound here
+                // would delete a file from a keystroke typed in a script.
+                //
+                // `BindingIndex::try_insert` rejects such a rule at
+                // registration; this is the second wall, because the cost of
+                // the two disagreeing is a deleted file.
+                .filter(|spec| spec.requires.is_empty()),
             // `native` and `<Shortcut>(…)` have no meaning against a popup:
             // both mean "not ours", which on this transport is exactly what
             // `None` already says.

@@ -10,18 +10,28 @@
 //! `set_input_as_handled()` on the way out — and both are the transport's
 //! business, not this module's.
 //!
-//! The walk is leaf→root over the declared surface path. For each surface it
-//! tries the probe list in priority order, and the FIRST exact trie hit that
-//! survives the capability gate wins. Four things that ordering encodes, each
-//! of which used to be an `if` in the dispatcher:
+//! The walk is **probe-major**: for each interpretation of the keystroke, in
+//! priority order, the whole surface path is walked leaf→root, and the FIRST
+//! exact trie hit that survives the capability gate wins. Probe priority
+//! therefore outranks surface depth, which is the only reading that makes the
+//! probe list mean what [`super::keys`] says it means — a guess about physical
+//! position must never beat what the user actually typed, on any surface.
+//! Five things that ordering encodes, each of which used to be an `if` in the
+//! dispatcher:
 //!
-//! - **Depth is specificity.** `dock.filesystem` is walked before `dock`
-//!   because it declares `dock` as its parent, which is what gives the
-//!   FileSystem keyset first refusal — replacing the hardcoded
+//! - **Depth is specificity, within one probe.** `dock.filesystem` is walked
+//!   before `dock` because it declares `dock` as its parent, which is what
+//!   gives the FileSystem keyset first refusal — replacing the hardcoded
 //!   `if fs_result.is_consumed()` branch.
-//! - **A capability miss is a declination.** It is skipped as if the trie had
-//!   said `NoMatch` and the walk continues, which is how `h`/`l` go inert on
-//!   an `ItemList` with no widget class named anywhere here.
+//! - **A typed probe outranks a positional one everywhere.** Probes 1–2 are
+//!   pass 1 over every surface; probe 3 is pass 2 over every surface, and only
+//!   against rules that individually asked for it with `<physical>`.
+//! - **A capability miss is a declination that still claims the key.** The
+//!   walk carries on to the parent within the same pass — which is how `h`/`l`
+//!   go inert on an `ItemList` with no widget class named anywhere here — but
+//!   it suppresses the positional pass entirely, because "this key means
+//!   something here and this widget cannot do it" is an answer, not an
+//!   invitation to reinterpret the keystroke.
 //! - **`RuleTarget::Native` terminates the walk**, and is emphatically not an
 //!   action that declines: a declining action would fall through to `panel`'s
 //!   `Consumption::Void` rule and consume the key anyway, silently defeating
@@ -265,39 +275,116 @@ pub(super) fn hit_from(
     }
 }
 
-/// The leaf→root candidate walk (S5).
-fn walk_path(input: &ResolveInput<'_>) -> Result<(Vec<Candidate>, KeyEvent), Stop> {
-    // The positional probe is opt-in twice over: a rule on this surface must
-    // carry `<physical>`, AND the anchor must not refuse it wholesale.
-    let anchor_allows = !input.path.anchor_refuses_positional;
+/// The surfaces one keystroke may consult on this path, and whether the seal
+/// is what limited them.
+///
+/// The seal is the deepest surface's, so it can only ever cut the walk at one
+/// place: after the anchor. Computing the scope once, up front, is what lets
+/// the surface loop be the INNER one in a probe-major walk without the seal
+/// check firing once per probe. One rule, three behaviours: `<CR>` still
+/// reaches the FS prompt's `text_submitted`, typing in a dock filter box still
+/// types, and Ctrl+hjkl still escapes both.
+///
+/// Shared with [`super::sequence`] so the single-key walk and the reservation
+/// walk cannot disagree about where a sealed anchor stops them — a key that
+/// was swallowed by the seal at one length and not at the other would be
+/// indistinguishable from a broken keyboard.
+pub(super) fn walk_scope<'p>(input: &'p ResolveInput<'_>) -> (&'p [SurfaceId], bool) {
+    if input.path.seal == Seal::Sealed && !input.probes.has_command_modifier() {
+        return (input.path.ids.get(..1).unwrap_or_default(), true);
+    }
+    (&input.path.ids, false)
+}
 
-    for &surface in &input.path.ids {
-        let positional = anchor_allows && input.index.has_physical_rule(surface);
-        for probe in input.probes.iter_scoped(positional) {
+/// The leaf→root candidate walk (S5), in two probe-major passes.
+///
+/// **Probe-major, not surface-major**, and that ordering is the whole
+/// function. The probe list is a priority list over *interpretations of one
+/// keystroke* — what the user typed, its Latin collapse, then a guess about
+/// where the key sits on a US keyboard — and the module header states plainly
+/// that "a lower-priority interpretation can never shadow a higher-priority
+/// one". Nesting the probe loop inside the surface loop broke exactly that:
+/// the deepest surface got all three probes before the next surface got any,
+/// so the guess won on a deep surface over the typed key on a shallow one.
+/// Colemak `j` in the FileSystem dock is the case that costs a user data —
+/// probe 3 is `y`, `dock.filesystem y` is `godotvim.fs.yank_path`, and the
+/// most-used navigation key in the keyset silently wrote the clipboard.
+///
+/// Two passes rather than one loop over `iter()`, because the passes are not
+/// symmetric:
+///
+/// - Pass 1 (probes 1–2) is the user's actual keystroke. A capability MISS
+///   here is a *declination that still claims the key*: `dock h` is
+///   `godotvim.item.collapse`, an `ItemList` grants no `HIERARCHY`, and the
+///   design says the key goes inert. Falling through to pass 2 instead
+///   promotes the positional guess and moves the selection.
+/// - Pass 2 is the guess, offered only where a rule asked for it — and asked
+///   for it **per rule**, via that rule's own `<physical>`, not per surface.
+///   A surface-wide test meant one flagged rule on `dock` opened probe 3 for
+///   every other rule on `dock` too, including every rule a user added.
+fn walk_path(input: &ResolveInput<'_>) -> Result<(Vec<Candidate>, KeyEvent), Stop> {
+    let (scope, sealed) = walk_scope(input);
+    let exhausted = || match (sealed, input.path.ids.first()) {
+        (true, Some(&anchor)) => Stop::Sealed(anchor),
+        _ => Stop::Exhausted,
+    };
+
+    // ── Pass 1: what the user typed, leaf→root ───────────────────────
+    //
+    // `typed_claimed` records that some typed probe found a rule and the
+    // capability gate turned it down. That is a real answer — "this key means
+    // something here and this widget cannot do it" — so pass 2 is skipped and
+    // the key stays inert rather than being reinterpreted by position.
+    let mut typed_claimed = false;
+    for probe in input.probes.iter_typed() {
+        for &surface in scope {
             let TrieLookup::ExactOnly(entry) = input.index.lookup(surface, &[probe]) else {
                 // `Prefix` belongs to [`super::sequence`], which runs BEFORE
                 // this walk and has already decided whether the key is
                 // reserved; reaching a `Prefix` here means it was not, so the
                 // key is simply unbound at this length. `NoMatch` and any
-                // future variant are misses too. Either way the next probe
-                // gets its turn, then the next surface.
+                // future variant are misses too.
                 continue;
             };
             match hit_from(input.index, input.registry, input.path.caps, surface, entry) {
-                Hit::Miss => continue,
+                Hit::Miss => typed_claimed = true,
                 Hit::Native => return Err(Stop::Native(surface)),
                 Hit::Run(candidate) => return Ok((vec![candidate], probe)),
             }
         }
-        // The seal is the deepest surface's, so this can only fire once —
-        // after the anchor has refused. One rule, three behaviours: `<CR>`
-        // still reaches the FS prompt's `text_submitted`, typing in a dock
-        // filter box still types, and Ctrl+hjkl still escapes both.
-        if input.path.seal == Seal::Sealed && !input.probes.has_command_modifier() {
-            return Err(Stop::Sealed(surface));
+    }
+
+    // ── Pass 2: the US-QWERTY positional guess ───────────────────────
+    if typed_claimed || input.path.anchor_refuses_positional {
+        return Err(exhausted());
+    }
+    let Some(probe) = input.probes.positional() else {
+        return Err(exhausted());
+    };
+    for &surface in scope {
+        // A cheap bail-out and nothing more: it answers "could any rule here
+        // want this?" over ~5 entries, so the per-rule test below is only
+        // reached on the surfaces that carry a flag at all. The per-rule test
+        // is the one that decides.
+        if !input.index.has_physical_rule(surface) {
+            continue;
+        }
+        let TrieLookup::ExactOnly(entry) = input.index.lookup(surface, &[probe]) else {
+            continue;
+        };
+        let asked = BindingIndex::slot_in(entry)
+            .and_then(|slot| input.index.rule_at(slot))
+            .is_some_and(|rule| rule.physical);
+        if !asked {
+            continue;
+        }
+        match hit_from(input.index, input.registry, input.path.caps, surface, entry) {
+            Hit::Miss => continue,
+            Hit::Native => return Err(Stop::Native(surface)),
+            Hit::Run(candidate) => return Ok((vec![candidate], probe)),
         }
     }
-    Err(Stop::Exhausted)
+    Err(exhausted())
 }
 
 /// S7 and S8 — run the plan and compute consumption from it.
@@ -510,13 +597,80 @@ mod tests {
 
     #[test]
     fn row5_the_positional_probe_is_offered_only_where_a_rule_asks_for_it() {
-        // `dock <CR>` carries no `<physical>`, so a positional Enter cannot
-        // synthesize an activation the user never pressed. The rules that DO
-        // carry it keep working.
+        // Both halves, because the name claims both. `dock j` carries
+        // `<physical>`, so a QWERTZ `z` at the QWERTY-`j` position still
+        // moves down…
         let dock = path("dock", TREE);
         assert_eq!(
             action_of(&run_positional(&dock, &[ch('z'), ch('j')], NEVER)),
             Some("godotvim.item.next")
+        );
+        // …while `dock <CR>` does not, so a positional Enter cannot
+        // synthesize an activation the user never pressed. A named key never
+        // produces probe 3 at all (`probes_from_parts` requires
+        // `Key::Char`), so the guard is spelled with a character instead: a
+        // rule the user added without `<physical>` must stay unreachable by
+        // position even on a surface where OTHER rules asked for it.
+        let mut index = builtin_index(&registry());
+        index.upsert(unphysical_rule("dock", ch('q')));
+        assert_eq!(
+            stop_of(&resolve_on(
+                &index,
+                &dock,
+                &Probes::from_slice_positional(&[ch('z'), ch('q')])
+            )),
+            Some(Stop::Exhausted),
+            "`panelmap dock q …` never asked for the positional probe"
+        );
+    }
+
+    /// A rule with every flag off — the shape a bare `panelmap <surface> <key>
+    /// <action>` line produces, and therefore the shape that must NOT be
+    /// reachable by physical position.
+    fn unphysical_rule(surface: SurfaceId, key: KeyEvent) -> Rule {
+        Rule {
+            surface,
+            lhs: vec![key],
+            target: RuleTarget::Action(
+                specs::registry()
+                    .id_of("godotvim.item.activate")
+                    .expect("shipped verb"),
+            ),
+            params: Params::new(),
+            consume: Consumption::Elastic,
+            repeat: Repeat::Allow,
+            physical: false,
+            shift_tolerant: false,
+            nowait: false,
+            owner: MappingOwner::User,
+            desc: "activate".into(),
+        }
+    }
+
+    /// Resolve against a caller-supplied index, so a test can add one rule.
+    fn resolve_on(index: &BindingIndex, p: &SurfacePath, probes: &Probes) -> Resolution {
+        let reg = registry();
+        resolve(&ResolveInput {
+            probes,
+            path: p,
+            index,
+            registry: &reg,
+            vim_claims: NEVER,
+        })
+    }
+
+    #[test]
+    fn a_surface_with_no_physical_rule_never_sees_the_positional_probe() {
+        // `dock.debugger` binds `y` to `godotvim.debugger.yank_frame` and
+        // carries no `<physical>` anywhere, so a Dvorak/Colemak `y` position
+        // must not reach it — even though its PARENT `dock` is full of
+        // `<physical>` rules. Fails under the mutation
+        // `let positional = anchor_allows;`.
+        let debugger = path("dock.debugger", TREE);
+        assert_eq!(
+            stop_of(&run_positional(&debugger, &[ch('f'), ch('y')], NEVER)),
+            Some(Stop::Exhausted),
+            "nothing on dock.debugger asked for the positional probe"
         );
     }
 
@@ -957,6 +1111,7 @@ mod tests {
         use super::*;
         use crate::actions::surface::fixtures::{code_edit, id, item_list, plain, tree};
         use crate::actions::surface::FocusChain;
+        use godot::global::Key as GodotKey;
         use vim_core::primitives::{Mode, Operator, VisualType};
 
         const ATTACHED: i64 = 7;
@@ -979,6 +1134,137 @@ mod tests {
                 .classify(chain)
                 .expect("the shipped forest is total");
             resolve_with(&path, &Probes::from_slice(keys), claims)
+        }
+
+        /// Resolve the probe list the REAL pipeline builds for one physical
+        /// keystroke, rather than a hand-written one.
+        ///
+        /// The difference is the whole point of the cases below:
+        /// `Probes::from_slice` marks nothing positional, so a bug that only
+        /// bites once probe 3 exists is invisible to every other test in this
+        /// file. `keycode` is the layout-dependent code Godot reports,
+        /// `physical` the US-QWERTY scan position, `unicode` what the key
+        /// actually typed.
+        fn resolve_layout(
+            chain: &FocusChain,
+            keycode: GodotKey,
+            physical: GodotKey,
+            unicode: char,
+        ) -> Resolution {
+            let path = crate::actions::providers::forest()
+                .classify(chain)
+                .expect("the shipped forest is total");
+            let probes = crate::actions::keys::probes_from_parts(
+                keycode,
+                physical,
+                unicode as u32,
+                false,
+                false,
+                false,
+                false,
+                None,
+            );
+            resolve_with(&path, &probes, NEVER)
+        }
+
+        fn fs_dock() -> FocusChain {
+            FocusChain {
+                nodes: vec![
+                    tree("FileSystemTree", 1),
+                    plain("SplitContainer", 2),
+                    plain("FileSystemDock", 3),
+                ],
+                in_filesystem_dock: true,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn colemak_j_navigates_instead_of_writing_the_clipboard() {
+            // Colemak puts `j` at the QWERTY-`y` position, so the probe list
+            // is ['j', 'y'] with 'y' positional. Walked surface-major,
+            // `dock.filesystem` got BOTH probes before `dock` got either, so
+            // probe 3 matched `godotvim.fs.yank_path` on the deeper surface —
+            // and the most-used key in the dock keyset silently wrote the
+            // clipboard instead of moving down, elastically consumed with no
+            // fallback. Probe-major is what makes the typed key win.
+            assert_eq!(
+                action_of(&resolve_layout(&fs_dock(), GodotKey::J, GodotKey::Y, 'j')),
+                Some("godotvim.item.next")
+            );
+        }
+
+        #[test]
+        fn the_qwertz_positional_alias_still_reaches_the_deeper_keyset() {
+            // The twin that must NOT change. QWERTZ swaps `z` and `y`, so the
+            // key at the QWERTY-`y` position types `z`; nothing binds `z`, so
+            // probe 3 is the only interpretation left and
+            // `panelmap <physical> dock.filesystem y` is exactly what it is
+            // for. Depth still decides — pass 2 walks leaf→root too.
+            assert_eq!(
+                action_of(&resolve_layout(&fs_dock(), GodotKey::Z, GodotKey::Y, 'z')),
+                Some("godotvim.fs.yank_path")
+            );
+        }
+
+        #[test]
+        fn a_capability_gated_typed_hit_never_promotes_the_positional_guess() {
+            // Dvorak puts `h` at the QWERTY-`j` position. `dock h` is
+            // `godotvim.item.collapse`, which needs HIERARCHY; an `ItemList`
+            // does not grant it, so probe 1 is a capability MISS — and a miss
+            // is a declination, not an invitation to guess. Promoting probe 3
+            // there moves the selection DOWN in the open-scripts list, the
+            // docs panel and the Output log, on every Dvorak keyboard, with
+            // no config and no way for the user to see why.
+            let list = FocusChain {
+                nodes: vec![item_list("ItemList", 1), plain("VBoxContainer", 2)],
+                ..Default::default()
+            };
+            assert_eq!(
+                stop_of(&resolve_layout(&list, GodotKey::H, GodotKey::J, 'h')),
+                Some(Stop::Exhausted),
+                "a gated-out typed hit must leave the key inert"
+            );
+            // …and the twin that proves the capability gate is the cause: a
+            // `Tree` grants HIERARCHY, probe 1 hits, nothing else is asked.
+            let a_tree = FocusChain {
+                nodes: vec![tree("Tree", 1), plain("VBoxContainer", 2)],
+                ..Default::default()
+            };
+            assert_eq!(
+                action_of(&resolve_layout(&a_tree, GodotKey::H, GodotKey::J, 'h')),
+                Some("godotvim.item.collapse")
+            );
+        }
+
+        /// CapsLock over the FileSystem `r`/`R` pair, pinned rather than
+        /// "fixed".
+        ///
+        /// With CapsLock on, the `r` key types `R`, so probe 1 is `R` and
+        /// resolves to `godotvim.fs.refresh`; `godotvim.fs.rename` is only
+        /// reachable as the positional guess. That inversion is **intended**
+        /// and is not what probe-major changed: probe 1 already won here
+        /// before the restructure, because `R` and `r` are both bound on
+        /// `dock.filesystem` and the as-typed probe is tried first on that
+        /// surface either way.
+        ///
+        /// It is pinned because the alternative — letting probe 3 outrank a
+        /// live probe-1 match so a CapsLocked `r` renames — inverts the one
+        /// invariant the whole probe list exists to state: a guess about
+        /// physical position must never beat the character the user actually
+        /// typed. A user who wants the other behaviour writes two lines of
+        /// vimrc; a user who gets it silently cannot.
+        #[test]
+        fn capslock_r_refreshes_and_that_is_the_documented_answer() {
+            assert_eq!(
+                action_of(&resolve_layout(&fs_dock(), GodotKey::R, GodotKey::R, 'R')),
+                Some("godotvim.fs.refresh")
+            );
+            // Unshifted, CapsLock off: the ordinary case is untouched.
+            assert_eq!(
+                action_of(&resolve_layout(&fs_dock(), GodotKey::R, GodotKey::R, 'r')),
+                Some("godotvim.fs.rename")
+            );
         }
 
         #[test]

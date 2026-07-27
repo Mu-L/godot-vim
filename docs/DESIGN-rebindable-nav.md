@@ -1913,6 +1913,29 @@ The fix is ordering plus opt-in, not deletion. Because the probe order applies t
 
 Two consequences worth naming rather than hiding. First, this is a behaviour *change* in the editor: today Ctrl+hjkl has no physical fallback when focus is the attached CodeEdit, because the escape-hatch block at `input.rs:110-116` matches the **logical** keycode only and `_ => return false` exits before `direction_from_hjkl`'s physical fallback at `:126` is ever reached — so a Cyrillic user gets panel navigation from a dock but not from the editor. Under the new order they get it from both. It ships as a pre-registered red-then-green test, not as a surprise. Second, the physical alias is not sticky across a rebind: a user who writes `panelmap dock.filesystem a godotvim.fs.rename` silently inherits no `<physical>` flag. Whether to warn on that, or make `physical` sticky per `(surface, lhs)`, is open (§13).
 
+### The walk is probe-major, and a capability miss ends it
+
+"Probe order applies to the whole key" above is a claim about the *walk*, not only about one surface's turn, and it has to be written as two passes to be true. The resolver walks probes 1 and 2 over **every** surface leaf→root first, and only then walks probe 3 over every surface. Nesting the probe loop inside the surface loop — the shape `walk_path` shipped with — gives the deepest surface all three probes before the next surface gets any, which lets the guess win on a deep surface over the typed key on a shallow one. Three zero-config, layout-specific failures followed from exactly that, none of which a QWERTY maintainer can reproduce:
+
+- **Colemak `j` in the FileSystem dock.** Colemak puts `j` at the QWERTY-`y` position, so the probes are `['j', 'y']`. `dock.filesystem` has no `j`, so probe 3 matched `y` → `godotvim.fs.yank_path` there before `dock`'s `j` → `godotvim.item.next` was ever tried. The most-used key in the dock keyset wrote the clipboard instead of moving down, elastically consumed, with no fallback and no diagnostic.
+- **Dvorak `h` in an `ItemList`.** `dock h` is `godotvim.item.collapse`, which needs `HIERARCHY`; an `ItemList` does not grant it. Probe 1 was therefore a capability miss, and `Hit::Miss => continue` promoted probe 3 (`j` at the QWERTY-`h` position) to `godotvim.item.next` — so `h` moved the selection *down* in the open-scripts list, the docs panel and the Output log.
+- **`<physical>` was enforced per surface, not per rule.** `has_physical_rule(surface)` answers "does *any* rule here carry the flag", and `dock` carries five, so probe 3 was offered to every other rule on `dock` too — including every rule a user adds. The containment the flag exists to provide did not contain.
+
+Two rules fix all three, and both are stated as invariants rather than as fixes:
+
+1. **A capability miss claims the key.** "This surface binds this key and this widget cannot do it" is an answer. The walk still continues to the parent *within pass 1* — that is what keeps `h`/`l` reaching `panel`'s chords — but it suppresses pass 2 entirely. Reinterpreting a keystroke by physical position because its real meaning was gated out is a guess layered on a refusal.
+2. **Probe 3 is admitted per rule.** `has_physical_rule` survives only as a cheap bail-out ahead of the scan; the decision is `slot_in(entry).and_then(rule_at)` and that rule's own `physical`.
+
+One intended behavioural delta comes with them, stated plainly: **a `native` rule reached by probe 1 on a shallow surface now terminates the walk before probe 3 gets a turn on a deep one.** That is the same "typed beats positional" ordering applied to the give-it-back-to-Godot escape hatch, and it is the direction that loses nothing — the key reaches Godot either way.
+
+### CapsLock over the `r`/`R` pair: pinned, not fixed
+
+With CapsLock on, the `r` key types `R`, so probe 1 is `R` and `dock.filesystem R godotvim.fs.refresh` wins; `godotvim.fs.rename` is reachable only as the positional guess. The inversion is real and it is **intended**.
+
+It is not a consequence of the probe-major restructure — probe 1 already won here beforehand, because `R` and `r` are both bound on `dock.filesystem` and the as-typed probe is tried first on that surface under either walk order. What the restructure does is remove any temptation to "repair" it by letting probe 3 outrank a live probe-1 match, which would invert the one invariant the whole probe list exists to state: **a guess about physical position must never beat the character the user actually typed.** Giving the pair a shift discriminator on the `Rule` would buy the CapsLock case at the price of that invariant everywhere else.
+
+A user who wants the other behaviour writes two lines of vimrc and probe 1 gives them exactly what they asked for. A user who gets it silently has no such recourse. Pinned by `capslock_r_refreshes_and_that_is_the_documented_answer` in `src/actions/resolve.rs`.
+
 ---
 
 ### 5.4 S2 — FocusChain sampling
