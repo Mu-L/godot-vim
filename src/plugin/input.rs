@@ -85,6 +85,30 @@ impl GodotVimCore {
             && !key_event.is_alt_pressed()
             && !key_event.is_meta_pressed()
             && !key_event.is_shift_pressed();
+
+        // One key vocabulary for every shell-side handler below; each tries
+        // the probes in priority order against its own whole keyset. See
+        // `crate::actions::keys`.
+        //
+        // Decoded lazily and only where a decision depends on it. Everything
+        // this function can still do from here needs either the panel chord
+        // (gated on `is_ctrl_only`) or a dock/search-box context; for anything
+        // else both `should_intercept_hjkl` and `consumed` are false and the
+        // handler is a no-op. Decoding unconditionally would run
+        // `translate_key` a second time on every keystroke editor-wide — it
+        // already runs once per key in `gui_input` — at the OS repeat rate.
+        if !is_ctrl_only
+            && !matches!(
+                context,
+                FocusContext::Dock(..) | FocusContext::SearchBox(..)
+            )
+        {
+            return;
+        }
+        let probes = crate::actions::keys::probes(&key_event, self.langmap.as_ref());
+        if probes.is_empty() {
+            return;
+        }
         let should_intercept_hjkl = is_ctrl_only
             && match context {
                 FocusContext::Foreign => false,
@@ -107,14 +131,14 @@ impl GodotVimCore {
                         // If the mapping trie has an entry for this Ctrl+hjkl key,
                         // let it flow through to gui_input where the mapping system
                         // handles it.
-                        let vim_key = vim_core::keymap::KeyEvent::ctrl(match keycode {
-                            Key::H => 'h',
-                            Key::J => 'j',
-                            Key::K => 'k',
-                            Key::L => 'l',
-                            _ => return false, // not hjkl — don't intercept
-                        });
-                        !c.could_start_mapping(vim_key)
+                        // Ask the engine about the interpretation we would
+                        // actually consume, not the raw logical keycode — on a
+                        // non-Latin layout those differ, and asking about the
+                        // wrong one denied panel navigation from the editor.
+                        match navigation::window::resolve_panel_key_typed(&probes) {
+                            Some((matched, _)) => !c.could_start_mapping(matched),
+                            None => false, // not a panel chord — don't intercept
+                        }
                     })
                 }
                 FocusContext::Dock(..) | FocusContext::SearchBox(..) | FocusContext::Unknown => {
@@ -122,13 +146,19 @@ impl GodotVimCore {
                 }
             };
         if should_intercept_hjkl {
-            let physical = key_event.get_physical_keycode();
-            if let Some(direction) = navigation::window::direction_from_hjkl(keycode, physical) {
+            // Editor focus refuses the positional guess (see
+            // `resolve_panel_key_typed`); every other context honours it.
+            let resolved = if matches!(context, FocusContext::Editor) {
+                navigation::window::resolve_panel_key_typed(&probes)
+            } else {
+                navigation::window::resolve_panel_key(&probes)
+            };
+            if let Some((_, direction)) = resolved {
                 if let Some(focus_owner) = viewport.gui_get_focus_owner() {
                     let control: Gd<godot::classes::Control> = focus_owner.upcast();
                     let _ = navigation::handle_window_nav(&control, direction);
                 }
-                log::trace!("input: Ctrl+hjkl consumed key={:?}", keycode);
+                log::trace!("input: Ctrl+hjkl consumed key={:?}", probes.primary());
                 viewport.set_input_as_handled();
                 return;
             }
@@ -138,15 +168,15 @@ impl GodotVimCore {
             FocusContext::Editor | FocusContext::Foreign | FocusContext::Unknown => false,
             FocusContext::Dock(kind, control) => {
                 let result = if navigation::is_in_filesystem_dock(&control) {
-                    let fs_result = self.fs_explorer.handle_key(&key_event, &control, kind);
+                    let fs_result = self.fs_explorer.handle_key(&probes, &control, kind);
                     if fs_result.is_consumed() {
                         log::trace!("input: filesystem explorer consumed key={:?}", keycode);
                         fs_result
                     } else {
-                        navigation::handle_dock_input(control, &key_event, kind)
+                        navigation::handle_dock_input(control, &probes, kind)
                     }
                 } else {
-                    navigation::handle_dock_input(control, &key_event, kind)
+                    navigation::handle_dock_input(control, &probes, kind)
                 };
                 if result.is_consumed() {
                     log::trace!("input: dock navigation consumed key={:?}", keycode);
@@ -157,7 +187,7 @@ impl GodotVimCore {
                 if self.fs_explorer.is_prompt_active(&line_edit) {
                     false
                 } else {
-                    let result = navigation::handle_search_input(&line_edit, &key_event);
+                    let result = navigation::handle_search_input(&line_edit, &probes);
                     if result.is_consumed() {
                         log::trace!("input: search box consumed key={:?}", keycode);
                     }

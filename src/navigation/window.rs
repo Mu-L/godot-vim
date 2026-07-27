@@ -7,8 +7,10 @@
 //! desired direction.
 
 use godot::classes::{Control, EditorInterface, Node};
-use godot::global::Key;
 use godot::prelude::*;
+use vim_core::keymap::{Key as VimKey, KeyEvent, Modifiers};
+
+use crate::actions::keys::Probes;
 
 use crate::bridge::godot_calls;
 
@@ -20,22 +22,48 @@ pub(crate) enum WindowNavDirection {
     Right,
 }
 
-/// Try logical keycode first (respects key remapping), fall back to physical
-/// keycode (layout-independent, US-QWERTY positions). This ensures Ctrl+hjkl
-/// panel navigation works on non-Latin layouts (Russian, Greek, etc.) where
-/// `get_keycode()` may not return the Latin H/J/K/L equivalents.
-pub(crate) fn direction_from_hjkl(logical: Key, physical: Key) -> Option<WindowNavDirection> {
-    hjkl_direction(logical).or_else(|| hjkl_direction(physical))
-}
-
-fn hjkl_direction(key: Key) -> Option<WindowNavDirection> {
-    match key {
-        Key::J => Some(WindowNavDirection::Down),
-        Key::K => Some(WindowNavDirection::Up),
-        Key::H => Some(WindowNavDirection::Left),
-        Key::L => Some(WindowNavDirection::Right),
+/// The cross-panel direction bound to a single key interpretation.
+///
+/// Requires Ctrl and nothing else: `Ctrl+hjkl` is the panel chord, while
+/// bare `hjkl` belongs to whichever dock has focus.
+fn direction_for(key: KeyEvent) -> Option<WindowNavDirection> {
+    if key.modifiers() != Modifiers::CTRL {
+        return None;
+    }
+    match key.key() {
+        VimKey::Char('j') => Some(WindowNavDirection::Down),
+        VimKey::Char('k') => Some(WindowNavDirection::Up),
+        VimKey::Char('h') => Some(WindowNavDirection::Left),
+        VimKey::Char('l') => Some(WindowNavDirection::Right),
         _ => None,
     }
+}
+
+/// Resolve a keystroke to a cross-panel direction and the interpretation that
+/// matched.
+///
+/// Each probe is tried against the whole hjkl set before the next probe is
+/// tried against any of it, so a lower-priority interpretation can never
+/// outrank what the user actually typed. See `crate::actions::keys`.
+///
+/// The matched `KeyEvent` is returned because the dispatcher must ask the
+/// engine about *that* key — not the raw logical keycode — when deciding
+/// whether a user mapping claims it. Asking about the wrong one is what used
+/// to deny Cyrillic users panel navigation from inside the editor.
+pub(crate) fn resolve_panel_key(probes: &Probes) -> Option<(KeyEvent, WindowNavDirection)> {
+    probes.resolve(|k| direction_for(k).map(|dir| (k, dir)))
+}
+
+/// As [`resolve_panel_key`], but refusing the US-QWERTY positional guess.
+///
+/// Used when focus is the attached editor, where every key already has a
+/// meaning. On Dvorak the QWERTY-H position emits `d`, so honouring the
+/// positional probe would turn `Ctrl+d` (half-page down) into panel-left;
+/// Colemak does the same to `Ctrl+n` and `Ctrl+e`. Non-Latin layouts lose
+/// nothing — `resolve_ctrl_key` already resolves those to a Latin key as
+/// probe 1.
+pub(crate) fn resolve_panel_key_typed(probes: &Probes) -> Option<(KeyEvent, WindowNavDirection)> {
+    probes.resolve_typed(|k| direction_for(k).map(|dir| (k, dir)))
 }
 
 #[derive(Debug)]
@@ -236,53 +264,94 @@ fn is_window_candidate(control: &Gd<Control>) -> bool {
 #[cfg(test)]
 mod characterization {
     use super::*;
+    use crate::actions::keys::Probes;
+    use vim_core::keymap::Key as VK;
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(VK::Char(c), Modifiers::CTRL)
+    }
+    fn probes(keys: &[KeyEvent]) -> Probes {
+        Probes::from_slice(keys)
+    }
+    fn direction_of(p: &Probes) -> Option<WindowNavDirection> {
+        resolve_panel_key(p).map(|(_, dir)| dir)
+    }
 
     // ── The Ctrl+hjkl direction table ────────────────────────────────
 
     #[test]
     fn hjkl_maps_to_vim_directions() {
-        assert_eq!(hjkl_direction(Key::H), Some(WindowNavDirection::Left));
-        assert_eq!(hjkl_direction(Key::J), Some(WindowNavDirection::Down));
-        assert_eq!(hjkl_direction(Key::K), Some(WindowNavDirection::Up));
-        assert_eq!(hjkl_direction(Key::L), Some(WindowNavDirection::Right));
+        assert_eq!(direction_for(ctrl('h')), Some(WindowNavDirection::Left));
+        assert_eq!(direction_for(ctrl('j')), Some(WindowNavDirection::Down));
+        assert_eq!(direction_for(ctrl('k')), Some(WindowNavDirection::Up));
+        assert_eq!(direction_for(ctrl('l')), Some(WindowNavDirection::Right));
     }
 
     #[test]
     fn non_hjkl_keys_are_not_directions() {
-        for key in [Key::A, Key::Z, Key::ENTER, Key::ESCAPE, Key::SLASH, Key::F2] {
-            assert_eq!(hjkl_direction(key), None, "{key:?} should not navigate");
+        for c in ['a', 'z', '/', '1'] {
+            assert_eq!(direction_for(ctrl(c)), None, "{c} should not navigate");
+        }
+        assert_eq!(
+            direction_for(KeyEvent::new(VK::Enter, Modifiers::CTRL)),
+            None
+        );
+    }
+
+    #[test]
+    fn panel_navigation_requires_ctrl_and_nothing_else() {
+        // Bare hjkl belongs to whichever dock has focus; Ctrl+Shift and
+        // Ctrl+Alt are different chords entirely.
+        assert_eq!(
+            direction_for(KeyEvent::new(VK::Char('j'), Modifiers::NONE)),
+            None
+        );
+        for extra in [Modifiers::SHIFT, Modifiers::ALT, Modifiers::META] {
+            assert_eq!(
+                direction_for(KeyEvent::new(VK::Char('j'), Modifiers::CTRL | extra)),
+                None
+            );
         }
     }
 
     #[test]
-    fn logical_keycode_wins_when_it_is_hjkl() {
-        // Latin layout: logical and physical agree.
+    fn the_as_typed_probe_wins_when_it_is_hjkl() {
         assert_eq!(
-            direction_from_hjkl(Key::J, Key::J),
+            direction_of(&probes(&[ctrl('j')])),
             Some(WindowNavDirection::Down)
         );
-        // Logical is authoritative even when physical would mean something
-        // else — this is what makes a user's OS-level remap take effect.
+        // Probe 1 is authoritative even when a later probe would mean
+        // something else — that is what makes an OS-level remap take effect.
         assert_eq!(
-            direction_from_hjkl(Key::J, Key::A),
-            Some(WindowNavDirection::Down)
-        );
-    }
-
-    #[test]
-    fn physical_keycode_is_the_fallback_for_non_latin_layouts() {
-        // Cyrillic: the QWERTY-J position emits logical Key::O (Cyrillic о).
-        // Without the physical fallback, Ctrl+hjkl would be dead on this
-        // layout — this is the whole reason the fallback exists.
-        assert_eq!(
-            direction_from_hjkl(Key::O, Key::J),
+            direction_of(&probes(&[ctrl('j'), ctrl('l')])),
             Some(WindowNavDirection::Down)
         );
     }
 
     #[test]
-    fn neither_logical_nor_physical_hjkl_yields_nothing() {
-        assert_eq!(direction_from_hjkl(Key::A, Key::B), None);
+    fn a_later_probe_is_the_fallback_for_non_latin_layouts() {
+        // Cyrillic: probe 1 is the Cyrillic char, probe 2/3 recover `j`.
+        // Without the fallback, Ctrl+hjkl would be dead on this layout.
+        assert_eq!(
+            direction_of(&probes(&[ctrl('о'), ctrl('j')])),
+            Some(WindowNavDirection::Down)
+        );
+    }
+
+    #[test]
+    fn no_probe_matching_hjkl_yields_nothing() {
+        assert_eq!(direction_of(&probes(&[ctrl('a'), ctrl('b')])), None);
+        assert_eq!(direction_of(&Probes::default()), None);
+    }
+
+    #[test]
+    fn resolve_panel_key_reports_the_probe_that_matched() {
+        // The dispatcher asks the engine about THIS key, not the raw logical
+        // keycode — asking about the wrong one denied Cyrillic users panel
+        // navigation from inside the editor.
+        let (matched, dir) = resolve_panel_key(&probes(&[ctrl('о'), ctrl('j')])).unwrap();
+        assert_eq!(matched, ctrl('j'));
+        assert_eq!(dir, WindowNavDirection::Down);
     }
 
     // ── The spatial cone ─────────────────────────────────────────────

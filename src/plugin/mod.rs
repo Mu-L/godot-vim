@@ -77,6 +77,11 @@ pub struct GodotVimCore {
     /// Used by [`ProcessingKeyGuard`] for RAII-based keystroke processing tracking.
     processing_key: bool,
     fs_explorer: crate::navigation::FileSystemExplorer,
+    /// Parsed `:set langmap`, rebuilt whenever config is sourced.
+    ///
+    /// `None` means the option is empty, which is the overwhelmingly common
+    /// case — the probe pipeline then skips the remap entirely.
+    langmap: Option<vim_core::keymap::LangmapTable>,
     /// Desired master-enable state (mirrors plugins/GodotVim/enabled).
     enabled: bool,
     /// Disabled->enabled EDGE detector (NOT a correctness gate): apply_enabled_state
@@ -103,6 +108,7 @@ impl INode for GodotVimCore {
             tracked_windows: Vec::new(),
             processing_key: false,
             fs_explorer: crate::navigation::FileSystemExplorer::new(),
+            langmap: None,
             enabled: true,
             wired: false,
         }
@@ -1174,6 +1180,10 @@ impl GodotVimCore {
     fn source_config_from_disk(&mut self, caller: &str) -> bool {
         let resolved = self.resolve_config_path();
         let Some(text) = crate::config::writer::read_file(&resolved.path) else {
+            // No file: the engine keeps whatever options it has, so the cache
+            // must be reconciled here too. Returning early without this leaves
+            // a stale table after a vimrc is deleted.
+            self.rebuild_langmap();
             return false;
         };
         let project_vimrc = self
@@ -1191,6 +1201,45 @@ impl GodotVimCore {
                 log::info!("{caller}: sourced config from '{}'", resolved.path);
             }
         }
+        self.rebuild_langmap();
         true
+    }
+
+    /// Re-read `:set langmap` into the cached table used by the shell-side
+    /// probe pipeline (`crate::actions::keys`).
+    ///
+    /// Called on every config-source path — startup, `:source`, the mapping
+    /// dialog's save, and the no-file case — so a deleted vimrc cannot leave
+    /// a stale table behind.
+    ///
+    /// It is deliberately NOT hooked to interactive ex-commands: a `:set
+    /// langmap=` typed at the command line updates the engine's table but not
+    /// this cache, so the two planes disagree until the next source. Hooking
+    /// every ex-command execution for one option is not obviously worth the
+    /// coupling; the gap is recorded rather than papered over.
+    ///
+    /// A malformed table is dropped with a warning rather than failing the
+    /// load — one bad option must not take the rest of the user's config
+    /// with it.
+    fn rebuild_langmap(&mut self) {
+        let spec = self
+            .controller
+            .as_ref()
+            .map(|c| c.engine().options().langmap().to_string())
+            .unwrap_or_default();
+        if spec.is_empty() {
+            self.langmap = None;
+            return;
+        }
+        match vim_core::keymap::LangmapTable::parse(&spec) {
+            Ok(table) => {
+                log::info!("langmap: loaded '{spec}'");
+                self.langmap = Some(table);
+            }
+            Err(err) => {
+                log::warn!("langmap: ignoring malformed '{spec}': {err:?}");
+                self.langmap = None;
+            }
+        }
     }
 }

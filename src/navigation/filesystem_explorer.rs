@@ -9,8 +9,10 @@ use godot::classes::{
     Control, DirAccess, DisplayServer, EditorInterface, FileAccess, HBoxContainer, Input,
     InputEventKey, ItemList, Label, LineEdit, Node, Tree, VBoxContainer,
 };
-use godot::global::Key;
 use godot::prelude::*;
+use vim_core::keymap::{Key as VimKey, KeyEvent, Modifiers};
+
+use crate::actions::keys::Probes;
 
 use crate::bridge::godot_calls;
 
@@ -67,7 +69,7 @@ impl FileSystemExplorer {
 
     pub(crate) fn handle_key(
         &mut self,
-        key_event: &Gd<InputEventKey>,
+        probes: &Probes,
         control: &Gd<Control>,
         kind: DockKind,
     ) -> DockInputResult {
@@ -79,16 +81,7 @@ impl FileSystemExplorer {
             self.dismiss_prompt();
         }
 
-        if key_event.is_ctrl_pressed() || key_event.is_alt_pressed() || key_event.is_meta_pressed()
-        {
-            return DockInputResult::Declined;
-        }
-
-        let action = resolve_fs_action(
-            key_event.get_keycode(),
-            key_event.get_physical_keycode(),
-            key_event.is_shift_pressed(),
-        );
+        let action = resolve_fs_action(probes);
 
         match action {
             FsAction::Create => self.begin_create(control, kind),
@@ -374,38 +367,28 @@ enum FsAction {
     None,
 }
 
-/// Check logical keycode first, fall back to physical.
+/// The FileSystem action bound to a single key interpretation.
 ///
-/// The fallback is meant for non-Latin layouts, but it is applied
-/// unconditionally — see [`resolve_fs_action`] for the misfire that causes.
-fn resolve_key(logical: Key, physical: Key) -> Option<Key> {
-    if is_fs_key(logical) {
-        Some(logical)
-    } else if is_fs_key(physical) {
-        Some(physical)
-    } else {
-        None
+/// Shift is a *discriminant* here, not a filter: `R` refreshes while `r`
+/// renames. Because `bridge::input` folds Shift into the character itself,
+/// that distinction is carried by the char, not by a modifier bit.
+fn fs_action_for(key: KeyEvent) -> Option<FsAction> {
+    if key.modifiers() != Modifiers::NONE {
+        return None;
+    }
+    match key.key() {
+        VimKey::Char('a') => Some(FsAction::Create),
+        VimKey::Char('d') => Some(FsAction::Delete),
+        VimKey::Char('r') => Some(FsAction::Rename),
+        VimKey::Char('y') => Some(FsAction::YankPath),
+        VimKey::Char('R') => Some(FsAction::Refresh),
+        _ => None,
     }
 }
 
-/// Resolve a plain keystroke to a FileSystem-dock action.
-///
-/// Note the physical fallback is unconditional: it fires even when the
-/// logical key is a perfectly good Latin character that simply is not bound.
-/// On QWERTZ that misfires — see the `#[ignore]`d red test below.
-fn resolve_fs_action(logical: Key, physical: Key, shift: bool) -> FsAction {
-    match (resolve_key(logical, physical), shift) {
-        (Some(Key::A), false) => FsAction::Create,
-        (Some(Key::D), false) => FsAction::Delete,
-        (Some(Key::R), false) => FsAction::Rename,
-        (Some(Key::Y), false) => FsAction::YankPath,
-        (Some(Key::R), true) => FsAction::Refresh,
-        _ => FsAction::None,
-    }
-}
-
-fn is_fs_key(key: Key) -> bool {
-    matches!(key, Key::A | Key::D | Key::R | Key::Y)
+/// Resolve a keystroke to a FileSystem-dock action, probe by probe.
+fn resolve_fs_action(probes: &Probes) -> FsAction {
+    probes.resolve(fs_action_for).unwrap_or(FsAction::None)
 }
 
 pub(crate) fn is_in_filesystem_dock(control: &Gd<Control>) -> bool {
@@ -537,68 +520,82 @@ fn get_selected_path(control: &Gd<Control>, kind: DockKind) -> Option<String> {
 #[cfg(test)]
 mod characterization {
     use super::*;
+    use crate::actions::keys::Probes;
 
-    #[test]
-    fn only_adry_are_filesystem_keys() {
-        for key in [Key::A, Key::D, Key::R, Key::Y] {
-            assert!(is_fs_key(key), "{key:?} should be an FS key");
-        }
-        for key in [Key::J, Key::K, Key::H, Key::L, Key::N, Key::Z, Key::SLASH] {
-            assert!(!is_fs_key(key), "{key:?} should not be an FS key");
-        }
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(VimKey::Char(c), Modifiers::NONE)
+    }
+    fn probes(keys: &[KeyEvent]) -> Probes {
+        Probes::from_slice(keys)
     }
 
     #[test]
-    fn the_shipped_keyset_on_a_latin_layout() {
-        let k = |key: Key, shift: bool| resolve_fs_action(key, key, shift);
-        assert_eq!(k(Key::A, false), FsAction::Create);
-        assert_eq!(k(Key::D, false), FsAction::Delete);
-        assert_eq!(k(Key::R, false), FsAction::Rename);
-        assert_eq!(k(Key::Y, false), FsAction::YankPath);
-        assert_eq!(k(Key::R, true), FsAction::Refresh);
+    fn the_shipped_keyset() {
+        assert_eq!(fs_action_for(ch('a')), Some(FsAction::Create));
+        assert_eq!(fs_action_for(ch('d')), Some(FsAction::Delete));
+        assert_eq!(fs_action_for(ch('r')), Some(FsAction::Rename));
+        assert_eq!(fs_action_for(ch('y')), Some(FsAction::YankPath));
+        assert_eq!(fs_action_for(ch('R')), Some(FsAction::Refresh));
     }
 
     #[test]
     fn shift_is_a_discriminant_only_for_r() {
-        // Shift+R is refresh; every other Shift+<fs key> is unbound rather
-        // than falling through to its unshifted meaning.
-        assert_eq!(resolve_fs_action(Key::R, Key::R, true), FsAction::Refresh);
-        assert_eq!(resolve_fs_action(Key::A, Key::A, true), FsAction::None);
-        assert_eq!(resolve_fs_action(Key::D, Key::D, true), FsAction::None);
-        assert_eq!(resolve_fs_action(Key::Y, Key::Y, true), FsAction::None);
+        // `R` refreshes, `r` renames. Because `bridge::input` folds Shift into
+        // the character itself, that distinction rides on the char, not on a
+        // modifier bit. Shifted forms of the other four are simply unbound.
+        assert_eq!(fs_action_for(ch('R')), Some(FsAction::Refresh));
+        assert_eq!(fs_action_for(ch('r')), Some(FsAction::Rename));
+        for c in ['A', 'D', 'Y'] {
+            assert_eq!(fs_action_for(ch(c)), None, "{c} should be unbound");
+        }
     }
 
     #[test]
     fn unbound_keys_decline() {
-        assert_eq!(resolve_fs_action(Key::N, Key::N, false), FsAction::None);
-        assert_eq!(resolve_fs_action(Key::J, Key::J, false), FsAction::None);
+        for c in ['n', 'j', 'z', 'q'] {
+            assert_eq!(resolve_fs_action(&probes(&[ch(c)])), FsAction::None);
+        }
     }
 
     #[test]
-    fn physical_fallback_recovers_the_keyset_on_a_cyrillic_layout() {
-        // Models a non-Latin layout: logical keycode unbound, physical
-        // position is A. This is the fallback doing its intended job.
-        assert_eq!(resolve_fs_action(Key::F, Key::A, false), FsAction::Create);
+    fn modified_keys_are_never_filesystem_actions() {
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::META] {
+            assert_eq!(fs_action_for(KeyEvent::new(VimKey::Char('d'), m)), None);
+        }
     }
 
     #[test]
-    fn logical_wins_when_both_are_filesystem_keys() {
-        // Logical D, physical Y: the user typed `d`, so delete — not yank.
-        assert_eq!(resolve_fs_action(Key::D, Key::Y, false), FsAction::Delete);
+    fn a_later_probe_recovers_the_keyset_on_a_non_latin_layout() {
+        // Cyrillic: probe 1 is the Cyrillic char, a later probe recovers `a`.
+        assert_eq!(
+            resolve_fs_action(&probes(&[ch('ф'), ch('a')])),
+            FsAction::Create
+        );
     }
 
-    // ── Known bug, pinned at its WRONG value ─────────────────────────
+    #[test]
+    fn the_as_typed_probe_wins_when_it_is_bound() {
+        // The user typed `d`; a physical position of `y` must not win.
+        assert_eq!(
+            resolve_fs_action(&probes(&[ch('d'), ch('y')])),
+            FsAction::Delete
+        );
+    }
 
     #[test]
-    fn known_bug_qwertz_z_yanks_the_path() {
-        // On QWERTZ the Y and Z keys are swapped, so the QWERTY-Y position
-        // emits a logical `z`. `z` is bound to nothing, but the fallback is
-        // unconditional: it sees physical Y and silently yanks the selected
-        // path. The fallback should apply only when the logical key is
-        // unusable (non-Latin), not merely unbound.
+    fn a_qwertz_z_still_reaches_the_physical_alias() {
+        // Was `known_bug_qwertz_z_yanks_the_path`, and it is NOT a bug that
+        // P1 fixes — it is the deliberate cost of supporting position-based
+        // layouts (Dvorak, Colemak, AZERTY). On QWERTZ the QWERTY-Y position
+        // emits `z`; `z` is unbound, so the physical probe wins and yanks.
         //
-        // WRONG. P1 (one global probe order, physical probe opt-in per rule)
-        // must flip this to `FsAction::None`.
-        assert_eq!(resolve_fs_action(Key::Z, Key::Y, false), FsAction::YankPath);
+        // What P1 changes is that the alias is now ordered — probe 1 always
+        // gets first refusal. It becomes escapable at P5, when a user can
+        // write `panelmap dock.filesystem z <target>` and win probe 1; the
+        // same phase scopes the alias to the fourteen rules that want it.
+        assert_eq!(
+            resolve_fs_action(&probes(&[ch('z'), ch('y')])),
+            FsAction::YankPath
+        );
     }
 }

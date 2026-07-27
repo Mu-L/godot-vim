@@ -94,7 +94,7 @@ fn is_dead_key_char(ch: char) -> bool {
 ///
 /// The shift table is hardcoded to US-QWERTY because Godot's
 /// `get_physical_keycode()` is defined as the US-QWERTY scan code.
-fn physical_to_ascii(physical: GodotKey, shift: bool) -> Option<char> {
+pub(crate) fn physical_to_ascii(physical: GodotKey, shift: bool) -> Option<char> {
     let code = physical.ord();
     // Letters: physical A-Z → 'a'-'z' or 'A'-'Z'
     let key_a = GodotKey::A.ord();

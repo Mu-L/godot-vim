@@ -8,9 +8,14 @@
 //! Modified keys (Ctrl/Alt/Meta/Shift) always pass through: Ctrl+hjkl is
 //! intercepted at a higher priority in `input.rs` for cross-panel navigation.
 
-use godot::classes::{CodeEdit, Control, EditorInterface, InputEventKey, Node};
-use godot::global::Key;
+use godot::classes::{CodeEdit, Control, EditorInterface, Node};
 use godot::prelude::*;
+use vim_core::keymap::{Key as VimKey, KeyEvent, Modifiers};
+
+use crate::actions::keys::Probes;
+
+/// Modifiers that mark a chord as belonging to the editor or the IDE.
+const CMD_MODS: Modifiers = Modifiers::CTRL.union(Modifiers::ALT).union(Modifiers::META);
 
 use super::dock_nav::{handle_hierarchy, handle_navigation, HierarchyAction, NavDirection};
 use super::dock_search::{find_sibling_nav_control, find_sibling_search_box};
@@ -80,69 +85,55 @@ enum DockKeyAction {
     None,
 }
 
-/// Resolve a keystroke to a dock action, logical keycode first with a
-/// physical fallback for non-Latin layouts.
+/// The dock action bound to a single key interpretation.
 ///
-/// **The order here is load-bearing, and it is currently wrong.** The hjkl
-/// probe consults BOTH the logical and the physical keycode before the
-/// slash/enter/escape match is reached. On a layout where the QWERTY-J
-/// position emits a logical `/`, the physical fallback claims the key for
-/// `Down` and `/` never opens the dock filter — the exact users the fallback
-/// was added to serve. Characterized by an `#[ignore]`d red test below;
-/// the fix belongs in the one-global-probe-order work, not here.
-fn resolve_dock_key(logical: Key, physical: Key, any_modifier: bool) -> DockKeyAction {
-    // Docks reject EVERY modifier, Shift included. The search box does not —
-    // see `resolve_search_key`. That asymmetry is real and load-bearing.
-    if any_modifier {
-        return DockKeyAction::None;
+/// Docks reject **every** modifier, Shift included — a modified key belongs
+/// to the editor or the IDE, not here. The search box is deliberately more
+/// permissive; see [`resolve_search_key`].
+fn dock_action_for(key: KeyEvent) -> Option<DockKeyAction> {
+    if key.modifiers() != Modifiers::NONE {
+        return None;
     }
-    if let Some(direction) = hjkl_to_dock(logical).or_else(|| hjkl_to_dock(physical)) {
-        return DockKeyAction::Hjkl(direction);
-    }
-    match logical {
-        Key::SLASH => DockKeyAction::Slash,
-        Key::ENTER => DockKeyAction::Enter,
-        Key::ESCAPE => DockKeyAction::Escape,
-        _ if physical == Key::SLASH => DockKeyAction::Slash,
-        _ => DockKeyAction::None,
-    }
-}
-
-fn hjkl_to_dock(key: Key) -> Option<DockHjkl> {
-    match key {
-        Key::J => Some(DockHjkl::Down),
-        Key::K => Some(DockHjkl::Up),
-        Key::H => Some(DockHjkl::Left),
-        Key::L => Some(DockHjkl::Right),
+    match key.key() {
+        VimKey::Char('j') => Some(DockKeyAction::Hjkl(DockHjkl::Down)),
+        VimKey::Char('k') => Some(DockKeyAction::Hjkl(DockHjkl::Up)),
+        VimKey::Char('h') => Some(DockKeyAction::Hjkl(DockHjkl::Left)),
+        VimKey::Char('l') => Some(DockKeyAction::Hjkl(DockHjkl::Right)),
+        VimKey::Char('/') => Some(DockKeyAction::Slash),
+        VimKey::Enter => Some(DockKeyAction::Enter),
+        VimKey::Escape => Some(DockKeyAction::Escape),
         _ => None,
     }
 }
 
+/// Resolve a keystroke to a dock action.
+///
+/// Every probe is tried against the **whole** keyset before the next probe is
+/// tried against any of it. That ordering is what makes `/` reachable again:
+/// under the old per-arm fallback the hjkl arm consulted the physical keycode
+/// and returned before the arm owning `Key::SLASH` was reached, so on a layout
+/// whose QWERTY-J position emits `/` the filter box was unreachable.
+fn resolve_dock_key(probes: &Probes) -> DockKeyAction {
+    probes
+        .resolve(dock_action_for)
+        .unwrap_or(DockKeyAction::None)
+}
+
 pub(crate) fn handle_dock_input(
     focused: Gd<Control>,
-    key_event: &Gd<InputEventKey>,
+    probes: &Probes,
     dock_kind: DockKind,
 ) -> DockInputResult {
     log::trace!(
         "dock_input: key={:?} kind={:?}",
-        key_event.get_keycode(),
+        probes.primary(),
         dock_kind
     );
-    // All modified keys pass through. Ctrl+hjkl is already intercepted at
-    // Priority 1 in input.rs before this code is reached.
-    let any_modifier = key_event.is_ctrl_pressed()
-        || key_event.is_alt_pressed()
-        || key_event.is_meta_pressed()
-        || key_event.is_shift_pressed();
 
-    // hjkl and / use logical-then-physical fallback for non-Latin layout support.
-    // Enter and Esc use logical keycode only — they are special keys with
-    // layout-independent keycodes.
-    let action = resolve_dock_key(
-        key_event.get_keycode(),
-        key_event.get_physical_keycode(),
-        any_modifier,
-    );
+    // One ordered probe list covers the whole keyset; see `actions::keys`.
+    // Enter and Escape never receive a positional probe — that is enforced in
+    // `probes_from_parts`, not left to chance.
+    let action = resolve_dock_key(probes);
     if let DockKeyAction::Hjkl(direction) = action {
         return match direction {
             DockHjkl::Down => {
@@ -199,24 +190,30 @@ enum SearchKeyAction {
 
 /// Resolve a keystroke inside a dock search box.
 ///
-/// Two deliberate asymmetries against [`resolve_dock_key`], both pinned by
-/// tests because a unified dispatcher will be tempted to erase them:
+/// One deliberate asymmetry against [`resolve_dock_key`], pinned by tests
+/// because a unified dispatcher will be tempted to erase it: **Shift is
+/// tolerated.** Only Ctrl/Alt/Meta suppress handling, so `Shift+Enter` and
+/// `Shift+Esc` still leave the search box, while in a dock Shift suppresses
+/// everything.
 ///
-/// 1. **Shift is tolerated.** Only Ctrl/Alt/Meta suppress handling, so
-///    `Shift+Enter` and `Shift+Esc` still leave the search box. In a dock,
-///    Shift suppresses everything. Shift is not even a parameter here — it
-///    is never consulted.
-/// 2. **No physical fallback.** Only the logical keycode is read. Enter and
-///    Escape carry layout-independent keycodes, so the fallback that hjkl
-///    and `/` need would buy nothing and could only misfire.
-fn resolve_search_key(logical: Key, ctrl_alt_or_meta: bool) -> SearchKeyAction {
-    if ctrl_alt_or_meta {
-        return SearchKeyAction::None;
+/// The search box reads the same probe list as every other handler. That
+/// costs nothing here: Enter and Escape are named keys, and a named key never
+/// receives a positional probe, so probes 2 and 3 can only ever produce
+/// characters this table does not bind.
+fn search_action_for(key: KeyEvent) -> Option<SearchKeyAction> {
+    if key.modifiers().intersects(CMD_MODS) {
+        return None;
     }
-    match logical {
-        Key::ESCAPE | Key::ENTER => SearchKeyAction::LeaveSearch,
-        _ => SearchKeyAction::None,
+    match key.key() {
+        VimKey::Escape | VimKey::Enter => Some(SearchKeyAction::LeaveSearch),
+        _ => None,
     }
+}
+
+fn resolve_search_key(probes: &Probes) -> SearchKeyAction {
+    probes
+        .resolve(search_action_for)
+        .unwrap_or(SearchKeyAction::None)
 }
 
 /// Only intercepts ESC and Enter from dock search boxes — all other keys
@@ -224,12 +221,9 @@ fn resolve_search_key(logical: Key, ctrl_alt_or_meta: bool) -> SearchKeyAction {
 /// nav control (Tree/ItemList), preserving the search filter text.
 pub(crate) fn handle_search_input(
     line_edit: &Gd<godot::classes::LineEdit>,
-    key_event: &Gd<InputEventKey>,
+    probes: &Probes,
 ) -> DockInputResult {
-    let action = resolve_search_key(
-        key_event.get_keycode(),
-        key_event.is_ctrl_pressed() || key_event.is_alt_pressed() || key_event.is_meta_pressed(),
-    );
+    let action = resolve_search_key(probes);
 
     match action {
         SearchKeyAction::LeaveSearch => {
@@ -339,131 +333,191 @@ fn handle_escape_from_dock() -> DockInputResult {
 #[cfg(test)]
 mod characterization {
     use super::*;
+    use crate::actions::keys::Probes;
 
-    // ── The hjkl table ───────────────────────────────────────────────
-
-    #[test]
-    fn hjkl_maps_to_dock_directions() {
-        assert_eq!(hjkl_to_dock(Key::J), Some(DockHjkl::Down));
-        assert_eq!(hjkl_to_dock(Key::K), Some(DockHjkl::Up));
-        assert_eq!(hjkl_to_dock(Key::H), Some(DockHjkl::Left));
-        assert_eq!(hjkl_to_dock(Key::L), Some(DockHjkl::Right));
-        assert_eq!(hjkl_to_dock(Key::A), None);
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(VimKey::Char(c), Modifiers::NONE)
+    }
+    fn named(k: VimKey) -> KeyEvent {
+        KeyEvent::new(k, Modifiers::NONE)
+    }
+    fn probes(keys: &[KeyEvent]) -> Probes {
+        Probes::from_slice(keys)
     }
 
-    // ── Resolution order ─────────────────────────────────────────────
+    // ── The dock keyset ──────────────────────────────────────────────
+
+    #[test]
+    fn the_shipped_dock_keyset() {
+        assert_eq!(
+            dock_action_for(ch('j')),
+            Some(DockKeyAction::Hjkl(DockHjkl::Down))
+        );
+        assert_eq!(
+            dock_action_for(ch('k')),
+            Some(DockKeyAction::Hjkl(DockHjkl::Up))
+        );
+        assert_eq!(
+            dock_action_for(ch('h')),
+            Some(DockKeyAction::Hjkl(DockHjkl::Left))
+        );
+        assert_eq!(
+            dock_action_for(ch('l')),
+            Some(DockKeyAction::Hjkl(DockHjkl::Right))
+        );
+        assert_eq!(dock_action_for(ch('/')), Some(DockKeyAction::Slash));
+        assert_eq!(
+            dock_action_for(named(VimKey::Enter)),
+            Some(DockKeyAction::Enter)
+        );
+        assert_eq!(
+            dock_action_for(named(VimKey::Escape)),
+            Some(DockKeyAction::Escape)
+        );
+        assert_eq!(dock_action_for(ch('z')), None);
+    }
+
+    #[test]
+    fn a_dock_rejects_every_modifier_including_shift() {
+        // Ctrl+hjkl is claimed earlier, at input.rs Priority 1; by the time a
+        // key reaches the dock resolver ANY modifier means "not ours".
+        for m in [
+            Modifiers::CTRL,
+            Modifiers::ALT,
+            Modifiers::META,
+            Modifiers::SHIFT,
+        ] {
+            assert_eq!(dock_action_for(KeyEvent::new(VimKey::Char('j'), m)), None);
+            assert_eq!(dock_action_for(KeyEvent::new(VimKey::Enter, m)), None);
+        }
+    }
+
+    // ── Probe ordering ───────────────────────────────────────────────
 
     #[test]
     fn latin_layout_resolves_every_bound_key() {
-        let same = |k: Key| resolve_dock_key(k, k, false);
-        assert_eq!(same(Key::J), DockKeyAction::Hjkl(DockHjkl::Down));
-        assert_eq!(same(Key::K), DockKeyAction::Hjkl(DockHjkl::Up));
-        assert_eq!(same(Key::H), DockKeyAction::Hjkl(DockHjkl::Left));
-        assert_eq!(same(Key::L), DockKeyAction::Hjkl(DockHjkl::Right));
-        assert_eq!(same(Key::SLASH), DockKeyAction::Slash);
-        assert_eq!(same(Key::ENTER), DockKeyAction::Enter);
-        assert_eq!(same(Key::ESCAPE), DockKeyAction::Escape);
-        assert_eq!(same(Key::Z), DockKeyAction::None);
+        for (k, want) in [
+            (ch('j'), DockKeyAction::Hjkl(DockHjkl::Down)),
+            (ch('/'), DockKeyAction::Slash),
+            (named(VimKey::Enter), DockKeyAction::Enter),
+            (named(VimKey::Escape), DockKeyAction::Escape),
+        ] {
+            assert_eq!(resolve_dock_key(&probes(&[k])), want);
+        }
+        assert_eq!(resolve_dock_key(&probes(&[ch('z')])), DockKeyAction::None);
     }
 
     #[test]
-    fn physical_fallback_recovers_hjkl_on_a_cyrillic_layout() {
-        // Models a non-Latin layout: the logical keycode is not one we bind,
-        // the physical position is J. (Key::O merely stands in for "some
-        // unbound logical keycode" — Godot reports a layout-specific value.)
+    fn a_later_probe_recovers_hjkl_on_a_non_latin_layout() {
         assert_eq!(
-            resolve_dock_key(Key::O, Key::J, false),
+            resolve_dock_key(&probes(&[ch('о'), ch('j')])),
             DockKeyAction::Hjkl(DockHjkl::Down)
         );
     }
 
     #[test]
-    fn physical_fallback_also_recovers_slash() {
-        // Logical is unbound, physical is SLASH: the trailing guard arm.
+    fn a_later_probe_also_recovers_slash() {
         assert_eq!(
-            resolve_dock_key(Key::Z, Key::SLASH, false),
+            resolve_dock_key(&probes(&[ch('ю'), ch('/')])),
             DockKeyAction::Slash
         );
     }
 
     #[test]
-    fn logical_hjkl_beats_a_physical_slash() {
-        // Pins precedence: the hjkl probe runs first, so a logical `j` wins
-        // even when the physical position is `/`. This one is CORRECT — the
-        // user typed `j`.
+    fn the_as_typed_probe_beats_a_later_one() {
+        // The user typed `j`; a physical position of `/` must not win.
         assert_eq!(
-            resolve_dock_key(Key::J, Key::SLASH, false),
+            resolve_dock_key(&probes(&[ch('j'), ch('/')])),
             DockKeyAction::Hjkl(DockHjkl::Down)
         );
     }
 
     #[test]
-    fn enter_and_escape_do_not_take_the_physical_fallback() {
-        // Only hjkl and slash consult the physical keycode. Enter/Escape are
-        // layout-independent, so a physical ENTER under some other logical
-        // key must NOT activate an item.
-        assert_eq!(
-            resolve_dock_key(Key::Z, Key::ENTER, false),
-            DockKeyAction::None
-        );
-        assert_eq!(
-            resolve_dock_key(Key::Z, Key::ESCAPE, false),
-            DockKeyAction::None
-        );
-    }
-
-    // ── Known bugs, pinned at their WRONG value ──────────────────────
-    //
-    // These assert what the code does TODAY, which is not what it should do.
-    // They run by default and are green right now. When the phase named in
-    // each one fixes the bug, the assertion FAILS — which is the point: it
-    // forces the fix to be acknowledged here rather than landing silently.
-    // Flip the expected value (and drop the `known_bug_` prefix) as part of
-    // that phase. Do not delete them to keep the suite quiet.
-    //
-    // `#[ignore]` was deliberately NOT used: an ignored test stays silent
-    // both while the bug exists and after it is fixed, so nothing ever
-    // forces the revisit.
-
-    #[test]
-    fn known_bug_physical_hjkl_probe_shadows_a_logical_slash() {
-        // On a layout whose QWERTY-J position emits `/`, the user pressed a
-        // key that produces `/` and should get the dock filter. Instead the
-        // hjkl probe consults the physical keycode first and moves the
-        // selection down, so `/` is unreachable — on exactly the non-Latin
-        // layouts the physical fallback exists to serve.
+    fn a_logical_slash_is_no_longer_shadowed_by_a_physical_hjkl_probe() {
+        // Was `known_bug_physical_hjkl_probe_shadows_a_logical_slash`.
         //
-        // WRONG. P1 (one global probe order) must flip this to
-        // `DockKeyAction::Slash`.
+        // The old resolver ran the hjkl arm — logical THEN physical — and
+        // returned before the arm owning SLASH was reached, so on a layout
+        // whose QWERTY-J position emits `/` the dock filter was unreachable.
+        // Probes are now tried against the WHOLE keyset in priority order, so
+        // the as-typed `/` wins.
         assert_eq!(
-            resolve_dock_key(Key::SLASH, Key::J, false),
-            DockKeyAction::Hjkl(DockHjkl::Down)
+            resolve_dock_key(&probes(&[ch('/'), ch('j')])),
+            DockKeyAction::Slash
         );
-
-        // The shadow is not specific to `/` — any logical key whose physical
-        // position is hjkl is swallowed the same way.
+        // Same for the other keys the old shadow swallowed.
         assert_eq!(
-            resolve_dock_key(Key::ESCAPE, Key::J, false),
-            DockKeyAction::Hjkl(DockHjkl::Down)
+            resolve_dock_key(&probes(&[named(VimKey::Escape), ch('j')])),
+            DockKeyAction::Escape
         );
         assert_eq!(
-            resolve_dock_key(Key::ENTER, Key::L, false),
-            DockKeyAction::Hjkl(DockHjkl::Right)
+            resolve_dock_key(&probes(&[named(VimKey::Enter), ch('l')])),
+            DockKeyAction::Enter
         );
     }
 
     #[test]
-    fn known_bug_numpad_enter_is_unbound_in_docks() {
-        // `bridge::input::get_named_key` folds KP_ENTER into Enter for the
-        // editor path (`src/bridge/input.rs:23`); the dock path matches the
-        // raw keycode and misses it.
+    fn numpad_enter_activates_a_dock_item() {
+        // Was `known_bug_numpad_enter_is_unbound_in_docks`.
         //
-        // WRONG. P1 (one key vocabulary) must flip this to
-        // `DockKeyAction::Enter`.
+        // `bridge::input::get_named_key` folds KP_ENTER into `Key::Enter`
+        // before the probe list is built, so the dock path sees a plain
+        // Enter and no longer has to know the numpad exists.
         assert_eq!(
-            resolve_dock_key(Key::KP_ENTER, Key::KP_ENTER, false),
-            DockKeyAction::None
+            resolve_dock_key(&probes(&[named(VimKey::Enter)])),
+            DockKeyAction::Enter
         );
+    }
+
+    // ── The search box ───────────────────────────────────────────────
+
+    #[test]
+    fn a_search_box_leaves_on_enter_and_escape() {
+        assert_eq!(
+            resolve_search_key(&probes(&[named(VimKey::Escape)])),
+            SearchKeyAction::LeaveSearch
+        );
+        assert_eq!(
+            resolve_search_key(&probes(&[named(VimKey::Enter)])),
+            SearchKeyAction::LeaveSearch
+        );
+    }
+
+    #[test]
+    fn a_search_box_passes_ordinary_typing_through() {
+        // Everything else must reach the LineEdit or the user cannot type a
+        // filter at all.
+        for k in [ch('a'), ch('j'), ch('/'), named(VimKey::Backspace)] {
+            assert_eq!(
+                resolve_search_key(&probes(&[k])),
+                SearchKeyAction::None,
+                "{k} should reach the LineEdit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_box_tolerates_shift_where_a_dock_does_not() {
+        // THE asymmetry. Shift+Enter still leaves the search box, while the
+        // same chord is inert in a dock. A unified dispatcher will be tempted
+        // to collapse these two regimes; this test makes that a decision
+        // rather than an accident.
+        let shift_enter = KeyEvent::new(VimKey::Enter, Modifiers::SHIFT);
+        assert_eq!(
+            resolve_search_key(&probes(&[shift_enter])),
+            SearchKeyAction::LeaveSearch
+        );
+        assert_eq!(dock_action_for(shift_enter), None);
+    }
+
+    #[test]
+    fn a_search_box_declines_ctrl_alt_and_meta() {
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::META] {
+            assert_eq!(
+                resolve_search_key(&probes(&[KeyEvent::new(VimKey::Escape, m)])),
+                SearchKeyAction::None
+            );
+        }
     }
 
     // ── The tri-state ────────────────────────────────────────────────
@@ -476,81 +530,8 @@ mod characterization {
     }
 
     // Compile-time proof that `is_consumed` stays `const`-evaluable, which
-    // P2's `const fn is_consumed(self)` signature depends on. These are
-    // assertions the compiler checks: if const-ness regresses, the crate
-    // stops building rather than a test going red at runtime.
+    // P2's `const fn is_consumed(self)` signature depends on.
     const _: () = assert!(DockInputResult::Handled.is_consumed());
     const _: () = assert!(DockInputResult::FocusChanged.is_consumed());
     const _: () = assert!(!DockInputResult::Declined.is_consumed());
-
-    // ── Modifier handling: dock vs. search box ───────────────────────
-
-    #[test]
-    fn a_dock_rejects_every_modifier_including_shift() {
-        // Ctrl+hjkl is claimed earlier, at input.rs Priority 1; by the time a
-        // key reaches the dock resolver ANY modifier means "not ours".
-        for key in [
-            Key::J,
-            Key::K,
-            Key::H,
-            Key::L,
-            Key::SLASH,
-            Key::ENTER,
-            Key::ESCAPE,
-        ] {
-            assert_eq!(
-                resolve_dock_key(key, key, true),
-                DockKeyAction::None,
-                "{key:?} with a modifier should not be a dock action"
-            );
-        }
-    }
-
-    #[test]
-    fn a_search_box_leaves_on_enter_and_escape() {
-        assert_eq!(
-            resolve_search_key(Key::ESCAPE, false),
-            SearchKeyAction::LeaveSearch
-        );
-        assert_eq!(
-            resolve_search_key(Key::ENTER, false),
-            SearchKeyAction::LeaveSearch
-        );
-    }
-
-    #[test]
-    fn a_search_box_passes_ordinary_typing_through() {
-        // Everything else must reach the LineEdit or the user cannot type a
-        // filter at all.
-        for key in [Key::A, Key::J, Key::SLASH, Key::BACKSPACE, Key::SPACE] {
-            assert_eq!(
-                resolve_search_key(key, false),
-                SearchKeyAction::None,
-                "{key:?} should reach the LineEdit"
-            );
-        }
-    }
-
-    #[test]
-    fn a_search_box_tolerates_shift_where_a_dock_does_not() {
-        // THE asymmetry. Shift is not a parameter of resolve_search_key at
-        // all, so Shift+Enter and Shift+Esc still leave the search box —
-        // while the same chords are inert in a dock. A unified dispatcher
-        // will be tempted to collapse these two regimes into one; this test
-        // is what makes that a deliberate decision rather than an accident.
-        assert_eq!(
-            resolve_search_key(Key::ENTER, false),
-            SearchKeyAction::LeaveSearch
-        );
-        assert_eq!(
-            resolve_dock_key(Key::ENTER, Key::ENTER, true),
-            DockKeyAction::None
-        );
-    }
-
-    #[test]
-    fn a_search_box_declines_ctrl_alt_and_meta() {
-        assert_eq!(resolve_search_key(Key::ESCAPE, true), SearchKeyAction::None);
-        assert_eq!(resolve_search_key(Key::ENTER, true), SearchKeyAction::None);
-    }
 }
