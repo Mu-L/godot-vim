@@ -81,7 +81,12 @@ pub(crate) fn classify_focus(
         return FocusContext::Foreign;
     }
 
-    // TextEdit that isn't CodeEdit (e.g., shader editor) — foreign.
+    // A TextEdit that isn't a CodeEdit — foreign. Note this is NOT the shader
+    // editor: `ShaderTextEditor` derives from `CodeEditorBase`, whose
+    // `CodeTextEditor` owns a real `CodeEdit` (godot/editor/gui/code_editor.h:93),
+    // so shader editing is attached and handled as `Editor` — which is what
+    // README.md:159 documents as intentional. This arm catches genuinely
+    // foreign plain-TextEdit surfaces (addon panels, some resource editors).
     if focus_owner.is_class("TextEdit") {
         return FocusContext::Foreign;
     }
