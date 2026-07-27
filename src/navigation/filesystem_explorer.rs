@@ -84,16 +84,19 @@ impl FileSystemExplorer {
             return DockInputResult::Declined;
         }
 
-        let shift = key_event.is_shift_pressed();
-        let key = resolve_key(key_event);
+        let action = resolve_fs_action(
+            key_event.get_keycode(),
+            key_event.get_physical_keycode(),
+            key_event.is_shift_pressed(),
+        );
 
-        match (key, shift) {
-            (Some(Key::A), false) => self.begin_create(control, kind),
-            (Some(Key::D), false) => self.begin_delete(control, kind),
-            (Some(Key::R), false) => self.begin_rename(control, kind),
-            (Some(Key::Y), false) => self.yank_path(control, kind),
-            (Some(Key::R), true) => self.refresh(),
-            _ => DockInputResult::Declined,
+        match action {
+            FsAction::Create => self.begin_create(control, kind),
+            FsAction::Delete => self.begin_delete(control, kind),
+            FsAction::Rename => self.begin_rename(control, kind),
+            FsAction::YankPath => self.yank_path(control, kind),
+            FsAction::Refresh => self.refresh(),
+            FsAction::None => DockInputResult::Declined,
         }
     }
 
@@ -360,16 +363,44 @@ impl FileSystemExplorer {
     }
 }
 
-/// Check logical keycode first, fall back to physical for non-Latin layouts.
-fn resolve_key(key_event: &Gd<InputEventKey>) -> Option<Key> {
-    let logical = key_event.get_keycode();
-    let physical = key_event.get_physical_keycode();
+/// nvim-tree-style file operation bound to a plain keystroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FsAction {
+    Create,
+    Delete,
+    Rename,
+    YankPath,
+    Refresh,
+    None,
+}
+
+/// Check logical keycode first, fall back to physical.
+///
+/// The fallback is meant for non-Latin layouts, but it is applied
+/// unconditionally — see [`resolve_fs_action`] for the misfire that causes.
+fn resolve_key(logical: Key, physical: Key) -> Option<Key> {
     if is_fs_key(logical) {
         Some(logical)
     } else if is_fs_key(physical) {
         Some(physical)
     } else {
         None
+    }
+}
+
+/// Resolve a plain keystroke to a FileSystem-dock action.
+///
+/// Note the physical fallback is unconditional: it fires even when the
+/// logical key is a perfectly good Latin character that simply is not bound.
+/// On QWERTZ that misfires — see the `#[ignore]`d red test below.
+fn resolve_fs_action(logical: Key, physical: Key, shift: bool) -> FsAction {
+    match (resolve_key(logical, physical), shift) {
+        (Some(Key::A), false) => FsAction::Create,
+        (Some(Key::D), false) => FsAction::Delete,
+        (Some(Key::R), false) => FsAction::Rename,
+        (Some(Key::Y), false) => FsAction::YankPath,
+        (Some(Key::R), true) => FsAction::Refresh,
+        _ => FsAction::None,
     }
 }
 
@@ -496,5 +527,78 @@ fn get_selected_path(control: &Gd<Control>, kind: DockKind) -> Option<String> {
             Some(path.to_string())
         }
         DockKind::RichTextLabel => None,
+    }
+}
+
+// ─── Characterization tests (P0) ─────────────────────────────────────────
+//
+// Pins CURRENT behaviour of the FileSystem dock's nvim-tree-style keyset.
+// Must survive the dispatcher cutover UNMODIFIED.
+#[cfg(test)]
+mod characterization {
+    use super::*;
+
+    #[test]
+    fn only_adry_are_filesystem_keys() {
+        for key in [Key::A, Key::D, Key::R, Key::Y] {
+            assert!(is_fs_key(key), "{key:?} should be an FS key");
+        }
+        for key in [Key::J, Key::K, Key::H, Key::L, Key::N, Key::Z, Key::SLASH] {
+            assert!(!is_fs_key(key), "{key:?} should not be an FS key");
+        }
+    }
+
+    #[test]
+    fn the_shipped_keyset_on_a_latin_layout() {
+        let k = |key: Key, shift: bool| resolve_fs_action(key, key, shift);
+        assert_eq!(k(Key::A, false), FsAction::Create);
+        assert_eq!(k(Key::D, false), FsAction::Delete);
+        assert_eq!(k(Key::R, false), FsAction::Rename);
+        assert_eq!(k(Key::Y, false), FsAction::YankPath);
+        assert_eq!(k(Key::R, true), FsAction::Refresh);
+    }
+
+    #[test]
+    fn shift_is_a_discriminant_only_for_r() {
+        // Shift+R is refresh; every other Shift+<fs key> is unbound rather
+        // than falling through to its unshifted meaning.
+        assert_eq!(resolve_fs_action(Key::R, Key::R, true), FsAction::Refresh);
+        assert_eq!(resolve_fs_action(Key::A, Key::A, true), FsAction::None);
+        assert_eq!(resolve_fs_action(Key::D, Key::D, true), FsAction::None);
+        assert_eq!(resolve_fs_action(Key::Y, Key::Y, true), FsAction::None);
+    }
+
+    #[test]
+    fn unbound_keys_decline() {
+        assert_eq!(resolve_fs_action(Key::N, Key::N, false), FsAction::None);
+        assert_eq!(resolve_fs_action(Key::J, Key::J, false), FsAction::None);
+    }
+
+    #[test]
+    fn physical_fallback_recovers_the_keyset_on_a_cyrillic_layout() {
+        // Models a non-Latin layout: logical keycode unbound, physical
+        // position is A. This is the fallback doing its intended job.
+        assert_eq!(resolve_fs_action(Key::F, Key::A, false), FsAction::Create);
+    }
+
+    #[test]
+    fn logical_wins_when_both_are_filesystem_keys() {
+        // Logical D, physical Y: the user typed `d`, so delete — not yank.
+        assert_eq!(resolve_fs_action(Key::D, Key::Y, false), FsAction::Delete);
+    }
+
+    // ── Known bug, pinned at its WRONG value ─────────────────────────
+
+    #[test]
+    fn known_bug_qwertz_z_yanks_the_path() {
+        // On QWERTZ the Y and Z keys are swapped, so the QWERTY-Y position
+        // emits a logical `z`. `z` is bound to nothing, but the fallback is
+        // unconditional: it sees physical Y and silently yanks the selected
+        // path. The fallback should apply only when the logical key is
+        // unusable (non-Latin), not merely unbound.
+        //
+        // WRONG. P1 (one global probe order, physical probe opt-in per rule)
+        // must flip this to `FsAction::None`.
+        assert_eq!(resolve_fs_action(Key::Z, Key::Y, false), FsAction::YankPath);
     }
 }
