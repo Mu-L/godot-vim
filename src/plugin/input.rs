@@ -173,10 +173,10 @@ impl GodotVimCore {
                         log::trace!("input: filesystem explorer consumed key={:?}", keycode);
                         fs_result
                     } else {
-                        navigation::handle_dock_input(control, &probes, kind)
+                        navigation::handle_dock_input(control, &probes, kind, &self.actions)
                     }
                 } else {
-                    navigation::handle_dock_input(control, &probes, kind)
+                    navigation::handle_dock_input(control, &probes, kind, &self.actions)
                 };
                 if result.is_consumed() {
                     log::trace!("input: dock navigation consumed key={:?}", keycode);

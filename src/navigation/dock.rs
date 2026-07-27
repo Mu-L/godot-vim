@@ -12,58 +12,21 @@ use godot::classes::{CodeEdit, Control, EditorInterface, Node};
 use godot::prelude::*;
 use vim_core::keymap::{Key as VimKey, KeyEvent, Modifiers};
 
-use crate::actions::keys::Probes;
+use crate::actions::action::{ActionCtx, ActionRegistry, Params};
+use crate::actions::caps::Caps;
+use crate::actions::keys::{Probes, CMD_MODS};
+use crate::actions::specs;
 
-/// Modifiers that mark a chord as belonging to the editor or the IDE.
-const CMD_MODS: Modifiers = Modifiers::CTRL.union(Modifiers::ALT).union(Modifiers::META);
-
-use super::dock_nav::{handle_hierarchy, handle_navigation, HierarchyAction, NavDirection};
 use super::dock_search::{find_sibling_nav_control, find_sibling_search_box};
 use super::focus::DockKind;
 use crate::scene_tree::{find_child_of_type, MAX_DISCOVERY_DEPTH};
 
-/// Tri-state outcome of a shell-side key handler.
+/// Retained so every existing call site compiles unchanged.
 ///
-/// `FocusChanged` is currently treated identically to `Handled` by every
-/// caller — `is_consumed()` is the only method anyone calls. It is kept
-/// distinct because moving focus is the case that will need extra
-/// bookkeeping once dock keys become rebindable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use]
-pub(crate) enum DockInputResult {
-    /// Event consumed — call `set_input_as_handled()`.
-    Handled,
-    /// Event consumed and focus moved to a different control.
-    FocusChanged,
-    /// Not consumed — Godot's native handling proceeds.
-    ///
-    /// This is a first-class outcome, not a failure. Godot dispatches
-    /// `_input` strictly before `gui_input` and offers no replay channel, so
-    /// consuming here destroys the event permanently; declining is the only
-    /// way a control's own behaviour survives. Two unambiguous examples:
-    /// `Esc` when no script editor can be found (`handle_escape_from_dock`),
-    /// and `Enter` on a `RichTextLabel` (`handle_enter`).
-    ///
-    /// Note this variant currently conflates two different things —
-    /// "recognized the key but declined to act" (the `DockKind` gates) and
-    /// "never matched at all" (the modifier guards and the `_ =>` arms).
-    /// Separating them belongs to the resolver, not to this enum. Until
-    /// then, do not flatten this type to `bool`: a dispatcher that consumes
-    /// every key it recognizes is a wall, not a keymap.
-    Declined,
-}
-
-impl DockInputResult {
-    /// Positive exhaustive match on purpose: a future variant becomes a
-    /// compile error here instead of silently defaulting to "consumed",
-    /// which would swallow the key.
-    pub(crate) const fn is_consumed(self) -> bool {
-        match self {
-            Self::Handled | Self::FocusChanged => true,
-            Self::Declined => false,
-        }
-    }
-}
+/// A `type` alias DOES resolve variants (RFC 2338, Rust 1.37+), which is why
+/// `DockInputResult::Declined` still works here — but it cannot *rename* one,
+/// which is why the `Ignored` → `Declined` rename had to land first.
+pub(crate) use crate::actions::outcome::Outcome as DockInputResult;
 
 /// Direction for hjkl dock navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +86,7 @@ pub(crate) fn handle_dock_input(
     focused: Gd<Control>,
     probes: &Probes,
     dock_kind: DockKind,
+    registry: &ActionRegistry,
 ) -> DockInputResult {
     log::trace!(
         "dock_input: key={:?} kind={:?}",
@@ -135,40 +99,31 @@ pub(crate) fn handle_dock_input(
     // `probes_from_parts`, not left to chance.
     let action = resolve_dock_key(probes);
     if let DockKeyAction::Hjkl(direction) = action {
-        return match direction {
-            DockHjkl::Down => {
-                if handle_navigation(&focused, NavDirection::Next, 0) {
-                    DockInputResult::Handled
-                } else {
-                    DockInputResult::Declined
-                }
-            }
-            DockHjkl::Up => {
-                if handle_navigation(&focused, NavDirection::Prev, 0) {
-                    DockInputResult::Handled
-                } else {
-                    DockInputResult::Declined
-                }
-            }
-            DockHjkl::Left => {
-                if matches!(dock_kind, DockKind::Tree)
-                    && handle_hierarchy(&focused, HierarchyAction::Collapse)
-                {
-                    DockInputResult::Handled
-                } else {
-                    DockInputResult::Declined
-                }
-            }
-            DockHjkl::Right => {
-                if matches!(dock_kind, DockKind::Tree)
-                    && handle_hierarchy(&focused, HierarchyAction::Expand)
-                {
-                    DockInputResult::Handled
-                } else {
-                    DockInputResult::Declined
-                }
-            }
+        // Dispatch through the action plane. The capability gate is what makes
+        // `h`/`l` inert on a list with no hierarchy — no `DockKind` match arm
+        // here, and no widget class named anywhere in this function.
+        // Named by static, not by string literal: a typo would otherwise
+        // compile clean, miss the registry, and silently kill hjkl in every
+        // dock with a green test suite.
+        let spec = match direction {
+            DockHjkl::Down => &specs::ITEM_NEXT,
+            DockHjkl::Up => &specs::ITEM_PREV,
+            DockHjkl::Left => &specs::ITEM_COLLAPSE,
+            DockHjkl::Right => &specs::ITEM_EXPAND,
         };
+        let Some(id) = registry.id_of(spec.id) else {
+            log::error!("dock_input: {} is not registered", spec.id);
+            return DockInputResult::Declined;
+        };
+        // Capability gate lives HERE, on the binding path — never inside
+        // `registry.run`. An action invoked by name from the command line has
+        // no sampled widget and must not be filtered by one.
+        let caps = caps_of(&focused);
+        if !registry.caps_allow(id, caps) {
+            return DockInputResult::Declined;
+        }
+        let mut cx = ActionCtx::new(Some(focused), Params::new());
+        return registry.run(id, &mut cx);
     }
 
     match action {
@@ -180,6 +135,38 @@ pub(crate) fn handle_dock_input(
     }
 }
 
+/// Classify a control into the dock kind whose signal contract it follows.
+///
+/// Survives the eventual deletion of `FocusContext` because the distinction
+/// is real at the Godot API level, not merely a dispatch convenience:
+/// `Tree::item_activated` takes **no** parameters while
+/// `ItemList::item_activated` takes an index (godot `scene/gui/tree.cpp:7534`
+/// vs `scene/gui/item_list.cpp:2486`). Emitting the wrong arity is not a
+/// no-op — it is `CALL_ERROR_TOO_MANY_ARGUMENTS`, and the handler does not run.
+pub(crate) fn dock_kind_of(control: &Gd<Control>) -> Option<DockKind> {
+    let node = control.clone().upcast::<Node>();
+    if node.is_class("Tree") {
+        Some(DockKind::Tree)
+    } else if node.is_class("ItemList") {
+        Some(DockKind::ItemList)
+    } else if node.is_class("RichTextLabel") {
+        Some(DockKind::RichTextLabel)
+    } else {
+        None
+    }
+}
+
+/// Capabilities the focused control contributes.
+///
+/// Uses `is_class` so the inheritance chain is walked — `FileSystemTree` is a
+/// `Tree`, `FileSystemList` is an `ItemList`.
+fn caps_of(control: &Gd<Control>) -> Caps {
+    let node = control.clone().upcast::<Node>();
+    Caps::of_control(|class| node.is_class(class))
+}
+
+/// Resolve a keystroke inside a dock search box.
+///
 /// What a keystroke resolves to while a dock's filter `LineEdit` has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchKeyAction {
@@ -188,8 +175,6 @@ enum SearchKeyAction {
     None,
 }
 
-/// Resolve a keystroke inside a dock search box.
-///
 /// One deliberate asymmetry against [`resolve_dock_key`], pinned by tests
 /// because a unified dispatcher will be tempted to erase it: **Shift is
 /// tolerated.** Only Ctrl/Alt/Meta suppress handling, so `Shift+Enter` and
@@ -257,7 +242,7 @@ fn handle_slash(focused: &Gd<Control>) -> DockInputResult {
 /// For ItemList, both `item_selected` and `item_activated` are emitted because
 /// some Godot editor docks listen to one, some to the other (e.g., the script
 /// list dock uses `item_activated` to open scripts).
-fn handle_enter(focused: &Gd<Control>, dock_kind: DockKind) -> DockInputResult {
+pub(crate) fn handle_enter(focused: &Gd<Control>, dock_kind: DockKind) -> DockInputResult {
     match dock_kind {
         DockKind::Tree => {
             let mut control = focused.clone();

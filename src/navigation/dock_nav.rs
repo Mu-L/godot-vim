@@ -10,13 +10,13 @@ use godot::prelude::*;
 use crate::bridge::codec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NavDirection {
+pub(crate) enum NavDirection {
     Next,
     Prev,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum HierarchyAction {
+pub(crate) enum HierarchyAction {
     Expand,
     Collapse,
 }
@@ -93,7 +93,7 @@ impl TreeExt for Gd<Tree> {
 /// prevents stack overflow on unexpectedly deep nesting.
 const MAX_NAV_DEPTH: u32 = 3;
 
-pub(super) fn handle_navigation(
+pub(crate) fn handle_navigation(
     control: &Gd<Control>,
     direction: NavDirection,
     depth: u32,
@@ -124,7 +124,7 @@ pub(super) fn handle_navigation(
     }
 }
 
-pub(super) fn handle_hierarchy(control: &Gd<Control>, action: HierarchyAction) -> bool {
+pub(crate) fn handle_hierarchy(control: &Gd<Control>, action: HierarchyAction) -> bool {
     if control.is_class("Tree") {
         let Ok(tree) = control.clone().try_cast::<Tree>() else {
             return false;

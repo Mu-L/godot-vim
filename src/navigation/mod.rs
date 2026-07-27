@@ -11,8 +11,8 @@
 //! focus-management boundary simple and predictable.
 
 mod cycle;
-mod dock;
-mod dock_nav;
+pub(crate) mod dock;
+pub(crate) mod dock_nav;
 mod dock_search;
 pub(crate) mod filesystem_explorer;
 mod focus;

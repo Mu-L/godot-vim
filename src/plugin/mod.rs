@@ -82,6 +82,12 @@ pub struct GodotVimCore {
     /// `None` means the option is empty, which is the overwhelmingly common
     /// case — the probe pipeline then skips the remap entirely.
     langmap: Option<vim_core::keymap::LangmapTable>,
+    /// Every shell-side verb the plugin knows, by id.
+    ///
+    /// Built once from `actions::specs::SHIPPED`. Later phases register
+    /// provider tables into the same registry; nothing about the dispatcher
+    /// changes when they do.
+    actions: crate::actions::action::ActionRegistry,
     /// Desired master-enable state (mirrors plugins/GodotVim/enabled).
     enabled: bool,
     /// Disabled->enabled EDGE detector (NOT a correctness gate): apply_enabled_state
@@ -109,6 +115,13 @@ impl INode for GodotVimCore {
             processing_key: false,
             fs_explorer: crate::navigation::FileSystemExplorer::new(),
             langmap: None,
+            actions: {
+                let mut r = crate::actions::action::ActionRegistry::new();
+                for spec in crate::actions::specs::SHIPPED {
+                    r.register(spec);
+                }
+                r
+            },
             enabled: true,
             wired: false,
         }
