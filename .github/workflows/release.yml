@@ -213,6 +213,11 @@ jobs:
           cp -r addons "$STAGE/"
           cp LICENSE "$STAGE/"
           cp README.md "$STAGE/"
+          # README links into docs/ with relative paths, and .godot-vimrc.sample
+          # is the onboarding artifact those links point users at. Shipping the
+          # README without them leaves every "Full reference →" link dead.
+          cp -r docs "$STAGE/"
+          cp .godot-vimrc.sample "$STAGE/"
           zip -r "godot-vim-${VERSION}.zip" "$STAGE"
 
       - name: Create GitHub Release

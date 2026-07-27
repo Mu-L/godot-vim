@@ -6,7 +6,7 @@
 //! structural rather than conditional — dispatch returns `Ignore` before any
 //! lookup, no ancestor is consulted, and `panel`'s Ctrl+hjkl rules are
 //! unreachable. That is the transcription of `FocusContext::Foreign => false`
-//! at `src/plugin/input.rs:114`, and it is the reason typing Ctrl+H in a
+//! at `src/plugin/input.rs`, and it is the reason typing Ctrl+H in a
 //! Project Settings field still backspaces.
 //!
 //! # Position in `PROVIDERS` is load-bearing in both directions
@@ -46,12 +46,12 @@ pub(crate) static FOREIGN: SurfaceSpec = SurfaceSpec {
     grants: |_| Caps::empty(),
     probe: |chain| {
         let node = chain.focus()?;
-        // A CodeEdit that is not ours, or a plain TextEdit (focus.rs:50-58
+        // A CodeEdit that is not ours, or a plain TextEdit (focus.rs
         // and :90-92).
         if node.is("TextEdit") && !chain.attached_editor_focused() {
             return Some(Anchor::Node(0));
         }
-        // A LineEdit that is nobody's filter box (focus.rs:73-82).
+        // A LineEdit that is nobody's filter box (focus.rs).
         if node.is("LineEdit") && chain.sibling_nav_control.is_none() {
             return Some(Anchor::Node(0));
         }

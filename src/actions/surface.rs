@@ -176,14 +176,14 @@ pub(crate) struct FocusChain {
     pub(crate) attached_editor: Option<InstanceId>,
     /// The vim controller's mode. `None` means "no controller", which maps to
     /// `editor.nav` rather than to the barrier — transcribing the `is_none_or`
-    /// polarity at `src/plugin/input.rs:116`.
+    /// polarity at `src/plugin/input.rs`.
     pub(crate) editor_mode: Option<vim_core::primitives::Mode>,
     /// `FileSystemDock::is_ancestor_of(focus_owner)`, evaluated once and
-    /// unbounded (`src/navigation/filesystem_explorer.rs:394-400`). Grants
+    /// unbounded (`src/navigation/filesystem_explorer.rs`). Grants
     /// [`Caps::FILEOPS`] through the `dock.filesystem` surface.
     pub(crate) in_filesystem_dock: bool,
     /// Discriminant for the `searchbox` probe ONLY, reproducing
-    /// `src/navigation/focus.rs:73-82`. There is deliberately no
+    /// `src/navigation/focus.rs`. There is deliberately no
     /// `sibling_search_box` field: the depth-20 DFS that finds one stays
     /// inside `handle_slash`, run once per `/` press exactly as today, rather
     /// than once per focus change.
@@ -291,7 +291,7 @@ impl FocusChain {
 ///
 /// Not `Option<usize>`, because "no focus owner at all" has no chain index and
 /// is a state the dispatcher must still act in: `classify_focus` returns
-/// `Unknown` for it (`src/navigation/focus.rs:46-48`), `input.rs` maps that to
+/// `Unknown` for it (`src/navigation/focus.rs`), `input.rs` maps that to
 /// intercept, and then calls `set_input_as_handled()` with no target found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Anchor {
@@ -353,7 +353,7 @@ pub(crate) struct SurfaceSpec {
     /// `<physical>`.
     ///
     /// This is the surface-plane transcription of `resolve_panel_key_typed`
-    /// (`src/plugin/input.rs:151-155`), and it is a guard, not a preference.
+    /// (`src/plugin/input.rs`), and it is a guard, not a preference.
     /// On Dvorak the QWERTY-H position emits `d`, so honouring the positional
     /// probe inside the attached editor turns `Ctrl+d` — half-page-down —
     /// into panel-left; Colemak does the same to `Ctrl+n` and `Ctrl+e`. It
@@ -493,6 +493,13 @@ impl Forest {
 
     /// Structural validation, as human-readable errors.
     ///
+    /// Run by [`crate::actions::providers::forest`] on every construction of
+    /// the shipped forest — a `debug_assert!` plus a `log::error!` — so the
+    /// claims elsewhere in this file that a malformed forest is "rejected at
+    /// registration" describe something that happens rather than something
+    /// that could. A third-party `Forest::new` is NOT audited automatically;
+    /// its provider is expected to route through the same constructor.
+    ///
     /// Covers V1 (a surface id is declared once), V3 (every parent is declared
     /// and the graph is acyclic) and the ordering half of V4 (probe order is a
     /// linear extension of descendant-before-ancestor). The totality half of
@@ -630,7 +637,7 @@ mod tests {
     #[test]
     fn a_code_edit_answers_text_edit() {
         // `foreign` claims "a TextEdit that is not ours", which must catch a
-        // foreign CodeEdit — the arm at focus.rs:50-58.
+        // foreign CodeEdit — the arm at focus.rs.
         let ce = code_edit(1);
         assert!(ce.is("CodeEdit"));
         assert!(ce.is("TextEdit"));
@@ -692,7 +699,7 @@ mod tests {
     #[test]
     fn attachment_is_instance_identity_not_class_identity() {
         // Two CodeEdits with the same class; only the one we attached to is
-        // ours. This is the whole `Editor` vs `Foreign` split at focus.rs:50.
+        // ours. This is the whole `Editor` vs `Foreign` split at focus.rs.
         let ours = FocusChain {
             nodes: vec![code_edit(7)],
             attached_editor: Some(id(7)),

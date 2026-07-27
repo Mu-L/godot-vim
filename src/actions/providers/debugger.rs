@@ -57,7 +57,7 @@
 //! `editor/debugger/debugger_editor_plugin.cpp:49`). That verb is **not** here,
 //! and the omission is the honest one. `RuleTarget::Shortcut` parses, registers
 //! and lists today, but `GodotVimCore::run_candidate` declines it
-//! (`src/plugin/input.rs:467-481`): delegating means re-injecting an event into
+//! (`src/plugin/input.rs`): delegating means re-injecting an event into
 //! the same `_input` flush that dispatched it, and the injection-cycle audit
 //! and per-frame budget that make that safe are a phase of their own. Shipping
 //! `panelmap dock.debugger s <Shortcut>(debugger/step_over)` as a default would
@@ -91,7 +91,7 @@ const DEBUGGER_DOCK_CLASS: &str = "EditorDebuggerNode";
 /// Upper bound on a walk to the end of a debugger tree.
 ///
 /// `handle_navigation` is itself bounded at 1000 items per call
-/// (`dock_nav.rs:37`), so an unbounded outer loop would be a frozen editor
+/// (`dock_nav.rs`), so an unbounded outer loop would be a frozen editor
 /// rather than a slow keystroke. A call stack deeper than this is pathological
 /// and stopping short of the true end is a far better failure than a hang.
 const MAX_WALK: u32 = 200;
@@ -114,14 +114,70 @@ pub(crate) static DOCK_DEBUGGER: SurfaceSpec = SurfaceSpec {
     yields_to_engine: false,
 };
 
-/// The focused control as a `Tree`, or `None`.
+/// The debugger tree, as questions and commands.
 ///
-/// Every body below opens with this rather than assuming the probe already
-/// proved it: `:action godotvim.debugger.yank_frame` and
-/// `<Action>(godotvim.debugger.frame_next)` reach the same verb with no
-/// surface, no keystroke and possibly no focus owner at all.
-fn tree_target(cx: &mut crate::actions::action::ActionCtx<'_>) -> Option<Gd<Tree>> {
-    cx.target().cloned()?.try_cast::<Tree>().ok()
+/// The same seam as [`crate::actions::action::CompletionOps`] and
+/// [`crate::actions::action::PanelOps`], and here for the same reason: the
+/// bodies below used to open with `cx.target().cloned()?`, so under `cargo
+/// test` — where no `Gd<Control>` exists — every one of them returned
+/// `Declined` before reading its own direction. `FRAME_LAST`'s `Next`, the
+/// [`MAX_WALK`] bound and `YANK_FRAME`'s **column 0** were all invisible to the
+/// suite. Behind this trait they are a direction, a loop count and an integer,
+/// asserted against a plain-data fake.
+///
+/// Narrow on purpose: four methods, no `Gd<T>` in the signature, and nothing
+/// that can reach the editor, the document or the engine.
+pub(crate) trait DebuggerTreeOps {
+    /// One step, with `handle_navigation`'s `false`-means-nothing-to-move-to
+    /// contract preserved.
+    fn navigate(&mut self, direction: NavDirection) -> bool;
+    /// Whether a row is selected at all — Godot's `Tree::get_selected()`
+    /// returning `Some`.
+    fn has_selection(&self) -> bool;
+    /// The selected row's text in `column`, or empty when there is no
+    /// selection. The column is a parameter and not a constant inside the
+    /// implementation precisely so the caller's `0` is a decision a test can
+    /// see.
+    fn selected_text(&self, column: i32) -> String;
+    fn clipboard_set(&mut self, text: &str);
+}
+
+/// The one shipped implementation.
+///
+/// The `Tree` cast lives here rather than in the caller so a focused `Button`
+/// inside the debugger dock answers "no selection" instead of being
+/// unrepresentable — which is the same declination the old `tree_target`
+/// produced, reached one layer down.
+impl DebuggerTreeOps for Gd<godot::classes::Control> {
+    fn navigate(&mut self, direction: NavDirection) -> bool {
+        handle_navigation(self, direction, 0)
+    }
+
+    fn has_selection(&self) -> bool {
+        self.as_tree().and_then(|t| t.get_selected()).is_some()
+    }
+
+    fn selected_text(&self, column: i32) -> String {
+        self.as_tree()
+            .and_then(|t| t.get_selected())
+            .map(|item| item.get_text(column).to_string())
+            .unwrap_or_default()
+    }
+
+    fn clipboard_set(&mut self, text: &str) {
+        DisplayServer::singleton().clipboard_set(&GString::from(text));
+    }
+}
+
+/// The focused control as a `Tree`, or `None`.
+trait AsTree {
+    fn as_tree(&self) -> Option<Gd<Tree>>;
+}
+
+impl AsTree for Gd<godot::classes::Control> {
+    fn as_tree(&self) -> Option<Gd<Tree>> {
+        self.clone().try_cast::<Tree>().ok()
+    }
 }
 
 /// Walk the focused tree, translating "nothing to move to" into a declination.
@@ -134,12 +190,12 @@ fn walk(
     direction: NavDirection,
     steps: u32,
 ) -> Outcome {
-    let Some(target) = cx.target().cloned() else {
+    let Some(tree) = cx.debugger_tree() else {
         return Outcome::Declined;
     };
     let mut moved = false;
     for _ in 0..steps {
-        if handle_navigation(&target, direction, 0) {
+        if tree.navigate(direction) {
             moved = true;
         } else {
             break;
@@ -196,17 +252,20 @@ pub(crate) static YANK_FRAME: ActionSpec = ActionSpec {
     requires: Caps::VNAV,
     host_invocable: false,
     run: |cx| {
-        let Some(tree) = tree_target(cx) else {
+        let Some(tree) = cx.debugger_tree() else {
             return Outcome::Declined;
         };
-        let Some(item) = tree.get_selected() else {
+        if !tree.has_selection() {
             return Outcome::Declined;
-        };
-        let text = item.get_text(0).to_string();
+        }
+        // Column 0. The debugger's stack-frame Tree is single-column
+        // (`script_editor_debugger.cpp:2230`), and yanking column 1 would copy
+        // an empty string over the user's clipboard.
+        let text = tree.selected_text(0);
         if text.is_empty() {
             return Outcome::Declined;
         }
-        DisplayServer::singleton().clipboard_set(&GString::from(&text));
+        tree.clipboard_set(&text);
         log::info!("debugger: yanked '{text}'");
         Outcome::Handled
     },
@@ -250,8 +309,194 @@ pub(crate) const PROVIDER: Provider = Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::action::{ActionCtx, Params};
     use crate::actions::surface::fixtures::*;
     use crate::actions::surface::{ChainNode, FocusChain};
+
+    // ── The executor bodies, behind the port ─────────────────────────
+
+    /// A debugger tree with no Godot in it.
+    ///
+    /// The same harness shape as `providers::completion`'s `FakePopup`: plain
+    /// data, an ordered command log, and no `Gd<T>` anywhere. Without it the
+    /// four verbs below were `Declined` before their first decision, so
+    /// `FRAME_LAST`'s direction, [`MAX_WALK`] and the yank column were pinned
+    /// by nothing.
+    #[derive(Debug, Default)]
+    struct FakeTree {
+        /// Rows left before the walk reaches the end of the stack.
+        steps_available: u32,
+        selected: bool,
+        /// The selected row, column by column. `y` must copy column 0.
+        columns: Vec<String>,
+        log: Vec<String>,
+        clipboard: Option<String>,
+    }
+
+    impl FakeTree {
+        fn with_steps(steps_available: u32) -> Self {
+            Self {
+                steps_available,
+                ..Self::default()
+            }
+        }
+
+        fn selecting(columns: &[&str]) -> Self {
+            Self {
+                selected: true,
+                columns: columns.iter().map(|s| (*s).to_string()).collect(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl DebuggerTreeOps for FakeTree {
+        fn navigate(&mut self, direction: NavDirection) -> bool {
+            self.log.push(format!("navigate({direction:?})"));
+            if self.steps_available == 0 {
+                return false;
+            }
+            self.steps_available -= 1;
+            true
+        }
+
+        fn has_selection(&self) -> bool {
+            self.selected
+        }
+
+        fn selected_text(&self, column: i32) -> String {
+            usize::try_from(column)
+                .ok()
+                .and_then(|c| self.columns.get(c))
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn clipboard_set(&mut self, text: &str) {
+            self.log.push(format!("clipboard_set({text})"));
+            self.clipboard = Some(text.to_string());
+        }
+    }
+
+    fn run_on(spec: &ActionSpec, tree: &mut FakeTree, params: Params) -> Outcome {
+        let mut cx = ActionCtx::new(None, params).with_debugger_tree(tree);
+        (spec.run)(&mut cx)
+    }
+
+    fn with_count(count: i64) -> Params {
+        let mut params = Params::new();
+        params.set_int("count", count);
+        params
+    }
+
+    #[test]
+    fn frame_next_and_frame_prev_walk_in_opposite_directions() {
+        for (spec, want) in [
+            (&FRAME_NEXT, "navigate(Next)"),
+            (&FRAME_PREV, "navigate(Prev)"),
+        ] {
+            let mut tree = FakeTree::with_steps(1);
+            assert_eq!(run_on(spec, &mut tree, Params::new()), Outcome::Handled);
+            assert_eq!(tree.log, vec![want], "{}", spec.id);
+        }
+    }
+
+    #[test]
+    fn frame_last_walks_forward_all_the_way_to_the_max_walk_bound() {
+        // Both halves are the verb: `G` means "the DEEPEST frame", so the
+        // direction is `Next` and the loop count is the bound. Flipping the
+        // direction turns `G` into `gg`; lowering the bound turns it into `J`.
+        //
+        // The expected step count is the LITERAL 200 and not `MAX_WALK`.
+        // Writing `MAX_WALK` here would make the assertion a tautology that
+        // moves with the constant — which is exactly how `MAX_WALK: 200 -> 1`
+        // survived a green suite once already.
+        assert_eq!(MAX_WALK, 200, "the depth `G` is willing to walk");
+        let mut tree = FakeTree::with_steps(250);
+        assert_eq!(
+            run_on(&FRAME_LAST, &mut tree, Params::new()),
+            Outcome::Handled
+        );
+        assert_eq!(
+            tree.log.len(),
+            200,
+            "`G` must walk the whole bound, not one step"
+        );
+        assert!(
+            tree.log.iter().all(|l| l == "navigate(Next)"),
+            "{:?}",
+            tree.log.first()
+        );
+    }
+
+    #[test]
+    fn a_frame_walk_stops_at_the_end_of_the_stack_and_declines_when_it_moved_nothing() {
+        // The `break`, and the polarity. A call stack of one frame asked to
+        // move four times must be asked twice — one move and the refusal.
+        let mut tree = FakeTree::with_steps(1);
+        assert_eq!(
+            run_on(&FRAME_NEXT, &mut tree, with_count(4)),
+            Outcome::Handled
+        );
+        assert_eq!(tree.log.len(), 2, "{:?}", tree.log);
+
+        // Nowhere to go at all: the key falls through to the `Tree`'s own
+        // handling rather than dying here.
+        let mut tree = FakeTree::with_steps(0);
+        assert_eq!(
+            run_on(&FRAME_NEXT, &mut tree, Params::new()),
+            Outcome::Declined
+        );
+        assert_eq!(tree.log.len(), 1);
+    }
+
+    #[test]
+    fn a_count_repeats_a_frame_walk() {
+        let mut tree = FakeTree::with_steps(9);
+        assert_eq!(
+            run_on(&FRAME_PREV, &mut tree, with_count(3)),
+            Outcome::Handled
+        );
+        assert_eq!(tree.log.len(), 3);
+    }
+
+    #[test]
+    fn yank_copies_column_zero_and_nothing_else() {
+        // The stack-frame Tree is single-column, so column 1 is the empty
+        // string — and yanking it would silently wipe the user's clipboard
+        // while reporting success.
+        let mut tree = FakeTree::selecting(&["res://player.gd:42 @ _process", "(unused)"]);
+        assert_eq!(
+            run_on(&YANK_FRAME, &mut tree, Params::new()),
+            Outcome::Handled
+        );
+        assert_eq!(
+            tree.clipboard.as_deref(),
+            Some("res://player.gd:42 @ _process")
+        );
+    }
+
+    #[test]
+    fn yank_declines_without_a_selection_and_without_text() {
+        let mut tree = FakeTree::default();
+        assert_eq!(
+            run_on(&YANK_FRAME, &mut tree, Params::new()),
+            Outcome::Declined,
+            "nothing selected"
+        );
+        assert!(tree.clipboard.is_none());
+
+        let mut tree = FakeTree::selecting(&[""]);
+        assert_eq!(
+            run_on(&YANK_FRAME, &mut tree, Params::new()),
+            Outcome::Declined,
+            "an empty row"
+        );
+        assert!(
+            tree.clipboard.is_none(),
+            "an empty row must not overwrite the clipboard"
+        );
+    }
 
     /// The real shape: focus owner, the tab's containers, the tab itself, the
     /// `TabContainer`, then the dock.

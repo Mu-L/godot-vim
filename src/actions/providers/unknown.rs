@@ -4,7 +4,7 @@
 //! `Button`, a container, a third-party control — and the case with no focus
 //! owner at all. Its parent is `panel`, so Ctrl+hjkl still works from all of
 //! them, which is exactly what `FocusContext::Unknown => true` buys today
-//! (`src/plugin/input.rs:144-146`). There is deliberately no `graph` surface:
+//! (`src/plugin/input.rs`). There is deliberately no `graph` surface:
 //! a `GraphEdit` lands here and inherits panel navigation, which is the
 //! behaviour that already ships.
 //!
@@ -19,7 +19,7 @@
 //!
 //! `viewport.gui_get_focus_owner()` returning `None` is a real, mandatory
 //! state — click the editor's empty background and it happens. Today
-//! `classify_focus` answers `Unknown` (`focus.rs:46-48`), `input.rs` intercepts
+//! `classify_focus` answers `Unknown` (`focus.rs`), `input.rs` intercepts
 //! Ctrl+hjkl, finds no focus owner, skips `handle_window_nav` entirely and
 //! calls `set_input_as_handled()` anyway. With an empty `nodes` vector there is
 //! no chain index to anchor at, so `Option<usize>` could not express it and the

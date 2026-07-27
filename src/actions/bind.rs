@@ -57,7 +57,7 @@ pub(crate) enum Consumption {
     Elastic,
     /// Consume regardless of outcome, and terminate the walk.
     ///
-    /// The declarative form of `src/plugin/input.rs:126-134`, where
+    /// The declarative form of `src/plugin/input.rs`, where
     /// `handle_window_nav`'s result is discarded and `set_input_as_handled()`
     /// fires even with no focus owner and no target found.
     Void,
@@ -875,7 +875,7 @@ mod tests {
     /// consumption, repeat, `<shift>`.
     #[allow(clippy::type_complexity, reason = "a golden table is a table")]
     const SHIPPED_DEFAULTS: &[(SurfaceId, &str, &str, bool, Consumption, Repeat, bool)] = &[
-        // Cross-panel focus. `<void>` reproduces input.rs:126-134, where
+        // Cross-panel focus. `<void>` reproduces input.rs, where
         // handle_window_nav's result is discarded and set_input_as_handled()
         // fires even when nothing was found. `<norepeat>` keeps a held Ctrl+J
         // from queueing ~20 deferred grab_focus calls a second.
@@ -994,7 +994,7 @@ mod tests {
             false,
         ),
         // Dock item navigation. Elastic: `j` at the end of a list declines and
-        // the key falls through, exactly as dock.rs:148-154 does today.
+        // the key falls through, exactly as dock.rs does today.
         (
             "dock",
             "h",

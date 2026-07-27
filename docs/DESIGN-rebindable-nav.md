@@ -6,6 +6,47 @@
 >
 > **Target:** godot-vim v1.6.1+ against vim-core **v0.7.1** (pinned, not forked) and
 > Godot 4.5+/4.8-dev.
+>
+> **This has since shipped, and not exactly as written. Read [As built](#as-built)
+> before trusting anything below it.**
+
+---
+
+## As built
+
+**This document is the design proposal, preserved as written. It was not updated as the
+work landed, and it is not the reference for what shipped.**
+
+- **Users** want [`docs/REFERENCE.md` § Panel Key Bindings](REFERENCE.md#panel-key-bindings-panelmap).
+  It documents the grammar, the surfaces, the flags and the action ids as they actually are.
+- **Readers of the code** want `src/actions/mod.rs`, whose module doc is an accurate map of
+  the tree. The module map in §3.2 below is **struck** — it names files that were never
+  built and omits two that carry a third of the model.
+
+What shipped differently from what §3–§7 describe:
+
+| The design says | What shipped |
+|-----------------|--------------|
+| `ActionPlane` (`plane.rs`) owns registry + index + forest + diagnostics + generation | Inlined onto `GodotVimCore`; there is no `plane.rs` and no `ActionPlane` type |
+| The dispatcher lives in `src/actions/dispatch.rs` | It lives in `src/plugin/input.rs`; `dispatch.rs` was never created |
+| `Registrar` — providers register imperatively against a `&mut Registrar<'_>` | Replaced by the data-driven `Provider` struct and the `PROVIDERS` const array in `src/actions/providers/mod.rs`. A provider is data — surfaces, `ActionSpec`s, and default bindings as `panelmap` text — not a function |
+| `KeyProbes` | Shipped as `Probes` (`src/actions/keys.rs`) |
+| `Disposition` lives in `outcome.rs` | It lives in `resolve.rs`, beside the fold that produces it |
+| `inject.rs` / `ShortcutInjector` delegate to Godot's own shortcuts | Never built. `<Shortcut>(path)` targets are **rejected at registration**, not dispatched |
+| §7.5 runtime registration (third-party providers at run time) | Never built. `PROVIDERS` is a compile-time const array |
+| `:checkhealth godotvim` | Never built. `:panelmap` with no argument absorbed its job: it lists live bindings, reservations, and every config line that was rejected |
+
+Two modules the map omits entirely, both load-bearing:
+
+- `src/actions/specs.rs` — the shipped keyset as named verbs, in one const array. §3.2 sends
+  you to `plane.rs` for this.
+- `src/actions/sequence.rs` — pending multi-key prefixes: the only state the shell plane
+  holds between keystrokes.
+
+Everything below this line is the proposal as written in `f6eb728`. Where it disagrees with
+the tree, the tree is right.
+
+---
 
 ## Contents
 
@@ -266,36 +307,11 @@ Decision (4) is the load-bearing one. `dock.rs:155-161` returns `Declined` when 
 
 ### 3.2 Module map
 
-```
-src/actions/
-├── mod.rs           re-exports; `pub(crate) fn resolve`
-├── plane.rs         ActionPlane: registry + index + forest + diagnostics + generation
-├── outcome.rs       Outcome, Disposition
-├── caps.rs          Caps bitflags, widget_caps()
-├── surface.rs       ChainNode, FocusChain, Anchor, Seal, SurfaceSpec, SurfacePath
-├── action.rs        ActionId, Params, ActionCtx, ActionSpec, ActionRegistry
-├── keys.rs          KeyProbes, canonicalize, validate_lhs_key, parse_lhs,
-│                    starts_vim_grammar_sequence
-├── bind.rs          Rule, RuleTarget, SlotId, BindingIndex, Registrar, Provenance,
-│                    RuleReject
-├── resolve.rs       ResolveInput, Resolution, resolve()  — zero Gd<T>
-├── dispatch.rs      the execution fold + Consumption; the only file that holds
-│                    `&mut GodotVimCore` and a viewport at the same time
-├── inject.rs        ShortcutInjector (re-entrancy guard for delegated shortcuts)
-├── introspect.rs    :panelmap / :panelmap <lhs> / :checkhealth godotvim
-└── providers/
-    ├── mod.rs       const PROVIDERS: &[fn(&mut Registrar<'_>)] — listed below in
-    │                array order, which IS probe order (§3.3)
-    ├── editor.rs    editor.nav, editor.insert
-    ├── prompt.rs    prompt + godotvim.prompt.dismiss
-    ├── searchbox.rs searchbox + godotvim.search.{accept,cancel}
-    ├── filesystem.rs dock.filesystem + godotvim.fs.*
-    ├── dock.rs      dock + godotvim.item.* + godotvim.dock.search + focus.editor
-    ├── foreign.rs   foreign
-    ├── unknown.rs   unknown
-    └── panel.rs     panel + focus.* + cycle.*
-src/config/panelmap.rs   the `panelmap` / `panelunmap` line parser (§6)
-```
+> **Struck. See [As built](#as-built).** The map that stood here named `plane.rs`,
+> `dispatch.rs` and `inject.rs`, none of which were built, and omitted `specs.rs` and
+> `sequence.rs`, which carry the verb table and the pending-prefix state machine. The
+> accurate map is the module doc at the top of `src/actions/mod.rs`; it is maintained with
+> the code and is 38 lines.
 
 `src/actions/` replaces the *binding* logic of `src/navigation/`. It does not replace the executors. `window::handle_window_nav`, `cycle::handle_cycle_focus`, `dock_nav::{handle_navigation, handle_hierarchy}`, `dock::{handle_slash, handle_enter, handle_escape_from_dock}`, `filesystem_explorer::{begin_create, begin_delete, begin_rename, yank_path, refresh}` and every `call_deferred("grab_focus")` site survive verbatim as `ActionSpec::run` bodies. Two mechanical consequences: `dock_nav::{handle_navigation, handle_hierarchy, NavDirection, HierarchyAction}` are `pub(super)` today and must be widened to `pub(crate)` and re-exported from `src/navigation/mod.rs:21-25`; `src/navigation/focus.rs::classify_focus` and `FocusContext` are deleted in the same commit that removes their last caller at `src/plugin/input.rs:76`, while `DockKind` **and its classifier `dock_kind_of`** move into `dock.rs` — `filesystem_explorer.rs` uses `DockKind` independently, and `ActionCtx::target_or` still needs a `Gd<Control>` → `DockKind` route.
 
@@ -3266,6 +3282,12 @@ pub(crate) fn has_shortcut_api(settings: &mut Gd<EditorSettings>) -> bool {
 `try_call` is defence in depth beyond the gate: even with `has_method` true, a future signature change must never panic the input handler. At load time, `<Shortcut>(path)` rules are rejected with per-line warn-and-skip when the API is absent, and `:checkhealth godotvim` prints an explicit **"unavailable on Godot < 4.6"** line — never a silently omitted section, because a silently missing section teaches users to trust a check that did not run. This is a **prerequisite bugfix that lands in P0/P1**, before any characterization test runs on 4.5.
 
 The same version gate covers `:checkhealth`'s conflict cross-reference against `EditorSettings.get_shortcut_list()`. Note that pinned gdext v0.4.5 generates **zero** shortcut methods on `EditorSettings`, which is why all of this goes through the dynamic-call shim rather than the typed API.
+
+**As built (post-P9).** The ruling was **deferred through P0–P9 and shipped afterwards**, not in P0/P1. P6 was assigned it, neither shipped it nor listed it in its gaps section, so `d` and `r` in the FileSystem dock stayed broken on 4.5 for the whole series. It is now in the tree, with three differences from the sketch above:
+
+- `has_shortcut_api` takes `&Gd<EditorSettings>`, not `&mut` — gdext's `Object::has_method` is `&self`.
+- The gate is applied **inside** `godot_calls`, not at the five call sites. `get_shortcut` and the new `get_shortcut_list` wrapper each check it and return `None` when absent, so a caller cannot forget it and the method-name literals still appear exactly once each. `src/host/dispatch.rs`'s two raw `settings.call("get_shortcut_list", …)` sites now route through that wrapper.
+- The two channels the sketch names as the user-visible explanation do not exist: `<Shortcut>(path)` rules are refused at registration on every tier (§6.5 R3, `bind.rs` V-DISPATCH) rather than "rejected when the API is absent", and there is no `:checkhealth`. The one message is the `godot_warn!` in `has_shortcut_api`, emitted once per process on the first lookup, and it names the degradations concretely instead of pointing at a command that was never built.
 
 ### 12.4 The vim-core version story
 

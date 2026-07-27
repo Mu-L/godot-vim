@@ -2,7 +2,7 @@
 //!
 //! The discriminant is not the class and not the placeholder text: it is
 //! whether the `LineEdit` has a *sibling navigable control* inside the same
-//! dock boundary (`src/navigation/focus.rs:70-82`). A filter box always does,
+//! dock boundary (`src/navigation/focus.rs`). A filter box always does,
 //! because filtering is filtering *something*; a Project Settings field never
 //! does. `FocusChain::sibling_nav_control` records the answer at sample time,
 //! so the depth-8 climb over a depth-20 DFS runs once per focus change instead
@@ -27,7 +27,7 @@ pub(crate) static SEARCHBOX: SurfaceSpec = SurfaceSpec {
     grants: |_| Caps::empty(),
     // `LineEdit` and not merely "accepts text": a `TextEdit` with a sibling
     // Tree is a foreign multi-line editor, not a filter box, and
-    // `classify_focus` reaches this arm only for `LineEdit` (focus.rs:73).
+    // `classify_focus` reaches this arm only for `LineEdit` (focus.rs).
     probe: |chain| {
         (chain.focus_is("LineEdit") && chain.sibling_nav_control.is_some())
             .then_some(Anchor::Node(0))
@@ -41,8 +41,8 @@ pub(crate) static SEARCHBOX: SurfaceSpec = SurfaceSpec {
 ///
 /// The only two shipped rules carrying `<shift>`, and the reason the flag
 /// exists at all: `handle_search_input` rejects ctrl/alt/meta but **tolerates
-/// shift** (`dock.rs:212`), while a dock rejects every modifier including
-/// shift (`dock.rs:133-137`). A global "named key with SHIFT cleared" probe
+/// shift** (`dock.rs`), while a dock rejects every modifier including
+/// shift (`dock.rs`). A global "named key with SHIFT cleared" probe
 /// could not express that difference — it would newly fire
 /// `godotvim.item.activate` on Shift+Enter in every dock.
 ///

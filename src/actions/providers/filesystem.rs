@@ -12,11 +12,11 @@
 //! `panelmap dock a godotvim.fs.create` from creating files at `res://` root
 //! from a focused Scene tree — `get_selected_path` returns `None` for a non-FS
 //! Tree and `begin_create` falls back to `"res://"`
-//! (`src/navigation/filesystem_explorer.rs:122-126`).
+//! (`src/navigation/filesystem_explorer.rs`).
 //!
 //! # Why depth replaces the hardcoded FileSystem-first branch
 //!
-//! `src/plugin/input.rs:170-180` hardcodes "ask the FileSystem explorer first,
+//! `src/plugin/input.rs` hardcodes "ask the FileSystem explorer first,
 //! then fall back to generic dock input". Here that is just the forest:
 //! `dock.filesystem` names `dock` as its parent, so it is deeper, so its
 //! bindings are consulted first and `j` — which it does not bind — falls
@@ -68,7 +68,7 @@ pub(crate) static DOCK_FILESYSTEM: SurfaceSpec = SurfaceSpec {
 };
 
 /// The nvim-tree-flavoured file operations of `resolve_fs_action`
-/// (`filesystem_explorer.rs:374-386`).
+/// (`filesystem_explorer.rs`).
 ///
 /// `R` and `r` are two *keys*, not one key with a modifier: `bridge::input`
 /// folds Shift into the character itself, so the discriminant is carried by
@@ -78,7 +78,7 @@ pub(crate) static DOCK_FILESYSTEM: SurfaceSpec = SurfaceSpec {
 /// `dock.filesystem` is deeper in the forest than `dock`, so these five get
 /// first refusal while `j`/`k` still fall through to the parent. That depth is
 /// the entire replacement for the hardcoded branch at
-/// `src/plugin/input.rs:140-150`.
+/// `src/plugin/input.rs`.
 const DEFAULTS: &str = "\
 panelmap <physical> dock.filesystem a godotvim.fs.create
 panelmap <physical> dock.filesystem d godotvim.fs.delete
@@ -152,6 +152,67 @@ mod tests {
             !chain.widget_caps().contains(Caps::FILEOPS),
             "FILEOPS is dock membership, not a widget affordance"
         );
+    }
+
+    #[test]
+    fn the_on_key_hook_dismisses_a_stale_prompt_through_the_ctx() {
+        // The one shipped `on_key` hook, and it belongs to no binding — so
+        // nothing in the resolver, the trie or the golden fixture table can
+        // notice it going missing. Gutting the body to `Some(|_| {})` passed
+        // 1416/1416 while silently reproducing the original bug: a create
+        // prompt left open after focus moved back to the Tree, which
+        // `dismiss_prompt` would later `call_deferred("grab_focus")` away from
+        // wherever the user has since gone.
+        //
+        // Driven through `ActionCtx::with_fs` rather than by calling
+        // `on_key_tick` directly, because the WIRING is the thing at risk: the
+        // hook has to reach the explorer the transport lends it.
+        let mut fs = crate::navigation::FileSystemExplorer::new();
+        fs.arm_stale_prompt();
+        assert!(
+            fs.prompt_is_live(),
+            "the fixture must start with a prompt up"
+        );
+
+        let hook = DOCK_FILESYSTEM
+            .on_key
+            .expect("dock.filesystem declares the one shipped hook");
+        {
+            let mut cx =
+                crate::actions::action::ActionCtx::new(None, crate::actions::action::Params::new())
+                    .with_fs(&mut fs);
+            hook(&mut cx);
+        }
+        assert!(
+            !fs.prompt_is_live(),
+            "the hook must auto-dismiss the orphaned prompt"
+        );
+    }
+
+    #[test]
+    fn the_on_key_hook_is_idempotent_and_needs_no_prompt() {
+        // The hook contract: it runs for EVERY key including key-repeat
+        // echoes, before any lookup and whether or not a binding matches. A
+        // second call must be a no-op rather than a second dismiss.
+        let mut fs = crate::navigation::FileSystemExplorer::new();
+        let hook = DOCK_FILESYSTEM.on_key.expect("shipped hook");
+        for _ in 0..3 {
+            let mut cx =
+                crate::actions::action::ActionCtx::new(None, crate::actions::action::Params::new())
+                    .with_fs(&mut fs);
+            hook(&mut cx);
+        }
+        assert!(!fs.prompt_is_live());
+    }
+
+    #[test]
+    fn the_on_key_hook_declines_a_transport_that_lends_no_explorer() {
+        // `:action` and the `gui_input` transport both leave `fs` unset. The
+        // hook must not panic there — `cx.fs()` is the whole guard.
+        let hook = DOCK_FILESYSTEM.on_key.expect("shipped hook");
+        let mut cx =
+            crate::actions::action::ActionCtx::new(None, crate::actions::action::Params::new());
+        hook(&mut cx);
     }
 
     #[test]

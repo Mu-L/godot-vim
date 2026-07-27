@@ -1103,10 +1103,68 @@ imap jj <Esc>
         );
     }
 
+    // ── The blocklist's delimiter split ──────────────────────────────
+
+    #[test]
+    fn every_set_delimiter_normalises_to_the_bare_option_name() {
+        // `extract_option_name_from_token` is the last line of defence in front
+        // of BLOCKED_SET_OPTIONS: the blocklist is matched against its OUTPUT,
+        // so a delimiter it does not split on is an option name it does not
+        // recognise. Narrowing the split set to `['=']` alone whitelists
+        // `set shell!` from a committed project vimrc.
+        //
+        // One token per delimiter Vim accepts, plus the `no` prefix.
+        for token in [
+            "shell=x", "shell?", "shell!", "shell:x", "shell+=x", "shell-=x", "noshell",
+        ] {
+            assert_eq!(
+                extract_option_name_from_token(token),
+                "shell",
+                "'{token}' must normalise to the bare option name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blocked_option_is_stripped_through_every_delimiter() {
+        // The same split, end to end: each of these reaches
+        // `BLOCKED_SET_OPTIONS` only if the delimiter was stripped first.
+        for line in ["set shell!\n", "set kp?\n", "set ep+=x\n", "set noshell\n"] {
+            let out = sandboxed(line);
+            assert!(
+                out.contains("[sandbox] stripped"),
+                "'{}' must not reach the engine: {out}",
+                line.trim()
+            );
+        }
+    }
+
     // ── panelmap trust tiers (P7) ────────────────────────────────────
 
     fn sandboxed(text: &str) -> String {
         apply_vimrc_policy(text, true, crate::settings::ProjectVimrc::Sandbox).unwrap_or_default()
+    }
+
+    /// Assert that `line` came through **live**, not commented out.
+    ///
+    /// Whole-line, and that is the entire point. A stripped line is emitted as
+    /// `" [sandbox] stripped: <trimmed>` — which *contains* the original line
+    /// verbatim — so `out.contains("panelmap …")` holds whether the binding was
+    /// honoured or stripped, and every such assertion passed while
+    /// `panel_line_is_safe` returned `false` for all three of its arms.
+    /// Comparing the trimmed line for equality is what makes the leading `" `
+    /// visible to the test. The negative twin is belt and braces: a future
+    /// output shape that both keeps the line and reports a strip would still
+    /// fail here.
+    fn assert_survives(out: &str, line: &str) {
+        assert!(
+            out.lines().any(|l| l.trim() == line),
+            "'{line}' must survive as a live line: {out}"
+        );
+        assert!(
+            !out.contains("[sandbox] stripped"),
+            "'{line}' must not be stripped: {out}"
+        );
     }
 
     #[test]
@@ -1116,7 +1174,7 @@ imap jj <Esc>
         // a recursive chain. That is the entire justification for letting it
         // through where recursive maps are stripped unconditionally.
         let out = sandboxed("panelmap dock n godotvim.item.next\n");
-        assert!(out.contains("panelmap dock n godotvim.item.next"), "{out}");
+        assert_survives(&out, "panelmap dock n godotvim.item.next");
     }
 
     #[test]
@@ -1124,13 +1182,13 @@ imap jj <Esc>
         // `native` can only REDUCE what the plugin consumes, so a hostile
         // project can at most hand keys back to Godot.
         let out = sandboxed("panelmap dock j native\n");
-        assert!(out.contains("panelmap dock j native"), "{out}");
+        assert_survives(&out, "panelmap dock j native");
     }
 
     #[test]
     fn an_unmap_survives_at_every_tier() {
         let out = sandboxed("panelunmap dock j\n");
-        assert!(out.contains("panelunmap dock j"), "{out}");
+        assert_survives(&out, "panelunmap dock j");
     }
 
     #[test]
@@ -1150,9 +1208,19 @@ imap jj <Esc>
 
     #[test]
     fn an_unparseable_panel_line_is_stripped_not_trusted() {
-        // "does not parse" and "is harmless" are different claims.
+        // "does not parse" and "is harmless" are different claims: this is the
+        // `Err(_) => false` arm of `panel_line_is_safe`, and flipping it to
+        // `true` passes an unparseable line through verbatim.
+        //
+        // The old needle here was `"\npanelmap dock\n"` — a leading newline the
+        // single-line input can never produce, so the assertion held no matter
+        // what the sandbox did.
         let out = sandboxed("panelmap dock\n");
-        assert!(!out.contains("\npanelmap dock\n"), "{out}");
+        assert!(out.contains("[sandbox] stripped"), "must say why: {out}");
+        assert!(
+            out.lines().all(|l| !l.starts_with("panelmap")),
+            "no live panelmap line may survive: {out}"
+        );
     }
 
     #[test]

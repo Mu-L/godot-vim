@@ -147,7 +147,7 @@ pub(crate) struct ResolveInput<'a> {
     ///
     /// The transport passes
     /// `|k| controller.as_ref().is_some_and(|c| c.could_start_mapping(k))`,
-    /// which is the `is_none_or` at the old `input.rs:116` with the predicate
+    /// which is the `is_none_or` at the old `input.rs` with the predicate
     /// negated on both sides. Getting that flip wrong stops the plugin
     /// navigating panels in exactly the state where nothing else can either:
     /// no controller must mean INTERCEPT.
@@ -413,7 +413,7 @@ pub(crate) fn dispose(
         if candidate.consume == Consumption::Void {
             // Consumes AND terminates, even on `Declined`, even when `run`
             // short-circuited because there was no target at all. This is the
-            // declarative form of the old `input.rs:126-134`, where
+            // declarative form of the old `input.rs`, where
             // `handle_window_nav`'s result was discarded and the key consumed
             // regardless. Making it conditional leaks Ctrl+H/J/K/L to Godot.
             return Disposition::Consume;

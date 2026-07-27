@@ -38,7 +38,7 @@ pub(crate) static PANEL: SurfaceSpec = SurfaceSpec {
 
 /// Cross-panel focus, in the exact form a user would write it.
 ///
-/// `<void>` reproduces `src/plugin/input.rs:126-134`, where
+/// `<void>` reproduces `src/plugin/input.rs`, where
 /// `handle_window_nav`'s result is discarded at `:129` and
 /// `set_input_as_handled()` fires at `:132` even with no focus owner and no
 /// target found. `<norepeat>` keeps a held Ctrl+J from queueing a ~20/s storm

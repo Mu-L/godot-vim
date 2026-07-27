@@ -255,6 +255,68 @@ pub(crate) trait CompletionOps {
     fn hand_to_editor(&mut self);
 }
 
+/// The focused panel control, as commands.
+///
+/// The same seam as [`CompletionOps`], for the same reason, applied to the
+/// executors that reach the scene tree. [`ActionCtx::new`] needs a
+/// `Gd<Control>`, which cannot be constructed in a `cdylib` under `cargo test`,
+/// so every body that opened with `let Some(target) = cx.target() else { return
+/// Declined }` short-circuited before its first decision. `Declined` was then
+/// produced for three indistinguishable reasons, and everything downstream of
+/// the guard — the direction, the repeat count, the break-on-false, and the
+/// polarity of the resulting [`Outcome`] — was freely mutable under a green
+/// suite. Behind this trait those decisions are plain data over a `bool` and an
+/// enum, and a recording fake asserts them.
+///
+/// It is **not** `navigation::dock_nav::NavigableItem`. That trait is a cursor
+/// over one widget's visible-item chain (`next_visible` / `prev_visible` /
+/// `is_selectable`), it knows nothing about selecting, scrolling or the
+/// Tree/ItemList/RichTextLabel dispatch that `handle_navigation` performs, and
+/// it is already faked by `dock_nav`'s own `MockItem`. This is the layer above
+/// it: one keystroke's worth of effect on a whole control.
+///
+/// Production reaches it through the target itself — `Gd<Control>` is the only
+/// shipped implementor, and [`ActionCtx::panel_ops`] hands it out — so there is
+/// exactly one code path and the fake substitutes for the widget, never for the
+/// executor.
+pub(crate) trait PanelOps {
+    /// One step in `direction`. `false` means "nothing to move to" — the end
+    /// of a list — which the caller turns into a declination so the key falls
+    /// through to Godot rather than dying here.
+    fn nav_step(&mut self, direction: crate::navigation::dock_nav::NavDirection) -> bool;
+    /// Expand or collapse, with the same `false`-is-a-declination contract.
+    fn hierarchy_step(&mut self, action: crate::navigation::dock_nav::HierarchyAction) -> bool;
+    /// Directional cross-panel focus movement.
+    fn move_focus(
+        &mut self,
+        direction: crate::navigation::window::WindowNavDirection,
+    ) -> crate::navigation::window::WindowNavResult;
+    /// Spatial cycle-focus. Returns nothing: the scene-tree walk reports its
+    /// own miss by leaving focus where it was.
+    fn cycle_focus(&mut self, action: crate::effects::WindowNavAction);
+}
+
+impl PanelOps for Gd<Control> {
+    fn nav_step(&mut self, direction: crate::navigation::dock_nav::NavDirection) -> bool {
+        crate::navigation::dock_nav::handle_navigation(self, direction, 0)
+    }
+
+    fn hierarchy_step(&mut self, action: crate::navigation::dock_nav::HierarchyAction) -> bool {
+        crate::navigation::dock_nav::handle_hierarchy(self, action)
+    }
+
+    fn move_focus(
+        &mut self,
+        direction: crate::navigation::window::WindowNavDirection,
+    ) -> crate::navigation::window::WindowNavResult {
+        crate::navigation::handle_window_nav(self, direction)
+    }
+
+    fn cycle_focus(&mut self, action: crate::effects::WindowNavAction) {
+        crate::navigation::handle_window_nav_action(self, action);
+    }
+}
+
 /// What an action can reach while it runs.
 ///
 /// Ships **chain-less** at this phase: the sampled focus chain arrives with
@@ -283,6 +345,18 @@ pub(crate) struct ActionCtx<'a> {
     /// `_input` panel dispatcher and `:action` both leave it unset, and a
     /// completion verb reached from there declines instead of half-running.
     completion: Option<&'a mut dyn CompletionOps>,
+    /// A stand-in for the focused control, set **only** under test.
+    ///
+    /// Unlike `fs` and `completion` this lane has no transport: production
+    /// always reaches [`PanelOps`] through `target`, so there is one code path
+    /// and a mutation to a body is a mutation the fake sees. `None` everywhere
+    /// outside `#[cfg(test)]`.
+    #[cfg(test)]
+    panel: Option<&'a mut dyn PanelOps>,
+    /// A stand-in for the focused debugger tree, set only under test. Same
+    /// arrangement and same reasoning as `panel`.
+    #[cfg(test)]
+    debugger: Option<&'a mut dyn super::providers::debugger::DebuggerTreeOps>,
 }
 
 /// One observable side effect of running an action.
@@ -320,6 +394,10 @@ impl<'a> ActionCtx<'a> {
             recorder: None,
             fs: None,
             completion: None,
+            #[cfg(test)]
+            panel: None,
+            #[cfg(test)]
+            debugger: None,
         }
     }
 
@@ -344,11 +422,65 @@ impl<'a> ActionCtx<'a> {
             recorder: Some(sink),
             fs: None,
             completion: None,
+            panel: None,
+            debugger: None,
         }
+    }
+
+    /// Stand a fake in for the focused control. Test-only, by construction:
+    /// production has no second source of [`PanelOps`].
+    #[cfg(test)]
+    pub(crate) fn with_panel_ops(mut self, ops: &'a mut dyn PanelOps) -> Self {
+        self.panel = Some(ops);
+        self
+    }
+
+    /// Stand a fake in for the focused debugger tree. Test-only.
+    #[cfg(test)]
+    pub(crate) fn with_debugger_tree(
+        mut self,
+        ops: &'a mut dyn super::providers::debugger::DebuggerTreeOps,
+    ) -> Self {
+        self.debugger = Some(ops);
+        self
     }
 
     pub(crate) fn target(&self) -> Option<&Gd<Control>> {
         self.target.as_ref()
+    }
+
+    /// What this keystroke may do to the focused control, when there is one.
+    ///
+    /// `None` is the no-focus-owner case — `Anchor::Rootless` reaches `panel`'s
+    /// Ctrl+hjkl rules with nothing focused — and every caller must turn it
+    /// into `Declined`: `Handled` there would consume the key and do nothing.
+    pub(crate) fn panel_ops(&mut self) -> Option<&mut (dyn PanelOps + 'a)> {
+        #[cfg(test)]
+        {
+            if self.panel.is_some() {
+                return self.panel.as_deref_mut();
+            }
+        }
+        self.target.as_mut().map(|t| t as &mut (dyn PanelOps + 'a))
+    }
+
+    /// The focused control as a debugger tree, when there is one.
+    ///
+    /// The cast to `Tree` lives inside the implementation rather than here, so
+    /// a focused `Button` inside the debugger dock answers "no selection"
+    /// instead of being unrepresentable.
+    pub(crate) fn debugger_tree(
+        &mut self,
+    ) -> Option<&mut (dyn super::providers::debugger::DebuggerTreeOps + 'a)> {
+        #[cfg(test)]
+        {
+            if self.debugger.is_some() {
+                return self.debugger.as_deref_mut();
+            }
+        }
+        self.target
+            .as_mut()
+            .map(|t| t as &mut (dyn super::providers::debugger::DebuggerTreeOps + 'a))
     }
 
     /// The FileSystem explorer, when this transport lends one.

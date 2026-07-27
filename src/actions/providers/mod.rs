@@ -26,7 +26,7 @@
 //! 2. **`foreign` must therefore precede `unknown`.** Behind it, a Project
 //!    Settings `LineEdit` would resolve to `unknown` → `panel` instead of to a
 //!    `Barrier`, and Ctrl+hjkl would be consumed mid-word — a direct violation
-//!    of `FocusContext::Foreign => false` (`src/plugin/input.rs:114`).
+//!    of `FocusContext::Foreign => false` (`src/plugin/input.rs`).
 //! 3. **`foreign` must not be first.** Its predicate claims "a `LineEdit` with
 //!    no sibling nav control", and whether the plugin's own FileSystem prompt
 //!    has one is an editor-runtime fact nobody can settle from source. Ahead
@@ -167,9 +167,44 @@ pub(crate) fn actions() -> Vec<&'static ActionSpec> {
         .collect()
 }
 
-/// The shipped forest, ready to classify.
+/// The shipped forest, ready to classify — and audited on the way out.
+///
+/// The audit is what makes three separate doc comments true rather than
+/// aspirational. Before this call existed, [`Forest::audit`] implemented the
+/// design's V1/V3/V4 validations and every caller of it was inside
+/// `#[cfg(test)]`, so a provider added by a third party got exactly the
+/// enforcement its author assumed was already there: none. A duplicate id, an
+/// undeclared parent, a parent cycle or an ancestor probed before its
+/// descendant each produce a surface whose bindings are silently dead.
+///
+/// Two channels on purpose. `debug_assert!` fails the suite for an in-repo
+/// mistake, which is where the shipped forest's errors belong. `log::error!`
+/// is for a release build, where refusing to start would be a worse answer
+/// than running with one broken surface — the rest of the keyset still works.
+///
+/// The cost is a walk over ~10 specs with a bounded `path_from` per spec, paid
+/// once per `builtin_index` call — i.e. at load and at each config reload,
+/// never on the input path, which reads `self.bindings.forest()`.
 pub(crate) fn forest() -> Forest {
-    Forest::new(&surfaces())
+    audited(Forest::new(&surfaces()))
+}
+
+/// Run [`Forest::audit`] over a freshly built forest and pass it through.
+///
+/// A separate function purely so the failure path is reachable from a test:
+/// the shipped forest is clean, so calling this on it proves nothing, and
+/// `a_malformed_forest_is_rejected_at_construction` needs a forest that is
+/// not.
+fn audited(forest: Forest) -> Forest {
+    let errors = forest.audit();
+    debug_assert!(
+        errors.is_empty(),
+        "the surface forest is malformed: {errors:?}"
+    );
+    for error in &errors {
+        log::error!("surface forest: {error}");
+    }
+    forest
 }
 
 #[cfg(test)]
@@ -884,7 +919,7 @@ mod tests {
 
     // ── Agreement with the classifier still in production ────────────
 
-    /// `classify_focus`'s five answers (`src/navigation/focus.rs:20-37`).
+    /// `classify_focus`'s five answers (`src/navigation/focus.rs`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Legacy {
         Editor,
@@ -894,7 +929,7 @@ mod tests {
         Unknown,
     }
 
-    /// `classify_focus` (`src/navigation/focus.rs:42-96`) transcribed against
+    /// `classify_focus` (`src/navigation/focus.rs`) transcribed against
     /// the sampled chain instead of a live `Gd<Control>` — same order, same
     /// predicates, same fallthrough.
     ///
@@ -936,7 +971,7 @@ mod tests {
             // lands without changing what the legacy code would have said.
             "dock" | "dock.filesystem" | "dock.debugger" => Legacy::Dock,
             // The prompt is a `SearchBox` to today's classifier, which is why
-            // `input.rs:187` has to ask `is_prompt_active` and decline.
+            // `input.rs` has to ask `is_prompt_active` and decline.
             "searchbox" | "prompt" => Legacy::SearchBox,
             "foreign" => Legacy::Foreign,
             "unknown" => Legacy::Unknown,
@@ -976,7 +1011,7 @@ mod tests {
     ///
     /// Both entries are the same fact: the FileSystem prompt is a `LineEdit`
     /// this plugin builds and parents into Godot's own dock
-    /// (`filesystem_explorer.rs:158-192`), so the two generic `LineEdit`
+    /// (`filesystem_explorer.rs`), so the two generic `LineEdit`
     /// predicates cannot be made to miss it. Whether
     /// `find_sibling_nav_control` reaches the dock's tree from the prompt is
     /// an editor-runtime fact — today it does, so `searchbox` would claim it;
@@ -1129,6 +1164,51 @@ mod tests {
         fn the_forest_audit_passes_on_the_shipped_order() {
             // V1, V3 and the descendant-before-ancestor half of V4.
             assert_eq!(forest().audit(), Vec::<String>::new());
+        }
+
+        /// Two surfaces naming each other as parent — V3's cycle case.
+        static CYCLE_A: crate::actions::surface::SurfaceSpec =
+            crate::actions::surface::SurfaceSpec {
+                id: "t.cycle_a",
+                parent: Some("t.cycle_b"),
+                seal: Seal::Open,
+                grants: |_| Caps::empty(),
+                probe: |_| None,
+                on_key: None,
+                yields_to_engine: false,
+                refuses_positional: false,
+            };
+        static CYCLE_B: crate::actions::surface::SurfaceSpec =
+            crate::actions::surface::SurfaceSpec {
+                id: "t.cycle_b",
+                parent: Some("t.cycle_a"),
+                seal: Seal::Open,
+                grants: |_| Caps::empty(),
+                probe: |_| None,
+                on_key: None,
+                yields_to_engine: false,
+                refuses_positional: false,
+            };
+
+        #[test]
+        #[should_panic(expected = "the surface forest is malformed")]
+        fn a_malformed_forest_is_rejected_at_construction() {
+            // The half that was missing. `Forest::audit` implements V1/V3/V4
+            // and, until `audited` existed, every caller of it was inside
+            // `#[cfg(test)]` — while three doc comments told the next provider
+            // author that a malformed forest is "rejected at registration".
+            // It was not: a parent cycle produced a surface whose bindings are
+            // silently dead, at runtime, with a green suite.
+            let _ = audited(crate::actions::surface::Forest::new(&[&CYCLE_A, &CYCLE_B]));
+        }
+
+        #[test]
+        fn a_clean_forest_passes_through_the_construction_audit_unchanged() {
+            // The other direction: `audited` is a pass-through, not a filter.
+            // A version that dropped surfaces on the way would take the whole
+            // keyset out.
+            let audited_ids: Vec<_> = audited(Forest::new(&surfaces())).ids().collect();
+            assert_eq!(audited_ids, SHIPPED);
         }
 
         #[test]

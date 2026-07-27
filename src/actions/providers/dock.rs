@@ -57,7 +57,7 @@ pub(crate) static DOCK: SurfaceSpec = SurfaceSpec {
 /// Dock item navigation, plus `/` for the filter box.
 ///
 /// Consumption is **elastic** — the default — which is what preserves `j` at
-/// the end of a list (`dock.rs:148-154`): the action declines, the key is not
+/// the end of a list (`dock.rs`): the action declines, the key is not
 /// consumed, and Godot's own handling proceeds.
 ///
 /// `h` and `l` are bound unconditionally and go inert on an `ItemList` through
@@ -66,7 +66,7 @@ pub(crate) static DOCK: SurfaceSpec = SurfaceSpec {
 /// whole replacement for `matches!(dock_kind, DockKind::Tree)`.
 ///
 /// `/` carries `<physical>` for the same reason the rest do, and it is the key
-/// whose shadowing bug (`dock.rs:127`, unreachable behind the hjkl arm on a
+/// whose shadowing bug (`dock.rs`, unreachable behind the hjkl arm on a
 /// physical-J layout) motivated the one-probe-list-per-keyset rule.
 /// Today's dock keyset, verbatim.
 ///

@@ -1387,40 +1387,18 @@ impl GodotVimCore {
 
     /// Rebuild the panel binding index, atomically.
     ///
-    /// Deliberately **outside** the `if let Some(text)` above and run on the
-    /// no-file path too: `apply_vimrc_policy` returns `None` under
-    /// `ProjectVimrc::Disabled` and `read_file` returns `None` when there is
-    /// no vimrc at all, so the naive placement means a security setting — or
-    /// simply having no config — destroys the builtin Ctrl+hjkl defaults.
+    /// Everything decidable is in [`build_index`]; what is left here is the
+    /// three effects that need `&mut self` — logging the diagnostics, swapping
+    /// the index in under a fresh generation, and dropping the chain cache.
     ///
-    /// The user layer is not read here yet; that is the config phase's work.
-    /// What ships now is the rebuild *seam*, so that adding the second layer
-    /// is one call and not a restructuring: build a fresh index, then swap,
-    /// so one broken line can never leave a half-built table live.
+    /// The swap is what makes it atomic: a fresh index is built to completion
+    /// and only then installed, so one broken line can never leave a half-built
+    /// table live.
     fn rebuild_bindings(&mut self) {
         let generation = self.bindings.generation.wrapping_add(1);
-        let mut index = crate::actions::bind::builtin_index(&self.actions);
-
-        // The user layer, on top of the builtins. Two layers within ONE file
-        // — `config::path::resolve` picks exactly one vimrc (EditorSettings
-        // override, else res://, else user://), never several. Layering
-        // between files is not a thing here and must not become one.
-        //
-        // Sourced from the sandboxed text, so a project-level vimrc has
-        // already had `<Shortcut>` targets stripped before we see it.
-        let mut diagnostics = Vec::new();
-        if let Some(text) = self.read_sandboxed_config() {
-            let resolved = self.resolve_config_path();
-            crate::actions::bind::apply_text(
-                &mut index,
-                &self.actions,
-                &text,
-                &vim_core::keymap::MappingOwner::User,
-                &resolved.path,
-                crate::actions::bind::Provenance::User,
-                &mut diagnostics,
-            );
-        }
+        let text = self.read_sandboxed_config();
+        let source = self.resolve_config_path().path;
+        let (mut index, diagnostics) = build_index(&self.actions, text.as_deref(), &source);
         for d in &diagnostics {
             // Warn-and-skip per line: one bad binding must not cost the user
             // the rest of their config. The log is the *secondary* channel and
@@ -1600,5 +1578,144 @@ impl GodotVimCore {
                 self.langmap = None;
             }
         }
+    }
+}
+
+/// Build a complete panel binding index from the builtins plus one vimrc.
+///
+/// The pure half of [`GodotVimCore::rebuild_bindings`], lifted out because
+/// everything it decides is decidable without a `Gd<T>` — and everything the
+/// caller keeps needs `&mut self`, so the two could not be tested together at
+/// any price.
+///
+/// `text` is the vimrc **after** the project-vimrc security policy, and `None`
+/// covers three states that must all behave identically: no config file at
+/// all, `ProjectVimrc::Disabled`, and a file the sandbox rejected outright.
+/// Applying the builtins outside that `if` is the whole reason it is a
+/// parameter rather than something read here — the naive placement means a
+/// security setting, or simply having no config, destroys the builtin
+/// Ctrl+hjkl defaults.
+///
+/// `source` is only ever a diagnostic label: it is what a rejected line is
+/// reported against, so `:panelmap` can name the file and the line number.
+fn build_index(
+    registry: &crate::actions::action::ActionRegistry,
+    text: Option<&str>,
+    source: &str,
+) -> (
+    crate::actions::bind::BindingIndex,
+    Vec<crate::actions::bind::PanelDiagnostic>,
+) {
+    let mut index = crate::actions::bind::builtin_index(registry);
+    let mut diagnostics = Vec::new();
+    // The user layer, on top of the builtins. Two layers within ONE file —
+    // `config::path::resolve` picks exactly one vimrc (EditorSettings
+    // override, else res://, else user://), never several. Layering between
+    // files is not a thing here and must not become one.
+    if let Some(text) = text {
+        crate::actions::bind::apply_text(
+            &mut index,
+            registry,
+            text,
+            &vim_core::keymap::MappingOwner::User,
+            source,
+            crate::actions::bind::Provenance::User,
+            &mut diagnostics,
+        );
+    }
+    (index, diagnostics)
+}
+
+#[cfg(test)]
+mod build_index_tests {
+    use super::build_index;
+    use crate::actions::specs;
+
+    /// The shipped keyset with no user config at all — the zero-config case.
+    fn builtin_count() -> usize {
+        let reg = specs::registry();
+        build_index(&reg, None, "user://.godot-vimrc").0.len()
+    }
+
+    #[test]
+    fn no_config_file_still_yields_the_builtin_keyset() {
+        // The regression this function's shape exists to prevent: reading the
+        // vimrc INSIDE the `if let Some(text)` and building the builtins there
+        // too means a user with no config — or with `ProjectVimrc::Disabled` —
+        // loses Ctrl+hjkl entirely.
+        assert!(
+            builtin_count() > 0,
+            "the builtin defaults must load with no vimrc"
+        );
+        let reg = specs::registry();
+        let (index, diagnostics) = build_index(&reg, None, "user://.godot-vimrc");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            index
+                .rule_for("panel", &[vim_core::keymap::KeyEvent::ctrl('h')])
+                .is_some(),
+            "panel <C-h> is a shipped default and must survive the no-file path"
+        );
+    }
+
+    #[test]
+    fn an_empty_vimrc_is_indistinguishable_from_no_vimrc() {
+        let reg = specs::registry();
+        assert_eq!(
+            build_index(&reg, Some(""), "user://.godot-vimrc").0.len(),
+            builtin_count()
+        );
+    }
+
+    #[test]
+    fn a_user_line_layers_on_top_of_the_builtins() {
+        let reg = specs::registry();
+        let (index, diagnostics) = build_index(
+            &reg,
+            Some("panelmap dock q godotvim.item.activate\n"),
+            "user://.godot-vimrc",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            index.len(),
+            builtin_count() + 1,
+            "the user rule must ADD to the builtins, not replace them"
+        );
+        assert!(index
+            .rule_for(
+                "dock",
+                &[vim_core::keymap::KeyEvent::new(
+                    vim_core::keymap::Key::Char('q'),
+                    vim_core::keymap::Modifiers::NONE,
+                )]
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn one_bad_line_costs_only_itself_and_names_its_source() {
+        // Warn-and-skip is per line, and the diagnostic has to carry the file
+        // and the line number or `:panelmap` cannot tell the user where to
+        // look — which is the same as the rejection being silent.
+        let reg = specs::registry();
+        let (index, diagnostics) = build_index(
+            &reg,
+            Some(
+                "panelmap dock q godotvim.item.activate\n\
+                 panelmap dock w godotvim.item.nextt\n",
+            ),
+            "res://.godot-vimrc",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let rendered = diagnostics[0].to_string();
+        assert!(
+            rendered.starts_with("res://.godot-vimrc:2:"),
+            "the diagnostic must name the file and the line: {rendered}"
+        );
+        assert_eq!(
+            index.len(),
+            builtin_count() + 1,
+            "the good line above the bad one must still install"
+        );
     }
 }

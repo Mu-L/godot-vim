@@ -51,6 +51,19 @@ This is a complete rewrite — settings, config format, and internals are all ne
    - **macOS:** `~/Library/Application Support/Godot/editor_settings-4.tres`
 3. **Recreate key mappings**: v0.x stored mappings in EditorSettings; v1.0 uses a `.godot-vimrc` config file instead (see [Configuration](#configuration))
 
+### Upgrading from v1.6.x
+
+Nothing to do — with no `.godot-vimrc`, the keyset is unchanged. The shell-side keys (panel focus, dock navigation, FileSystem and debugger operations, the completion popup) are now a **rebindable table** rather than hardcoded match arms; the shipped defaults are exactly what they were. See [Panel Key Bindings →](docs/REFERENCE.md#panel-key-bindings-panelmap).
+
+Four differences you may notice, all deliberate:
+
+- **`Ctrl+Enter` no longer confirms a completion.** The old popup handling matched `Enter`, `Tab`, `Escape`, `Up` and `Down` while *ignoring modifiers*, so every modified variant was swallowed too. `<CR>` now means `<CR>`, and modified variants reach the Vim engine — which is both more correct and reversible: `panelmap <shift> editor.completion <Up> godotvim.completion.navigate` restores the Shift+Up half.
+- **Holding `Ctrl+j` no longer repeats.** The four panel chords carry `<norepeat>`, so auto-repeat is consumed without re-firing. Previously a held chord queued roughly twenty deferred focus changes a second. The keystroke is still consumed, so nothing leaks to Godot.
+- **`Ctrl+h/j/k/l` now escapes the FileSystem create/rename prompt**, and the stale-prompt cleanup runs for those chords too. Previously the prompt was left pointing at a tree it would later steal focus back to.
+- **`:action godotvim.fs.create` and friends actually run.** They were declining stubs; they now do what the corresponding key does.
+
+New in this release: `:panelmap` lists every shell-side binding in the exact syntax you would paste into a vimrc, plus any config line that was rejected and why. `:panelmap {keys}` explains how one key resolves where focus is right now.
+
 ## Quick Start
 
 Open any script.
@@ -87,6 +100,8 @@ Not just Vim in an editor — Vim that speaks Godot:
 - **`Ctrl+h/j/k/l`** — spatial panel navigation (script editor, scene tree, inspector, filesystem)
 - **`j/k/h/l` in docks** — browse the scene tree, filesystem, and output with Vim keys; `/` to search
 - **File explorer** — `a` create file/dir, `d` delete, `r` rename, `y` yank path, `R` refresh (nvim-tree style)
+- **Debugger** — `J`/`K` walk stack frames and breakpoints, `G` jumps to the deepest frame, `y` yanks the row
+- **Every one of those keys is rebindable** — `panelmap` / `panelunmap` lines in your `.godot-vimrc`, `:panelmap` to list and explain them
 - **`gd`** — go-to-definition; **`K`** — hover docs
 - **Code completion** — `Ctrl-N`/`Ctrl-P`/`Ctrl-Space` trigger and navigate completions
 - **Cross-buffer jump list** — `Ctrl-O`/`Ctrl-I` switch tabs when the jump is in another buffer
@@ -129,10 +144,14 @@ nnoremap <Leader>w :save<CR>
 inoremap jk <Esc>
 vnoremap < <gv
 vnoremap > >gv
+
+" Keys outside the script editor are rebindable too:
+panelunmap dock j
+panelmap <physical> dock n godotvim.item.next
 ```
 
 
-Hot-reloads on save. 20 built-in presets togglable via the `:mappings` dialog. [Config syntax →](docs/REFERENCE.md#godot-vimrc-syntax) · [All presets →](docs/REFERENCE.md#preset-mappings)
+Hot-reloads on save. 20 built-in presets togglable via the `:mappings` dialog. [Config syntax →](docs/REFERENCE.md#godot-vimrc-syntax) · [Panel bindings →](docs/REFERENCE.md#panel-key-bindings-panelmap) · [All presets →](docs/REFERENCE.md#preset-mappings)
 
 <p align="center">
   <img src="media/mappings.gif" alt="Mappings Dialog" width="800" />
@@ -150,6 +169,8 @@ Record with `qa`, replay with `@a`. Named registers `"a`-`"z`, system clipboard 
 | Plugin not appearing | Ensure `addons/godot_vim/` contains `plugin.cfg`, `.gdextension`, and the compiled library. Enable in Project Settings > Plugins. |
 | `addons/` folder missing after Asset Library install | "Ignore asset root" was unchecked. Re-install from AssetLib with the box **checked**, or manually copy `addons/godot_vim/` from the release zip. |
 | Key not working | Check `passthrough_keys` setting — the key may be bypassing Vim. Check `:mappings` for conflicts. |
+| A dock or panel key does nothing | Run `:panelmap {key}` with that panel focused — the Output panel shows which surface claimed the focus, which rule won, and which gate stopped it. `:panelmap` with no argument lists every binding plus any `.godot-vimrc` line that was rejected. |
+| A `panelmap` line seems to be ignored | `:panelmap` prints rejected lines and the reason. If yours is not listed at all, the verb is misspelled — `panelmp` is not claimed as a panel line. Set **Log Level** to `Debug` to see rejections as the file loads. |
 | `.godot-vimrc` not loading | Verify the file is at `res://.godot-vimrc` or `user://.godot-vimrc`. Run `:source` to force reload. |
 | Clipboard not working | Enable `editor/clipboard_enabled` in EditorSettings. Both `y`/`p` and `"+y`/`"+p` sync with the system clipboard when enabled. |
 | Cursor not rendering | The custom cursor uses a GLSL shader. Set `cursor/enabled = false` to fall back to native caret. |

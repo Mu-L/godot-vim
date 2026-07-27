@@ -245,6 +245,25 @@ pub(crate) fn explain_report(
         path.caps, path.seal, path.anchor_yields_to_engine, path.anchor_refuses_positional
     );
 
+    // ── What this report structurally cannot know ────────────────────
+    //
+    // `Probes::from_key` builds ONE as-typed probe with the positional index
+    // unset, so the walk below runs against a one-element list while a real
+    // keystroke carries up to three. Until this line existed the caveat was a
+    // source comment addressed to the maintainer and the user was told
+    // nothing, which on a non-QWERTY layout means the report answers a
+    // different question than the one the user asked.
+    let probe_list: Vec<String> = probes
+        .iter()
+        .map(|probe| probe.to_vim_notation().into_owned())
+        .collect();
+    let _ = writeln!(
+        out,
+        "probes: {} (as typed only — a real keystroke on a non-QWERTY layout also carries a \
+         Latin collapse and a US-QWERTY position, which a written LHS cannot derive)",
+        probe_list.join(", ")
+    );
+
     // ── Candidates, surface by surface ───────────────────────────────
     let _ = writeln!(out, "candidates:");
     for &surface in &path.ids {
@@ -307,6 +326,49 @@ pub(crate) fn explain_report(
         }
         if !any {
             let _ = writeln!(out, "  {surface}: no rule for this key");
+        }
+        // The other half of the same honesty. A `<physical>` rule whose LHS is
+        // a single character is reachable from whichever key sits at that
+        // character's US-QWERTY position — on Dvorak the QWERTY-J position
+        // emits `c`, so `c` in the FileSystem dock is `godotvim.fs.delete`'s
+        // neighbour, and a user asking about `c` needs to see that. Named keys
+        // are excluded because their position does not move between layouts.
+        //
+        // Gated on `positional`, which is already `!refuses_positional &&
+        // has_physical_rule`: inside the attached editor probe 3 is withheld
+        // from the whole walk, so claiming positional reachability there would
+        // be a new lie replacing the old one.
+        if positional {
+            let shadows: Vec<String> = index
+                .rules_on(surface)
+                .filter(|rule| {
+                    rule.physical
+                        && rule.lhs.len() == 1
+                        && matches!(rule.lhs[0].key(), vim_core::keymap::Key::Char(_))
+                })
+                .map(|rule| {
+                    format!(
+                        "{} -> {}",
+                        rule.lhs[0].to_vim_notation(),
+                        match &rule.target {
+                            RuleTarget::Action(id) => registry
+                                .name_of(*id)
+                                .unwrap_or("<unregistered>")
+                                .to_string(),
+                            RuleTarget::Native => "native".to_string(),
+                            RuleTarget::Shortcut(p) => format!("<Shortcut>({p})"),
+                        }
+                    )
+                })
+                .collect();
+            if !shadows.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  {surface}: reachable positionally from another physical key on \
+                     non-QWERTY layouts: {}",
+                    shadows.join(", ")
+                );
+            }
         }
     }
 
@@ -685,6 +747,145 @@ panel  (parent: -, seal: Open)
             report.contains("echoes are consumed WITHOUT running"),
             "{report}"
         );
+    }
+
+    // ── Layout honesty (§5.3) ────────────────────────────────────────
+
+    #[test]
+    fn the_report_says_its_probe_list_is_as_typed_only() {
+        // `Probes::from_key` builds ONE probe with the positional index unset,
+        // so the walk runs against a one-element list while a real keystroke
+        // carries up to three. That was acknowledged only in a source comment
+        // addressed to the maintainer; on Colemak the user was simply given a
+        // confident answer to a question they did not ask.
+        let report = explain("j", &fs_chain(), NEVER);
+        assert!(report.contains("probes: j (as typed only"), "{report}");
+        assert!(report.contains("Latin collapse"), "{report}");
+        assert!(report.contains("US-QWERTY position"), "{report}");
+        assert!(
+            report.contains("a written LHS cannot derive"),
+            "the caveat must name WHY the list is short: {report}"
+        );
+    }
+
+    #[test]
+    fn the_caveat_renders_the_probe_in_the_notation_the_user_typed() {
+        // Not a fixed string: the line has to name the key it is hedging
+        // about, or a user reading two reports side by side cannot tell them
+        // apart.
+        for (lhs, rendered) in [("<C-h>", "probes: <C-h> "), ("<CR>", "probes: <CR> ")] {
+            let report = explain(lhs, &fs_chain(), NEVER);
+            assert!(report.contains(rendered), "{lhs}: {report}");
+        }
+    }
+
+    #[test]
+    fn the_report_names_the_physical_rules_that_could_shadow_a_key() {
+        // The half a caveat alone cannot give: WHICH other key lands here. On
+        // Dvorak the QWERTY-D position emits `e`, so `e` in the FileSystem
+        // dock is `godotvim.fs.delete` — and `:panelmap e` would otherwise say
+        // "no surface on the stack binds this key".
+        let report = explain("j", &fs_chain(), NEVER);
+        assert!(
+            report.contains(
+                "dock.filesystem: reachable positionally from another physical key on \
+                 non-QWERTY layouts:"
+            ),
+            "{report}"
+        );
+        for rule in [
+            "a -> godotvim.fs.create",
+            "d -> godotvim.fs.delete",
+            "r -> godotvim.fs.rename",
+            "y -> godotvim.fs.yank_path",
+            "R -> godotvim.fs.refresh",
+        ] {
+            assert!(report.contains(rule), "{rule} missing from: {report}");
+        }
+        // …and the parent's own physical rules, which are equally reachable.
+        assert!(report.contains("j -> godotvim.item.next"), "{report}");
+        assert!(report.contains("<C-h> -> godotvim.focus.left"), "{report}");
+    }
+
+    #[test]
+    fn a_surface_that_refuses_positional_claims_no_positional_reachability() {
+        // `editor.nav` withholds probe 3 from the WHOLE walk, `panel`
+        // included, so `panel`'s `<physical>` chords are not positionally
+        // reachable from inside the attached editor. Printing the note there
+        // would replace the old lie with a new one — a Dvorak user would be
+        // told `Ctrl+d` might be panel-left, which is exactly the outcome
+        // `refuses_positional` exists to prevent.
+        let report = explain(
+            "<C-h>",
+            &editor_chain(Some(vim_core::primitives::Mode::Normal)),
+            NEVER,
+        );
+        assert!(
+            report.contains("refuses_positional: true"),
+            "fixture must be on the surface that refuses: {report}"
+        );
+        assert!(!report.contains("reachable positionally"), "{report}");
+        // The caveat itself still prints: the probe list is short there too.
+        assert!(report.contains("probes: <C-h> "), "{report}");
+    }
+
+    /// Every "reachable positionally" line in a report, joined.
+    ///
+    /// A helper rather than a `contains` over the whole report, because the
+    /// negative assertions below have to be scoped to these lines: `<Tab>` and
+    /// `q` both appear elsewhere in a report that binds them.
+    fn shadow_lines(report: &str) -> String {
+        report
+            .lines()
+            .filter(|l| l.contains("reachable positionally"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_named_key_is_never_listed_as_positionally_reachable() {
+        // A named key sits at the same physical position on every layout, so
+        // listing it would be noise that dilutes the real warning. Asserted
+        // against a rule that carries `<physical>` AND a named LHS, because no
+        // SHIPPED rule is both — which is exactly why dropping the `Char(_)`
+        // arm survived until this test existed.
+        let index = index_with("panelmap <physical> dock <Tab> godotvim.item.activate");
+        let report = explain_with(&index, "j", &fs_chain(), NEVER);
+        let shadows = shadow_lines(&report);
+        assert!(!shadows.is_empty(), "{report}");
+        assert!(
+            !shadows.contains("<Tab>"),
+            "a named key has no layout-dependent position:\n{shadows}"
+        );
+        // …while the physical single-Char rules on the same surface still are.
+        assert!(shadows.contains("j -> godotvim.item.next"), "{shadows}");
+    }
+
+    #[test]
+    fn a_rule_without_physical_is_never_listed_as_positionally_reachable() {
+        // `<physical>` is what admits probe 3 for a rule at all. A bare
+        // `panelmap dock q …` is reachable only by the key the user actually
+        // typed, so claiming otherwise would send a Colemak user hunting for a
+        // conflict that does not exist. No shipped rule on this path is a
+        // single Char without `<physical>`, so the flag check was unpinned.
+        let index = index_with("panelmap dock q godotvim.item.activate");
+        let report = explain_with(&index, "j", &fs_chain(), NEVER);
+        let shadows = shadow_lines(&report);
+        assert!(!shadows.is_empty(), "{report}");
+        assert!(
+            !shadows.contains("q -> godotvim.item.activate"),
+            "a rule without <physical> is not positionally reachable:\n{shadows}"
+        );
+    }
+
+    #[test]
+    fn the_hedging_belongs_to_the_explainer_and_not_the_listing() {
+        // The golden snapshot is the shipped keyset's contract and a caveat in
+        // it would be re-asserted thirty times for no gain.
+        let reg = registry();
+        let report = list_report(&builtin_index(&reg), &reg, &[]);
+        assert!(!report.contains("as typed only"), "{report}");
+        assert!(!report.contains("reachable positionally"), "{report}");
     }
 
     #[test]

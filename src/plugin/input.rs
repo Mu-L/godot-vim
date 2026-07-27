@@ -53,6 +53,71 @@ enum Plan {
     Run(Vec<Candidate>, KeyEvent),
 }
 
+/// What a [`Plan`] does to the shell timer.
+///
+/// Named rather than inlined for the same reason `Plan` itself is: the timer
+/// is `&mut self` state, so the decision and the effect want to be separable —
+/// and the decision half is then testable without a `Gd<T>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerAction {
+    /// Touch neither the timer nor the buffer. The echo arm's other half:
+    /// a held prefix key must not keep restarting its own timeout.
+    Leave,
+    /// (Re)arm the shell timer — a prefix is pending.
+    Arm,
+    /// Stop the timer, so a stale timeout cannot fire into whatever runs next.
+    Stop,
+}
+
+/// The whole consumption-and-timer contract of the five plans, as data.
+///
+/// The `Disposition` is what the **plan itself** decides, before any action
+/// runs. `Plan::Run` therefore answers `Ignore`: it consumes nothing on its
+/// own, and `resolve::dispose` — which is where `<void>`, `<norepeat>` and the
+/// decline-and-fall-through rule live — has the say. Every other arm is
+/// terminal, so its answer here is final.
+fn plan_effects(plan: &Plan) -> (Disposition, TimerAction) {
+    match plan {
+        // Nothing matched. Godot's own handling proceeds, and a pending
+        // buffer (if any) keeps waiting: a key that resolved to nothing is
+        // not evidence that the prefix was abandoned.
+        Plan::Drop => (Disposition::Ignore, TimerAction::Leave),
+        Plan::Swallow => (Disposition::Consume, TimerAction::Leave),
+        Plan::Arm => (Disposition::Consume, TimerAction::Arm),
+        // Consumed on purpose. A reserved prefix owns its whole subtree:
+        // letting the terminating key through would send it to Tree
+        // incremental search after the prefix has already been destroyed.
+        Plan::Clear => (Disposition::Consume, TimerAction::Stop),
+        // A sequence that completed has already cleared its buffer; stopping
+        // the timer is what keeps a stale timeout from firing into the action
+        // that just ran.
+        Plan::Run(_, _) => (Disposition::Ignore, TimerAction::Stop),
+    }
+}
+
+/// Build the cache key from the five facts a re-sample depends on.
+///
+/// A free function so the field-by-field copy is reachable from a test: every
+/// caller sits behind a `Gd<Viewport>`, so before this existed a component
+/// that stopped being read — `mode: None` being the dangerous one — could not
+/// be caught by anything but review. See
+/// `every_chain_key_component_moves_the_key`.
+fn chain_key(
+    focus: Option<InstanceId>,
+    attached: Option<InstanceId>,
+    mode: Option<vim_core::primitives::Mode>,
+    prompt: Option<InstanceId>,
+    generation: u64,
+) -> ChainKey {
+    ChainKey {
+        focus,
+        attached,
+        mode,
+        prompt,
+        generation,
+    }
+}
+
 /// The sampled chain, and the state it was sampled against.
 ///
 /// `FocusChain::sample` walks the focus owner's ancestors and asks each one
@@ -217,28 +282,26 @@ impl GodotVimCore {
             }
         };
 
+        // The decision is `plan_effects`; this match only performs it. Both
+        // effects are idempotent and act on unrelated objects, so their order
+        // relative to each other is not observable.
+        let (immediate, timer) = plan_effects(&plan);
+        match timer {
+            TimerAction::Leave => {}
+            TimerAction::Arm => self.arm_panel_timer(),
+            TimerAction::Stop => self.stop_panel_timer(),
+        }
         let (candidates, matched) = match plan {
-            Plan::Drop => return,
-            Plan::Swallow => {
-                viewport.set_input_as_handled();
-                return;
-            }
-            Plan::Arm => {
-                self.arm_panel_timer();
-                viewport.set_input_as_handled();
-                return;
-            }
-            Plan::Clear => {
-                self.stop_panel_timer();
-                viewport.set_input_as_handled();
-                return;
-            }
             Plan::Run(candidates, matched) => (candidates, matched),
+            // Every other arm is terminal: `plan_effects` has already said
+            // everything there is to say about the keystroke.
+            Plan::Drop | Plan::Swallow | Plan::Arm | Plan::Clear => {
+                if immediate == Disposition::Consume {
+                    viewport.set_input_as_handled();
+                }
+                return;
+            }
         };
-        // A sequence that completed has already cleared its buffer; stopping
-        // the timer here is what keeps a stale timeout from firing into the
-        // action that just ran.
-        self.stop_panel_timer();
 
         // ── S7/S8: run the plan, then apply its consumption policy ───
         let target = viewport
@@ -373,19 +436,18 @@ impl GodotVimCore {
 
     /// Re-sample the chain if anything a probe reads has changed.
     fn refresh_focus_chain(&mut self, viewport: &Gd<Viewport>) {
-        let key = ChainKey {
-            focus: viewport
+        let key = chain_key(
+            viewport
                 .gui_get_focus_owner()
                 .map(|owner| owner.instance_id()),
-            attached: self
-                .attached_editor
+            self.attached_editor
                 .as_ref()
                 .filter(|e| e.is_instance_valid())
                 .map(Gd::instance_id),
-            mode: self.controller.as_ref().map(VimController::mode),
-            prompt: self.fs_explorer.prompt_instance(),
-            generation: self.bindings.generation,
-        };
+            self.controller.as_ref().map(VimController::mode),
+            self.fs_explorer.prompt_instance(),
+            self.bindings.generation,
+        );
         if self.chain_cache.as_ref().is_none_or(|c| c.key != key) {
             log::trace!("input: resampling focus chain");
             // §5.10 — `pending` clears on focus-owner change and on config
@@ -921,5 +983,255 @@ fn detect_selection_shape(editor: &Gd<CodeEdit>) -> vim_core::primitives::Select
         SelectionShape::Line
     } else {
         SelectionShape::Char
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::bind::{Consumption, Repeat};
+    use crate::actions::surface::{ChainNode, FocusChain};
+    use vim_core::keymap::{Key as VimKey, Modifiers};
+    use vim_core::primitives::Mode;
+
+    // ── What is NOT decidable here ───────────────────────────────────
+    //
+    // Everything below is the *decision* half of the transport. The effect
+    // half stays live-editor-only and is deliberately not faked:
+    //
+    // - that `viewport.set_input_as_handled()` reaches the same viewport the
+    //   keystroke arrived on (`Gd<Viewport>` is unconstructible under
+    //   `cargo test` in a cdylib);
+    // - that `arm_panel_timer` / `stop_panel_timer` drive a real `Timer` node
+    //   at `timeoutlen`;
+    // - that `FocusChain::sample` reads the ancestors Godot actually has, and
+    //   that `refresh_focus_chain` passes the live values into `chain_key`
+    //   rather than a constant — the argument expressions are still review-only,
+    //   which is exactly why they were reduced to five bare reads;
+    // - that `gui_get_focus_owner` answers before Godot has moved focus.
+
+    fn id(n: i64) -> InstanceId {
+        InstanceId::from_i64(n)
+    }
+
+    // ── (a) The chain cache key ──────────────────────────────────────
+
+    #[test]
+    fn every_chain_key_component_moves_the_key() {
+        // The cache is the one piece of shipped state that can silently
+        // MISCLASSIFY: a component that stops being read means a stale chain
+        // is reused, and the answer is wrong rather than merely slow. `mode`
+        // is the sharp one — a mode change does not move the focus owner, so
+        // dropping it leaves `editor.insert` classified as `editor.nav` and
+        // Ctrl+H stops being backspace.
+        let base = chain_key(Some(id(1)), Some(id(2)), Some(Mode::Normal), Some(id(3)), 7);
+        assert_eq!(
+            base,
+            chain_key(Some(id(1)), Some(id(2)), Some(Mode::Normal), Some(id(3)), 7),
+            "the same five facts must produce the same key, or nothing ever hits"
+        );
+
+        let moved = [
+            (
+                "focus",
+                chain_key(Some(id(9)), Some(id(2)), Some(Mode::Normal), Some(id(3)), 7),
+            ),
+            (
+                "attached",
+                chain_key(Some(id(1)), Some(id(9)), Some(Mode::Normal), Some(id(3)), 7),
+            ),
+            (
+                "mode",
+                chain_key(Some(id(1)), Some(id(2)), Some(Mode::Insert), Some(id(3)), 7),
+            ),
+            (
+                "prompt",
+                chain_key(Some(id(1)), Some(id(2)), Some(Mode::Normal), Some(id(9)), 7),
+            ),
+            (
+                "generation",
+                chain_key(Some(id(1)), Some(id(2)), Some(Mode::Normal), Some(id(3)), 8),
+            ),
+        ];
+        for (component, key) in moved {
+            assert_ne!(base, key, "{component} does not move the cache key");
+        }
+    }
+
+    #[test]
+    fn absence_is_a_distinct_key_for_every_component() {
+        // `None` must not collapse onto some other value: no controller, no
+        // attached editor and no prompt are all real states the dispatcher
+        // runs in, and each has to invalidate a key sampled while they existed.
+        let full = chain_key(Some(id(1)), Some(id(2)), Some(Mode::Normal), Some(id(3)), 7);
+        for (component, key) in [
+            (
+                "focus",
+                chain_key(None, Some(id(2)), Some(Mode::Normal), Some(id(3)), 7),
+            ),
+            (
+                "attached",
+                chain_key(Some(id(1)), None, Some(Mode::Normal), Some(id(3)), 7),
+            ),
+            (
+                "mode",
+                chain_key(Some(id(1)), Some(id(2)), None, Some(id(3)), 7),
+            ),
+            (
+                "prompt",
+                chain_key(Some(id(1)), Some(id(2)), Some(Mode::Normal), None, 7),
+            ),
+        ] {
+            assert_ne!(full, key, "{component} losing its value must move the key");
+        }
+    }
+
+    #[test]
+    fn every_focus_chain_field_is_covered_by_a_chain_key_component() {
+        // The totality fence. `FocusChain` is what a re-sample produces, and
+        // `ChainKey` is what decides whether to re-sample; a field added to
+        // the first with no component covering it in the second is a fact that
+        // can change while the cache reports a hit. The exhaustive destructure
+        // below fails to COMPILE when that happens, which is the only way to
+        // force the decision — `every_probe_relevant_fact_moves_the_classification`
+        // looks like it covers this and does not: it asserts each field moves
+        // the CLASSIFICATION and never touches `ChainKey` at all.
+        let FocusChain {
+            nodes,
+            attached_editor,
+            editor_mode,
+            in_filesystem_dock,
+            sibling_nav_control,
+            is_plugin_prompt,
+        } = FocusChain {
+            nodes: vec![ChainNode::new(
+                "Tree",
+                "Tree",
+                id(1),
+                crate::actions::surface::ClassMask::TREE,
+            )],
+            attached_editor: Some(id(2)),
+            editor_mode: Some(Mode::Normal),
+            in_filesystem_dock: true,
+            sibling_nav_control: Some(id(4)),
+            is_plugin_prompt: false,
+        };
+
+        let base = chain_key(Some(id(1)), Some(id(2)), Some(Mode::Normal), Some(id(3)), 7);
+
+        // `nodes` ← `focus`. The whole chain is walked upward from the focus
+        // owner, so a different owner is a different chain by construction.
+        assert!(!nodes.is_empty());
+        assert_ne!(
+            base,
+            chain_key(Some(id(9)), Some(id(2)), Some(Mode::Normal), Some(id(3)), 7)
+        );
+
+        // `attached_editor` ← `attached`. Passed straight into `sample`.
+        assert_eq!(attached_editor, Some(id(2)));
+        assert_ne!(
+            base,
+            chain_key(Some(id(1)), Some(id(9)), Some(Mode::Normal), Some(id(3)), 7)
+        );
+
+        // `editor_mode` ← `mode`. The field that does NOT follow from focus:
+        // typing `i` changes the mode and moves nothing else.
+        assert_eq!(editor_mode, Some(Mode::Normal));
+        assert_ne!(
+            base,
+            chain_key(Some(id(1)), Some(id(2)), Some(Mode::Insert), Some(id(3)), 7)
+        );
+
+        // `in_filesystem_dock` ← `focus`. `is_ancestor_of(focus_owner)`, so it
+        // cannot change while the focus owner stands still.
+        assert!(in_filesystem_dock);
+
+        // `sibling_nav_control` ← `focus`. A depth-20 DFS from the focus
+        // owner, gated on the owner being a `LineEdit`.
+        assert_eq!(sibling_nav_control, Some(id(4)));
+
+        // `is_plugin_prompt` ← `focus` AND `prompt`: instance equality between
+        // the two, so either moving re-samples.
+        assert!(!is_plugin_prompt);
+        assert_ne!(
+            base,
+            chain_key(Some(id(1)), Some(id(2)), Some(Mode::Normal), Some(id(9)), 7)
+        );
+    }
+
+    // ── (b) The five consumption arms ────────────────────────────────
+
+    fn a_candidate() -> Candidate {
+        Candidate {
+            surface: "dock",
+            target: CandidateTarget::Shortcut("filesystem_dock/delete".into()),
+            params: Params::new(),
+            consume: Consumption::Elastic,
+            repeat: Repeat::Allow,
+        }
+    }
+
+    #[test]
+    fn every_plan_declares_its_consumption_and_its_timer_effect() {
+        // The whole consumption contract of the transport, in one table.
+        // Before this existed, deleting `viewport.set_input_as_handled()` from
+        // the `Plan::Clear` arm passed 1416/1416: a dead prefix would leak its
+        // terminating key into Tree incremental search after the prefix had
+        // already been destroyed.
+        let key = KeyEvent::new(VimKey::Char('g'), Modifiers::NONE);
+        let cases = [
+            ("Drop", Plan::Drop, Disposition::Ignore, TimerAction::Leave),
+            (
+                "Swallow",
+                Plan::Swallow,
+                Disposition::Consume,
+                TimerAction::Leave,
+            ),
+            ("Arm", Plan::Arm, Disposition::Consume, TimerAction::Arm),
+            (
+                "Clear",
+                Plan::Clear,
+                Disposition::Consume,
+                TimerAction::Stop,
+            ),
+            (
+                "Run",
+                Plan::Run(vec![a_candidate()], key),
+                Disposition::Ignore,
+                TimerAction::Stop,
+            ),
+        ];
+        for (name, plan, disposition, timer) in cases {
+            assert_eq!(plan_effects(&plan), (disposition, timer), "Plan::{name}");
+        }
+    }
+
+    #[test]
+    fn only_the_echo_arm_leaves_a_pending_prefix_armed() {
+        // The other half of "a held prefix key does not keep its buffer alive
+        // forever": `Swallow` must NOT restart the timer, or an autorepeating
+        // `g` re-arms `timeoutlen` ~20 times a second and the prefix never
+        // times out. `Arm` is the only plan allowed to touch it.
+        for plan in [Plan::Drop, Plan::Swallow] {
+            assert_eq!(plan_effects(&plan).1, TimerAction::Leave);
+        }
+        assert_eq!(plan_effects(&Plan::Arm).1, TimerAction::Arm);
+    }
+
+    #[test]
+    fn a_plan_that_runs_leaves_consumption_to_the_fold() {
+        // `Plan::Run` answering `Consume` here would make `<void>`,
+        // `<norepeat>` and decline-and-fall-through unreachable: `j` at the
+        // end of a list would be eaten instead of reaching Godot.
+        let key = KeyEvent::new(VimKey::Char('j'), Modifiers::NONE);
+        assert_eq!(
+            plan_effects(&Plan::Run(Vec::new(), key)).0,
+            Disposition::Ignore
+        );
+        assert_eq!(
+            plan_effects(&Plan::Run(vec![a_candidate()], key)).0,
+            Disposition::Ignore,
+            "the candidate list must not change the plan's own verdict"
+        );
     }
 }

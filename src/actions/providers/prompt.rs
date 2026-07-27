@@ -2,7 +2,7 @@
 //!
 //! A plugin-owned control, built by `FileSystemExplorer::ensure_prompt` and
 //! parented into the FileSystem dock's own `VBoxContainer`
-//! (`src/navigation/filesystem_explorer.rs:158-192`). Nothing about its
+//! (`src/navigation/filesystem_explorer.rs`). Nothing about its
 //! *class* distinguishes it from any other `LineEdit`; the discriminant is
 //! instance identity, which `FocusChain::is_plugin_prompt` records at sample
 //! time.

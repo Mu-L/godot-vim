@@ -13,12 +13,15 @@
 " :zen :unzen                        Distraction-free mode toggle
 " :mappings                          Open key mapping dialog (GUI)
 " :actionlist [filter]               Discover all available commands
+" :panelmap [keys]                   List / explain panel key bindings
 "
-" ── Navigation (built-in, no config needed) ───────────────────────────────
+" ── Navigation (defaults — rebindable, see Panel Bindings) ────────────────
 " Ctrl-h/j/k/l                       Move focus between panels (spatial)
-" Ctrl-W w / Ctrl-W W                Cycle focus forward / backward
+" Ctrl-W w / Ctrl-W W                Cycle focus (from the script editor)
 " h/j/k/l in docks                   Navigate Tree/ItemList items
-" / in docks                          Jump to search box
+" / in docks                         Jump to search box
+" a/d/r/y/R in FileSystem            Create / delete / rename / yank path / refresh
+" J/K/G/y in Debugger                Next / prev / deepest stack frame, yank row
 " gd                                 Go to definition (LSP)
 " K                                  Hover documentation (LSP)
 
@@ -26,6 +29,66 @@
 " Leader must come before any <Leader> mappings.
 let mapleader = " "
 set timeoutlen=1000
+
+" ══ Panel Bindings (uncomment to change) ══════════════════════════════════
+" Keys OUTSIDE the script editor are a table you can edit: panel focus, dock
+" navigation, the FileSystem dock, the debugger, and the completion popup.
+" Run :panelmap to list every live binding and every line that was rejected.
+" Full grammar: docs/REFERENCE.md#panel-key-bindings-panelmap
+"
+"   panelmap   [<flag> ...] <surface> <keys> <target> [key=value ...]
+"   panelunmap <surface> <keys>
+"
+" Surfaces   panel  dock  dock.filesystem  dock.debugger  searchbox  prompt
+"            editor.nav  editor.completion  unknown
+"            (editor.insert and foreign are barriers and take no bindings)
+"            A deeper surface wins: a rule on dock.filesystem beats the same
+"            key on dock, which beats the same key on panel.
+" Targets    a godotvim.* action id, or `native` to hand the key to Godot.
+" Flags      <physical> also match the US-QWERTY key POSITION — drop it and
+"                       the key dies on Colemak / Dvorak / AZERTY
+"            <void>     consume even when the action declines — drop it and
+"                       the panel chords leak to Godot at the layout's edges
+"            <norepeat> ignore auto-repeat while the key is held
+"            <shift>    also match with Shift held (named keys only)
+"            <nowait>   fire now instead of waiting for a longer sequence
+" Params     count=N (1-100), at most 4 pairs, decimal integers only.
+"
+" Rebinding is panelunmap + panelmap: adding a key never removes the old one.
+"
+" ── Cycle panel focus on Alt+] / Alt+[ ───────────────────────────────────
+"    Ships unbound: Ctrl-W w / Ctrl-W W only cycle from the script editor.
+" panelmap <physical> <void> <norepeat> panel <M-]> godotvim.focus.cycle_next
+" panelmap <physical> <void> <norepeat> panel <M-[> godotvim.focus.cycle_prev
+"
+" ── Panel focus on Alt instead of Ctrl ────────────────────────────────────
+" panelunmap panel <C-h>
+" panelunmap panel <C-j>
+" panelunmap panel <C-k>
+" panelunmap panel <C-l>
+" panelmap <physical> <void> <norepeat> panel <M-h> godotvim.focus.left
+" panelmap <physical> <void> <norepeat> panel <M-j> godotvim.focus.down
+" panelmap <physical> <void> <norepeat> panel <M-k> godotvim.focus.up
+" panelmap <physical> <void> <norepeat> panel <M-l> godotvim.focus.right
+"
+" ── Dock navigation on Colemak's home row ─────────────────────────────────
+" panelunmap dock j
+" panelunmap dock k
+" panelmap <physical> dock n godotvim.item.next
+" panelmap <physical> dock e godotvim.item.prev
+"
+" ── Require dd to delete in the FileSystem dock ───────────────────────────
+" panelunmap dock.filesystem d
+" panelmap <physical> dock.filesystem dd godotvim.fs.delete
+"
+" ── Completion: Ctrl-Y confirms, Ctrl-E dismisses, Tab goes back to Godot ─
+" panelunmap editor.completion <Tab>
+" panelmap editor.completion <C-y> godotvim.completion.confirm
+" panelmap editor.completion <C-e> godotvim.completion.dismiss
+"
+" ── Half-page dock movement ───────────────────────────────────────────────
+" panelmap dock <C-d> godotvim.item.next count=10
+" panelmap dock <C-u> godotvim.item.prev count=10
 
 " ══ Presets (uncomment to enable) ═════════════════════════════════════════
 " Managed by :mappings dialog. Manual edits here are preserved on save.
@@ -91,3 +154,5 @@ set timeoutlen=1000
 " Editor Settings → Plugins → GodotVim   enabled toggle, scrolloff, etc.
 " :mappings                               GUI for managing all key bindings
 " :actionlist                             Discover every available command
+" :panelmap                               List panel bindings + rejected lines
+" :panelmap {keys}                        Explain how one key resolves here

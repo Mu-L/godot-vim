@@ -122,17 +122,32 @@ fn resolve_dock_key(probes: &Probes) -> DockKeyAction {
 }
 
 /// Classify a control into the dock kind whose signal contract it follows.
-pub(crate) fn dock_kind_of(control: &Gd<Control>) -> Option<DockKind> {
-    let node = control.clone().upcast::<Node>();
-    if node.is_class("Tree") {
+///
+/// The pure half, taking the class probe rather than the control. Split out so
+/// that this table and [`crate::actions::caps::Caps::of_control`] — two
+/// hand-maintained lists over the same three widget classes — can be held to
+/// one agreement property without a Godot runtime. A class in one and not the
+/// other manufactures a silent dead key: `Caps` grants `VNAV`, so `:panelmap`
+/// reports `godotvim.item.next` as eligible, and then `dock_kind_of` answers
+/// `None` and the body declines.
+pub(crate) fn dock_kind_for(is_class: impl Fn(&str) -> bool) -> Option<DockKind> {
+    if is_class("Tree") {
         Some(DockKind::Tree)
-    } else if node.is_class("ItemList") {
+    } else if is_class("ItemList") {
         Some(DockKind::ItemList)
-    } else if node.is_class("RichTextLabel") {
+    } else if is_class("RichTextLabel") {
         Some(DockKind::RichTextLabel)
     } else {
         None
     }
+}
+
+/// Classify a focused control into the dock kind whose signal contract it
+/// follows. `Node::is_class` walks the inheritance chain, which is what makes
+/// `FileSystemTree` answer `Tree`.
+pub(crate) fn dock_kind_of(control: &Gd<Control>) -> Option<DockKind> {
+    let node = control.clone().upcast::<Node>();
+    dock_kind_for(|class| node.is_class(class))
 }
 
 /// Resolve a keystroke inside a dock search box.

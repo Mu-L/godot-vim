@@ -400,7 +400,7 @@ pub(crate) fn validate_lhs_key(k: KeyEvent) -> Result<(), LhsError> {
 
 /// The nav modes in which an `editor.*` surface is live.
 ///
-/// Verbatim from `src/plugin/input.rs:118-123` — the modes in which the
+/// Verbatim from `src/plugin/input.rs` — the modes in which the
 /// dispatcher intercepts a panel chord from the attached editor. A grammar
 /// prefix is only dangerous where the shell is allowed to consume, so these
 /// are exactly the modes the guard must ask about.

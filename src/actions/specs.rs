@@ -15,25 +15,30 @@
 use super::action::{ActionCtx, ActionSpec};
 use super::caps::Caps;
 use super::outcome::Outcome;
-use crate::navigation::dock_nav::{
-    handle_hierarchy, handle_navigation, HierarchyAction, NavDirection,
-};
+use crate::navigation::dock_nav::{HierarchyAction, NavDirection};
 use crate::navigation::window::{WindowNavDirection, WindowNavResult};
 
 /// Run a nav executor against the context's target, translating its `bool`
 /// into the tri-state. `false` means "nothing to move to" — the end of a
 /// list — which is a declination, not a failure: the key falls through and
 /// Godot's own handling proceeds.
+///
+/// The target is reached through [`super::action::PanelOps`] rather than as a
+/// `Gd<Control>`, which is what makes the four decisions below — the
+/// direction, the `count` repeat, the break on the first refusal, and the
+/// polarity of the result — assertable without a running editor.
 fn nav(cx: &mut ActionCtx<'_>, direction: NavDirection) -> Outcome {
     let count = cx.params.count();
-    let Some(target) = cx.target().cloned() else {
+    let Some(ops) = cx.panel_ops() else {
         return Outcome::Declined;
     };
     let mut moved = false;
     for _ in 0..count {
-        if handle_navigation(&target, direction, 0) {
+        if ops.nav_step(direction) {
             moved = true;
         } else {
+            // The end of the list. Stopping here rather than retrying is what
+            // keeps `10j` at the bottom of a Tree from spinning ten times.
             break;
         }
     }
@@ -45,10 +50,10 @@ fn nav(cx: &mut ActionCtx<'_>, direction: NavDirection) -> Outcome {
 }
 
 fn hierarchy(cx: &mut ActionCtx<'_>, action: HierarchyAction) -> Outcome {
-    let Some(target) = cx.target().cloned() else {
+    let Some(ops) = cx.panel_ops() else {
         return Outcome::Declined;
     };
-    if handle_hierarchy(&target, action) {
+    if ops.hierarchy_step(action) {
         Outcome::Handled
     } else {
         Outcome::Declined
@@ -124,7 +129,7 @@ pub(crate) static ITEM_ACTIVATE: ActionSpec = ActionSpec {
 // These require NO capability. That is what lets them still fire when there
 // is no focus owner at all — the case the dispatcher must consume for. The
 // `cx.target()` guard below is the verbatim transcription of the old
-// `input.rs:127-130`, where `handle_window_nav` was skipped with no focus
+// `input.rs`, where `handle_window_nav` was skipped with no focus
 // owner and `set_input_as_handled()` fired anyway; `Consumption::Void` on the
 // four `panel` rules supplies the consume that `:132` supplied.
 
@@ -135,20 +140,34 @@ pub(crate) static ITEM_ACTIVATE: ActionSpec = ActionSpec {
 /// gets an elastic rule, and then "no panel that way" must leave the chord to
 /// Godot rather than swallowing it.
 fn focus_dir(cx: &mut ActionCtx<'_>, direction: WindowNavDirection) -> Outcome {
-    let Some(target) = cx.target().cloned() else {
+    let Some(ops) = cx.panel_ops() else {
         return Outcome::Declined;
     };
-    match crate::navigation::handle_window_nav(&target, direction) {
+    outcome_of_nav(ops.move_focus(direction))
+}
+
+/// The `WindowNavResult` → `Outcome` mapping, on its own.
+///
+/// Two arms, and inverting them is not cosmetic: `dispose` branches on
+/// `outcome.is_consumed()`, so a `Focused` reported as `Declined` hands
+/// `<C-h>` back to Godot *after* focus has already moved, and an `Ignored`
+/// reported as `FocusChanged` swallows the chord at the edge of the layout
+/// where the user most expects it to fall through.
+fn outcome_of_nav(result: WindowNavResult) -> Outcome {
+    match result {
         WindowNavResult::Focused => Outcome::FocusChanged,
         WindowNavResult::Ignored => Outcome::Declined,
     }
 }
 
+/// Cycling reports `FocusChanged` unconditionally, and that is a decision
+/// rather than an oversight: `handle_window_nav_action` returns nothing, so
+/// there is no miss to observe, and the chord is `Void` on `panel` anyway.
 fn focus_cycle(cx: &mut ActionCtx<'_>, action: crate::effects::WindowNavAction) -> Outcome {
-    let Some(target) = cx.target().cloned() else {
+    let Some(ops) = cx.panel_ops() else {
         return Outcome::Declined;
     };
-    crate::navigation::handle_window_nav_action(&target, action);
+    ops.cycle_focus(action);
     Outcome::FocusChanged
 }
 
@@ -382,7 +401,269 @@ pub(crate) fn registry() -> super::action::ActionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::action::{is_valid_action_id, ActionCtx, ActionRegistry};
+    use crate::actions::action::{
+        is_valid_action_id, ActionCtx, ActionRegistry, PanelOps, Params, MAX_ACTION_COUNT,
+    };
+
+    // ── The executor bodies, behind the port ─────────────────────────
+    //
+    // Replicating `providers::completion`'s `CompletionOps` + `FakePopup`. The
+    // reason is the same one stated there: the only real `PanelOps` is a
+    // `Gd<Control>`, which cannot be constructed in a `cdylib` under
+    // `cargo test`, so before this fake existed every body below short-circuited
+    // at its `let Some(target) … else { return Declined }` and the tests could
+    // only observe a `Declined` produced for three indistinguishable reasons.
+    // Direction, repeat count, break-on-refusal and outcome polarity were all
+    // freely mutable under a green suite.
+
+    /// A focused control with no Godot in it.
+    ///
+    /// Records the LOG rather than a final state, because the interesting
+    /// failures are "moved twice when asked once" and "moved, then moved back"
+    /// — neither of which a final position can show.
+    #[derive(Debug, Default)]
+    struct FakePanel {
+        /// How many steps the widget has left before it refuses. Refusal is
+        /// the end of a list, which is a declination and not a failure.
+        steps_available: u32,
+        /// Whether expand/collapse finds something to do.
+        hierarchy_ok: bool,
+        /// Whether the cross-panel walk finds a panel that way.
+        focus_found: bool,
+        log: Vec<String>,
+    }
+
+    impl FakePanel {
+        fn with_steps(steps_available: u32) -> Self {
+            Self {
+                steps_available,
+                ..Self::default()
+            }
+        }
+
+        fn hierarchy(hierarchy_ok: bool) -> Self {
+            Self {
+                hierarchy_ok,
+                ..Self::default()
+            }
+        }
+
+        fn focus(focus_found: bool) -> Self {
+            Self {
+                focus_found,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl PanelOps for FakePanel {
+        fn nav_step(&mut self, direction: NavDirection) -> bool {
+            self.log.push(format!("nav({direction:?})"));
+            if self.steps_available == 0 {
+                return false;
+            }
+            self.steps_available -= 1;
+            true
+        }
+
+        fn hierarchy_step(&mut self, action: HierarchyAction) -> bool {
+            self.log.push(format!("hierarchy({action:?})"));
+            self.hierarchy_ok
+        }
+
+        fn move_focus(&mut self, direction: WindowNavDirection) -> WindowNavResult {
+            self.log.push(format!("focus({direction:?})"));
+            if self.focus_found {
+                WindowNavResult::Focused
+            } else {
+                WindowNavResult::Ignored
+            }
+        }
+
+        fn cycle_focus(&mut self, action: crate::effects::WindowNavAction) {
+            self.log.push(format!("cycle({action:?})"));
+        }
+    }
+
+    /// Run one shipped verb against one fake widget.
+    fn run_on(spec: &ActionSpec, panel: &mut FakePanel, params: Params) -> Outcome {
+        let mut cx = ActionCtx::new(None, params).with_panel_ops(panel);
+        (spec.run)(&mut cx)
+    }
+
+    fn with_count(count: i64) -> Params {
+        let mut params = Params::new();
+        params.set_int("count", count);
+        params
+    }
+
+    #[test]
+    fn item_next_and_item_prev_ask_for_opposite_directions() {
+        // The direction is the whole verb. `ITEM_NEXT` walking `Prev` is `j`
+        // moving up, and nothing else in the tree can tell.
+        for (spec, want) in [(&ITEM_NEXT, "nav(Next)"), (&ITEM_PREV, "nav(Prev)")] {
+            let mut panel = FakePanel::with_steps(1);
+            assert_eq!(run_on(spec, &mut panel, Params::new()), Outcome::Handled);
+            assert_eq!(panel.log, vec![want], "{}", spec.id);
+        }
+    }
+
+    #[test]
+    fn a_count_repeats_the_step_exactly_that_many_times() {
+        // `count=` is plumbed from the binding through `Params` and into this
+        // loop, and this is the only place the plumbing is observable: with
+        // `for _ in 0..count` collapsed to `0..1` every other test still passes.
+        let mut panel = FakePanel::with_steps(9);
+        assert_eq!(
+            run_on(&ITEM_NEXT, &mut panel, with_count(3)),
+            Outcome::Handled
+        );
+        assert_eq!(panel.log.len(), 3);
+
+        // …and the clamp that keeps `panelmap dock 9999j` from freezing the
+        // editor is on the same path. The expected count is the literal 100
+        // rather than `MAX_ACTION_COUNT`, so the assertion cannot move with the
+        // constant it is supposed to pin.
+        assert_eq!(MAX_ACTION_COUNT, 100, "the repeat ceiling");
+        let mut panel = FakePanel::with_steps(10_000);
+        assert_eq!(
+            run_on(&ITEM_NEXT, &mut panel, with_count(9_999)),
+            Outcome::Handled
+        );
+        assert_eq!(panel.log.len(), 100);
+    }
+
+    #[test]
+    fn a_repeat_stops_at_the_first_refusal_instead_of_grinding() {
+        // The `break`. Two steps are available and five are asked for: the
+        // widget must be asked three times — two moves and the refusal that
+        // ends the loop — not five.
+        let mut panel = FakePanel::with_steps(2);
+        assert_eq!(
+            run_on(&ITEM_NEXT, &mut panel, with_count(5)),
+            Outcome::Handled
+        );
+        assert_eq!(
+            panel.log.len(),
+            3,
+            "two moves plus the one refusal that stopped it: {:?}",
+            panel.log
+        );
+    }
+
+    #[test]
+    fn moving_reports_handled_and_moving_nowhere_reports_declined() {
+        // The polarity, both ways round. It is not cosmetic: `dispose`
+        // branches on `outcome.is_consumed()`, so inverting this decides
+        // whether `j` at the bottom of a Tree is handed back to Godot or
+        // silently eaten.
+        let mut panel = FakePanel::with_steps(1);
+        assert_eq!(
+            run_on(&ITEM_NEXT, &mut panel, Params::new()),
+            Outcome::Handled
+        );
+
+        let mut panel = FakePanel::with_steps(0);
+        assert_eq!(
+            run_on(&ITEM_NEXT, &mut panel, Params::new()),
+            Outcome::Declined
+        );
+        assert_eq!(panel.log, vec!["nav(Next)"], "it must have asked once");
+    }
+
+    #[test]
+    fn collapse_and_expand_ask_for_opposite_hierarchy_actions() {
+        for (spec, want) in [
+            (&ITEM_COLLAPSE, "hierarchy(Collapse)"),
+            (&ITEM_EXPAND, "hierarchy(Expand)"),
+        ] {
+            let mut panel = FakePanel::hierarchy(true);
+            assert_eq!(run_on(spec, &mut panel, Params::new()), Outcome::Handled);
+            assert_eq!(panel.log, vec![want], "{}", spec.id);
+
+            let mut panel = FakePanel::hierarchy(false);
+            assert_eq!(
+                run_on(spec, &mut panel, Params::new()),
+                Outcome::Declined,
+                "{} must decline when there is nothing to fold",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn hierarchy_deliberately_ignores_the_repeat_count() {
+        // `3h` is not "collapse three levels": each collapse also moves the
+        // selection, so repeating would walk the tree rather than fold it.
+        // Pinned so the asymmetry with `nav` reads as a decision.
+        let mut panel = FakePanel::hierarchy(true);
+        assert_eq!(
+            run_on(&ITEM_COLLAPSE, &mut panel, with_count(3)),
+            Outcome::Handled
+        );
+        assert_eq!(panel.log.len(), 1);
+    }
+
+    #[test]
+    fn each_focus_verb_asks_for_its_own_direction() {
+        for (spec, want) in [
+            (&FOCUS_LEFT, "focus(Left)"),
+            (&FOCUS_RIGHT, "focus(Right)"),
+            (&FOCUS_UP, "focus(Up)"),
+            (&FOCUS_DOWN, "focus(Down)"),
+        ] {
+            let mut panel = FakePanel::focus(true);
+            assert_eq!(
+                run_on(spec, &mut panel, Params::new()),
+                Outcome::FocusChanged,
+                "{}",
+                spec.id
+            );
+            assert_eq!(panel.log, vec![want], "{}", spec.id);
+        }
+    }
+
+    #[test]
+    fn the_window_nav_result_mapping_holds_in_both_directions() {
+        // Two arms and both are load-bearing. `Focused` → `Declined` hands the
+        // chord back to Godot after focus has already moved; `Ignored` →
+        // `FocusChanged` swallows it at the edge of the layout, where a user
+        // most expects `<C-h>` to fall through.
+        assert_eq!(
+            outcome_of_nav(WindowNavResult::Focused),
+            Outcome::FocusChanged
+        );
+        assert_eq!(outcome_of_nav(WindowNavResult::Ignored), Outcome::Declined);
+
+        // …and through a real verb, so the mapping cannot be right here and
+        // bypassed there.
+        let mut panel = FakePanel::focus(false);
+        assert_eq!(
+            run_on(&FOCUS_LEFT, &mut panel, Params::new()),
+            Outcome::Declined
+        );
+    }
+
+    #[test]
+    fn each_cycle_verb_carries_its_own_action_and_always_consumes() {
+        use crate::effects::WindowNavAction;
+        for (spec, want) in [
+            (&FOCUS_CYCLE_NEXT, "cycle(CycleNext)"),
+            (&FOCUS_CYCLE_PREV, "cycle(CyclePrev)"),
+        ] {
+            let mut panel = FakePanel::default();
+            assert_eq!(
+                run_on(spec, &mut panel, Params::new()),
+                Outcome::FocusChanged,
+                "{}",
+                spec.id
+            );
+            assert_eq!(panel.log, vec![want], "{}", spec.id);
+        }
+        // Named rather than inferred: the fake's log is a `Debug` rendering,
+        // so a rename of the enum variant would otherwise silently pass.
+        assert_eq!(format!("{:?}", WindowNavAction::CycleNext), "CycleNext");
+    }
 
     #[test]
     fn every_shipped_id_is_well_formed() {
@@ -565,6 +846,13 @@ mod tests {
         // "consume the key AND report success" — which would destroy the
         // keystroke and do nothing.
         //
+        // This asserts the GUARD and nothing past it. It used to be the only
+        // test that ran these bodies at all, which made it read as coverage it
+        // never had: with no `PanelOps` to lend, every one of them returned
+        // `Declined` before reading its own direction. What each body then does
+        // is asserted against `FakePanel` at the top of this module; this row
+        // is the `None` case only.
+        //
         // `Consumption::Void` is what still consumes there; the action's
         // honesty and the rule's policy are two separate decisions, and this
         // asserts the first.
@@ -612,6 +900,63 @@ mod tests {
         assert_eq!(r.run(bogus, &mut cx), Outcome::Declined);
     }
 
+    /// `host_invocable` for **every** registered verb, spelled out.
+    ///
+    /// Exhaustive rather than a spot check, and that is the whole point: the
+    /// four-name version of this test left ~15 of ~29 specs unpinned, so
+    /// flipping `godotvim.focus.editor`'s `host_invocable` to `false` passed
+    /// the suite while `:action godotvim.focus.editor` started failing loudly
+    /// for a user. It is a hand-written table rather than a derived one for
+    /// the same reason `PROVIDERS` is an array: a new verb must arrive with a
+    /// *decision*, and a decision nobody wrote down is not one.
+    ///
+    /// The rule: `true` iff the body can locate its own target. `Caps` says
+    /// nothing about it — `godotvim.dock.search` requires no capability and is
+    /// still `false`, because it needs a focused control to run the sibling
+    /// DFS from.
+    const HOST_INVOCABLE: &[(&str, bool)] = &[
+        // Item navigation — every one needs a focused control.
+        ("godotvim.item.next", false),
+        ("godotvim.item.prev", false),
+        ("godotvim.item.collapse", false),
+        ("godotvim.item.expand", false),
+        ("godotvim.item.activate", false),
+        // Cross-panel focus — `handle_window_nav` walks from the target, and
+        // `focus.editor` locates the script editor with no target at all.
+        ("godotvim.focus.left", true),
+        ("godotvim.focus.right", true),
+        ("godotvim.focus.up", true),
+        ("godotvim.focus.down", true),
+        ("godotvim.focus.cycle_next", true),
+        ("godotvim.focus.cycle_prev", true),
+        ("godotvim.focus.editor", true),
+        // Filter box — both need the focused control they operate on.
+        ("godotvim.dock.search", false),
+        ("godotvim.search.accept", false),
+        // FileSystem — each reaches `EditorInterface::singleton()` or the
+        // dock's own selection, so `:action godotvim.fs.refresh` works from
+        // the editor. `create` is the boundary case: it needs a target for
+        // the directory but declines rather than half-running without one.
+        ("godotvim.fs.create", true),
+        ("godotvim.fs.delete", true),
+        ("godotvim.fs.rename", true),
+        ("godotvim.fs.yank_path", true),
+        ("godotvim.fs.refresh", true),
+        // Completion — meaningless without the popup, which only the
+        // `gui_input` transport lends.
+        ("godotvim.completion.trigger", false),
+        ("godotvim.completion.next", false),
+        ("godotvim.completion.prev", false),
+        ("godotvim.completion.confirm", false),
+        ("godotvim.completion.dismiss", false),
+        ("godotvim.completion.navigate", false),
+        // Debugger — meaningless without a focused debugger tree.
+        ("godotvim.debugger.frame_next", false),
+        ("godotvim.debugger.frame_prev", false),
+        ("godotvim.debugger.frame_last", false),
+        ("godotvim.debugger.yank_frame", false),
+    ];
+
     #[test]
     fn only_self_locating_actions_are_host_invocable() {
         // `:action godotvim.fs.create` works from anywhere because the FS
@@ -619,15 +964,34 @@ mod tests {
         // it needs a focused control — so a host request must fail loudly
         // rather than decline invisibly.
         let r = registry();
-        for (name, want) in [
-            ("godotvim.fs.create", true),
-            ("godotvim.focus.left", true),
-            ("godotvim.item.next", false),
-            ("godotvim.dock.search", false),
-        ] {
-            let spec = r.get(r.id_of(name).unwrap()).unwrap();
-            assert_eq!(spec.host_invocable, want, "{name}");
+        for (name, want) in HOST_INVOCABLE {
+            let id = r
+                .id_of(name)
+                .unwrap_or_else(|| panic!("{name} is not registered"));
+            let spec = r.get(id).unwrap();
+            assert_eq!(spec.host_invocable, *want, "{name}");
         }
+    }
+
+    #[test]
+    fn the_host_invocable_table_covers_every_registered_verb() {
+        // The half that makes the table above exhaustive rather than merely
+        // long: a verb added to `SHIPPED` or to a `Provider::actions` table
+        // without a line up there fails here, so "spot-checked" cannot quietly
+        // come back.
+        let mut listed: Vec<&str> = HOST_INVOCABLE.iter().map(|(name, _)| *name).collect();
+        listed.sort_unstable();
+        let before = listed.len();
+        listed.dedup();
+        assert_eq!(before, listed.len(), "duplicate entry in HOST_INVOCABLE");
+
+        // Read off the REGISTRY rather than off `SHIPPED`, so the union of the
+        // two registration points is what the table is held against — a
+        // provider verb reaching the registry and not this table is exactly
+        // the hole the four-name version had.
+        let mut registered: Vec<&str> = registry().iter().map(|(_, spec)| spec.id).collect();
+        registered.sort_unstable();
+        assert_eq!(listed, registered);
     }
 
     #[test]

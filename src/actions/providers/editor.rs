@@ -3,7 +3,7 @@
 //! One surface would not do. The same widget must be a *navigable* place where
 //! Ctrl+hjkl moves between panels, and an *insert-like* place where Ctrl+H is
 //! backspace and Ctrl+J is a newline. Today that split is a mode test inside
-//! `should_intercept_hjkl` (`src/plugin/input.rs:112-147`); here it is two
+//! `should_intercept_hjkl` (`src/plugin/input.rs`); here it is two
 //! surfaces with different seals, and the dispatcher never mentions a mode.
 //!
 //! # Why `editor.insert` is written as a negation
@@ -29,7 +29,7 @@ use super::Provider;
 
 /// The modes in which panel navigation wins over the engine.
 ///
-/// Verbatim from `src/plugin/input.rs:118-123`. `Select` is deliberately
+/// Verbatim from `src/plugin/input.rs`. `Select` is deliberately
 /// **excluded**: it is insert-like, so Ctrl+H/J/K/L must reach the engine.
 const fn is_nav_mode(mode: Mode) -> bool {
     matches!(
@@ -44,7 +44,7 @@ pub(crate) static EDITOR_NAV: SurfaceSpec = SurfaceSpec {
     seal: Seal::Open,
     grants: |_| Caps::empty(),
     // `editor_mode == None` maps HERE, not to the barrier: the `is_none_or` at
-    // input.rs:116 makes "no controller attached" mean INTERCEPT.
+    // input.rs makes "no controller attached" mean INTERCEPT.
     probe: |chain| {
         (chain.attached_editor_focused() && chain.editor_mode.is_none_or(is_nav_mode))
             .then_some(Anchor::Node(0))
@@ -60,7 +60,7 @@ pub(crate) static EDITOR_NAV: SurfaceSpec = SurfaceSpec {
     // parent IS `panel`, so without this flag a Dvorak `Ctrl+d` would reach
     // `panel <C-h>` by position and become panel-left instead of half-page
     // down. Verbatim transcription of the `resolve_panel_key_typed` branch at
-    // `src/plugin/input.rs:151-155`.
+    // `src/plugin/input.rs`.
     refuses_positional: true,
 };
 
@@ -174,7 +174,7 @@ mod tests {
     fn select_mode_is_insert_like() {
         // Called out on its own because it is the one that reads wrong: Select
         // is a *visual* mode in Vim's taxonomy but typing replaces the
-        // selection, so Ctrl+H must reach the engine. input.rs:124-126 says so
+        // selection, so Ctrl+H must reach the engine. input.rs says so
         // in a comment; here it is a test.
         for vt in [VisualType::Char, VisualType::Line, VisualType::Block] {
             assert_eq!(
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn no_controller_means_intercept() {
-        // The `is_none_or` polarity at input.rs:116. A CodeEdit we are
+        // The `is_none_or` polarity at input.rs. A CodeEdit we are
         // attached to but have no controller for is still navigable, or
         // Ctrl+hjkl would break during attach.
         assert_eq!((EDITOR_NAV.probe)(&editor(None)), Some(Anchor::Node(0)));
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn a_code_edit_that_is_not_ours_is_neither() {
         // It falls through to `foreign`. Attachment is instance identity, not
-        // class identity — the split at focus.rs:50-58.
+        // class identity — the split at focus.rs.
         let theirs = FocusChain {
             nodes: vec![code_edit(9)],
             attached_editor: Some(id(ATTACHED)),

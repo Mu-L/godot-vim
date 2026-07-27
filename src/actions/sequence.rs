@@ -524,9 +524,26 @@ mod tests {
         is_echo: bool,
     ) -> SeqStep {
         let probes = Probes::from_slice(&[key]);
+        press_probes(pending, index, registry, path, &probes, is_echo)
+    }
+
+    /// Feed one keystroke carrying its **whole** probe list.
+    ///
+    /// Every other helper here builds a one-probe list, which is the US-layout
+    /// case and only that case. A real keystroke on Cyrillic, Greek or any
+    /// `:set langmap` layout arrives with two or three interpretations, and the
+    /// sequence layer's two-pass walk exists entirely for them.
+    fn press_probes(
+        pending: &mut Pending,
+        index: &BindingIndex,
+        registry: &ActionRegistry,
+        path: &SurfacePath,
+        probes: &Probes,
+        is_echo: bool,
+    ) -> SeqStep {
         pending.step(
             &ResolveInput {
-                probes: &probes,
+                probes,
                 path,
                 index,
                 registry,
@@ -534,6 +551,30 @@ mod tests {
             },
             is_echo,
         )
+    }
+
+    /// A rule installed through [`BindingIndex::upsert`], the primitive
+    /// underneath `try_insert`.
+    ///
+    /// Bypassing the gate is the point: `try_insert` refuses a multi-key LHS on
+    /// every editor-reachable surface, so a reservation on `panel` — the state
+    /// the seal has to be tested against — is unreachable through the parser by
+    /// design. What is installed is a real rule: same trie, same slot table,
+    /// same `is_reserved`.
+    fn seq_rule(surface: SurfaceId, lhs: &[KeyEvent], action: &str) -> Rule {
+        Rule {
+            surface,
+            lhs: lhs.to_vec(),
+            target: RuleTarget::Action(registry().id_of(action).expect("registered")),
+            params: Params::new(),
+            consume: Consumption::Elastic,
+            repeat: Repeat::Allow,
+            physical: false,
+            shift_tolerant: false,
+            nowait: false,
+            owner: MappingOwner::User,
+            desc: "test".into(),
+        }
     }
 
     fn ran(step: &SeqStep) -> Option<&'static str> {
@@ -728,19 +769,157 @@ mod tests {
 
     #[test]
     fn a_sealed_anchor_still_swallows_a_bare_key_before_a_parent_reservation() {
-        // `panel` cannot hold a multi-key rule (it is editor-reachable), so
-        // the reservation goes on `searchbox` itself; what this pins is that
-        // the seal is honoured on the way UP, exactly as the resolver honours
-        // it — a reservation on a parent must not claim a character the filter
-        // box is entitled to.
-        let index = index_with("panelmap dock gg godotvim.item.next");
+        // The seal, honoured on the way UP, exactly as `resolve` honours it:
+        // a reservation on a PARENT must not claim a character the filter box
+        // is entitled to.
+        //
+        // The reservation is on `panel`, which is on the searchbox path and
+        // above the seal — the only arrangement that tests the seal at all.
+        // The previous version of this test put its rule on `dock`, which is
+        // not on the searchbox path, and said so in its own comment: it
+        // asserted that an absent rule does not fire, and passed with the seal
+        // removed entirely.
+        let mut index = builtin_index(&registry());
+        index.upsert(seq_rule(
+            "panel",
+            &[ch('g'), ch('g')],
+            "godotvim.focus.left",
+        ));
+        index.upsert(seq_rule(
+            "panel",
+            &[ctrl('x'), ctrl('f')],
+            "godotvim.focus.left",
+        ));
         let reg = registry();
         let search = path("searchbox", Caps::TEXTENTRY);
+        assert!(
+            index.is_reserved("panel", ch('g')) && index.is_reserved("panel", ctrl('x')),
+            "the fixture must really reserve both, or this test proves nothing"
+        );
+
         let mut pending = Pending::default();
         assert_eq!(
             press(&mut pending, &index, &reg, &search, ch('g')),
             SeqStep::Passthrough,
-            "`dock` is not on the searchbox path and nothing else reserves g"
+            "a sealed anchor swallows a bare key before the parent is consulted"
+        );
+        assert!(!pending.is_active(), "…and must open no buffer");
+        assert!(pending.keys().is_empty());
+
+        // The mirror, and what makes the half above a claim about the SEAL
+        // rather than about an empty path: a command chord continues past the
+        // anchor to `panel`, where the same kind of reservation is honoured.
+        let mut pending = Pending::default();
+        assert_eq!(
+            press(&mut pending, &index, &reg, &search, ctrl('x')),
+            SeqStep::Buffered,
+            "Ctrl continues past the seal"
+        );
+        assert_eq!(pending.surface(), Some("panel"));
+    }
+
+    // ── Multi-probe keystrokes (non-QWERTY layouts) ──────────────────
+
+    #[test]
+    fn a_lower_priority_probe_continues_a_sequence_the_first_probe_cannot() {
+        // The sequence analogue of `the_editor_still_gets_the_latin_probe`,
+        // and the NORMAL case for every Cyrillic/Greek user and everyone with
+        // `:set langmap`: probe 1 is the character they typed, probe 2 its
+        // Latin collapse. `try_continue` must un-push a probe the trie
+        // rejected, or the buffer becomes `[g, <typed>, j]`, the sequence dies
+        // as a dead prefix, and the key is consumed anyway.
+        let reg = registry();
+        let p = path("dock", TREE);
+        let probes = Probes::from_slice(&[ch('x'), ch('j')]);
+
+        // (i) the second probe COMPLETES the sequence.
+        let index = index_with("panelmap dock gj godotvim.item.next");
+        let mut pending = Pending::default();
+        assert_eq!(
+            press(&mut pending, &index, &reg, &p, ch('g')),
+            SeqStep::Buffered
+        );
+        let step = press_probes(&mut pending, &index, &reg, &p, &probes, false);
+        assert_eq!(ran(&step), Some("godotvim.item.next"));
+        assert!(!pending.is_active());
+
+        // (ii) the second probe EXTENDS it, which makes the buffer itself
+        // observable: exactly the two keys that matched, with the rejected
+        // probe gone rather than buried in the middle.
+        let index = index_with("panelmap dock gjj godotvim.item.prev");
+        let mut pending = Pending::default();
+        press(&mut pending, &index, &reg, &p, ch('g'));
+        assert_eq!(
+            press_probes(&mut pending, &index, &reg, &p, &probes, false),
+            SeqStep::Buffered
+        );
+        assert_eq!(pending.keys(), &[ch('g'), ch('j')]);
+    }
+
+    // ── `<physical>` scoping, both passes ────────────────────────────
+
+    #[test]
+    fn a_positional_guess_opens_a_buffer_only_where_a_rule_asked_for_one() {
+        // Probe 3 is a guess about where the key sits on a US keyboard, and
+        // `<physical>` is how an individual rule opts into being reached by
+        // it. `has_physical_rule` is the cheap bail-out ahead of the scan and
+        // nothing more: reading it alone would let one unrelated physical rule
+        // re-open the positional guess for every sequence on the surface.
+        let reg = registry();
+        let p = path("dock", TREE);
+        // Probe 1 is what was typed and reserves nothing; probe 2 is the
+        // US-QWERTY position, which the fixture reserves.
+        let probes = Probes::from_slice_positional(&[ch('q'), ch('g')]);
+
+        let plain = index_with("panelmap dock gg godotvim.item.next");
+        assert!(
+            plain.has_physical_rule("dock"),
+            "the shipped dock keyset carries <physical>, so the bail-out is \
+             open and the per-rule scan is the only thing deciding"
+        );
+        let mut pending = Pending::default();
+        assert_eq!(
+            press_probes(&mut pending, &plain, &reg, &p, &probes, false),
+            SeqStep::Passthrough,
+            "`gg` did not ask to be reachable by position"
+        );
+        assert!(!pending.is_active());
+
+        // The same keystroke against a rule that did ask.
+        let physical = index_with("panelmap <physical> dock gg godotvim.item.next");
+        let mut pending = Pending::default();
+        assert_eq!(
+            press_probes(&mut pending, &physical, &reg, &p, &probes, false),
+            SeqStep::Buffered
+        );
+        assert_eq!(pending.keys(), &[ch('g')]);
+        assert_eq!(pending.surface(), Some("dock"));
+    }
+
+    #[test]
+    fn a_positional_guess_continues_a_sequence_only_where_the_continuation_asked() {
+        // The same scoping one level in, on `extend`. The surface carries a
+        // `<physical>` rule (`zz`) so the bail-out passes, but the
+        // continuation the guess would take (`gg`) does not — and it is the
+        // continuation that decides.
+        let index = index_with(
+            "panelmap <physical> dock zz godotvim.item.next\n\
+             panelmap dock gg godotvim.item.prev",
+        );
+        let reg = registry();
+        let p = path("dock", TREE);
+        assert!(index.has_physical_rule("dock"), "the bail-out must be open");
+
+        let mut pending = Pending::default();
+        assert_eq!(
+            press(&mut pending, &index, &reg, &p, ch('g')),
+            SeqStep::Buffered
+        );
+        let probes = Probes::from_slice_positional(&[ch('q'), ch('g')]);
+        assert_eq!(
+            press_probes(&mut pending, &index, &reg, &p, &probes, false),
+            SeqStep::DeadPrefix("dock"),
+            "`gg` is not <physical>, so the guess must not complete it"
         );
         assert!(!pending.is_active());
     }

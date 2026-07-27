@@ -148,6 +148,63 @@ mod tests {
         assert_eq!(Caps::of_control(classes(&["GraphEdit"])), Caps::empty());
     }
 
+    /// Every class name either table names, plus the subclasses the editor
+    /// really produces and a control that is in neither.
+    ///
+    /// Written out rather than derived, because deriving it from one of the
+    /// two tables would make the agreement test read that table twice.
+    const SHARED_CLASSES: &[&[&str]] = &[
+        &["Tree"],
+        &["ItemList"],
+        &["RichTextLabel"],
+        &["FileSystemTree", "Tree"],
+        &["FileSystemList", "ItemList"],
+        &["SceneTreeEditor", "Tree"],
+        &["EditorLog", "RichTextLabel"],
+        &["LineEdit"],
+        &["TextEdit"],
+        &["CodeEdit", "TextEdit"],
+        &["Button"],
+        &["GraphEdit"],
+    ];
+
+    #[test]
+    fn granting_vnav_and_having_a_dock_kind_are_the_same_question() {
+        // Two hand-maintained class tables over Tree/ItemList/RichTextLabel,
+        // in two modules, with nothing pinning their agreement. A fourth class
+        // added to `Caps::of_control` and not to `dock_kind_of` manufactures a
+        // SILENT DEAD KEY: the surface grants VNAV, so the resolver admits
+        // `godotvim.item.next` and `:panelmap` reports it eligible, and then
+        // `handle_navigation` has no signal contract to drive and the body
+        // declines. Added to the other table only, the mirror: the widget
+        // navigates but no rule can ever reach it.
+        for names in SHARED_CLASSES {
+            let is_class = |q: &str| names.contains(&q);
+            let vnav = Caps::of_control(is_class).satisfies(Caps::VNAV);
+            let kind = crate::navigation::dock::dock_kind_for(is_class);
+            assert_eq!(
+                vnav,
+                kind.is_some(),
+                "{names:?}: Caps grants VNAV={vnav} but dock_kind_of answers {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_tables_agree_on_which_kind_carries_hierarchy() {
+        // The narrower half of the same property. `HIERARCHY` is what makes
+        // `h`/`l` live, and it is `Tree` and nothing else on both sides — an
+        // `ItemList` that grew HIERARCHY here would send `godotvim.item.expand`
+        // into `handle_hierarchy` with no tree to expand.
+        use crate::navigation::dock::DockKind;
+        for names in SHARED_CLASSES {
+            let is_class = |q: &str| names.contains(&q);
+            let hierarchy = Caps::of_control(is_class).satisfies(Caps::HIERARCHY);
+            let is_tree = crate::navigation::dock::dock_kind_for(is_class) == Some(DockKind::Tree);
+            assert_eq!(hierarchy, is_tree, "{names:?}");
+        }
+    }
+
     #[test]
     fn requiring_nothing_is_satisfied_by_anything() {
         // Cross-panel focus movement requires no capability, which is how it

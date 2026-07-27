@@ -90,6 +90,27 @@ impl FileSystemExplorer {
         }
     }
 
+    /// Whether a create prompt is live. Test-only.
+    ///
+    /// The one bit of `on_key_tick`'s work that is observable without a Godot
+    /// runtime: every other effect it has runs behind an `is_instance_valid`
+    /// guard on a `Gd<T>` that cannot exist under `cargo test`. Exposed so the
+    /// `dock.filesystem` `on_key` WIRING can be pinned — see
+    /// `providers::filesystem`.
+    #[cfg(test)]
+    pub(crate) fn prompt_is_live(&self) -> bool {
+        !matches!(self.prompt_mode, PromptMode::Inactive)
+    }
+
+    /// Put the explorer in the state `on_key_tick` exists to clean up: a
+    /// create prompt left open while focus moved back to the Tree. Test-only.
+    #[cfg(test)]
+    pub(crate) fn arm_stale_prompt(&mut self) {
+        self.prompt_mode = PromptMode::Create {
+            target_dir: String::from("res://"),
+        };
+    }
+
     /// The prompt `LineEdit`'s instance id, when one exists and is live.
     ///
     /// Fed to [`crate::actions::surface::FocusChain::sample`] so the `prompt`
