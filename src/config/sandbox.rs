@@ -91,6 +91,19 @@ pub(crate) fn sandbox_config_text(text: &str) -> String {
                 output.push_str(line);
                 output.push('\n');
             }
+        } else if crate::config::panelmap::is_panel_line(trimmed) {
+            if panel_line_is_safe(trimmed) {
+                output.push_str(line);
+                output.push('\n');
+            } else {
+                log::warn!(
+                    "sandbox: stripped panel binding from project vimrc: {}",
+                    trimmed
+                );
+                output.push_str("\" [sandbox] stripped: ");
+                output.push_str(trimmed);
+                output.push('\n');
+            }
         } else {
             log::warn!(
                 "sandbox: stripped unrecognized line from project vimrc: {}",
@@ -144,6 +157,37 @@ fn extract_option_name_from_token(token: &str) -> &str {
 }
 
 /// Whitelist check for non-mapping lines that are safe to pass through.
+/// Whether a `panelmap` / `panelunmap` line is safe to honour from a
+/// project-level vimrc, which is committed and therefore attacker-supplied.
+///
+/// The parser is the arbiter, not a regex: a line that does not parse is not
+/// safe, because "unparseable" and "harmless" are different claims.
+///
+/// The rule is about the RIGHT-hand side, and it holds because that side is a
+/// **closed vocabulary**:
+///
+/// - `Action(id)` — a registered action id plus integer-only params. It
+///   cannot expand into `:!`, `:source`, or a recursive mapping chain, which
+///   is precisely why this module strips recursive maps unconditionally. An
+///   unregistered id is rejected at load, so the worst case is a dead key.
+/// - `native` — the give-back. Legal at EVERY trust tier because it can only
+///   *reduce* what the plugin consumes; a hostile project can at most hand
+///   keys back to Godot.
+/// - `<Shortcut>(path)` — DENIED here. It invokes an arbitrary Godot editor
+///   command by name: an open vocabulary, and outside anything this plugin
+///   can reason about.
+///
+/// `panelunmap` is always safe — it can only remove a binding.
+fn panel_line_is_safe(trimmed: &str) -> bool {
+    use crate::config::panelmap::{parse_panel_line, PanelLine, TargetSpec};
+    match parse_panel_line(trimmed) {
+        Ok(Some(PanelLine::Unmap { .. })) => true,
+        Ok(Some(PanelLine::Map(ref m))) => !matches!(m.target, TargetSpec::Shortcut(_)),
+        // Anything that fails to parse is stripped rather than trusted.
+        Ok(None) | Err(_) => false,
+    }
+}
+
 fn is_safe_non_mapping_line(trimmed: &str) -> bool {
     if trimmed.is_empty() {
         return true;
@@ -1057,5 +1101,98 @@ imap jj <Esc>
             "uppercase SET with multi-option blocked should be stripped, got: {}",
             output
         );
+    }
+
+    // ── panelmap trust tiers (P7) ────────────────────────────────────
+
+    fn sandboxed(text: &str) -> String {
+        apply_vimrc_policy(text, true, crate::settings::ProjectVimrc::Sandbox).unwrap_or_default()
+    }
+
+    #[test]
+    fn an_action_binding_survives_a_project_vimrc() {
+        // The RHS is a closed vocabulary — a registered action id plus
+        // integer-only params — so it cannot expand into `:!`, `:source`, or
+        // a recursive chain. That is the entire justification for letting it
+        // through where recursive maps are stripped unconditionally.
+        let out = sandboxed("panelmap dock n godotvim.item.next\n");
+        assert!(out.contains("panelmap dock n godotvim.item.next"), "{out}");
+    }
+
+    #[test]
+    fn a_give_back_survives_at_every_tier() {
+        // `native` can only REDUCE what the plugin consumes, so a hostile
+        // project can at most hand keys back to Godot.
+        let out = sandboxed("panelmap dock j native\n");
+        assert!(out.contains("panelmap dock j native"), "{out}");
+    }
+
+    #[test]
+    fn an_unmap_survives_at_every_tier() {
+        let out = sandboxed("panelunmap dock j\n");
+        assert!(out.contains("panelunmap dock j"), "{out}");
+    }
+
+    #[test]
+    fn a_shortcut_target_is_stripped_from_a_project_vimrc() {
+        // `<Shortcut>(path)` invokes an arbitrary Godot editor command by
+        // name — an open vocabulary, outside anything this plugin can reason
+        // about. Denied at project tier.
+        let out = sandboxed("panelmap dock d <Shortcut>(filesystem_dock/delete)\n");
+        // Stripped means commented out with a reason, not deleted — the user
+        // can see what happened and why, which a silent drop would deny them.
+        assert!(out.contains("[sandbox] stripped"), "must say why: {out}");
+        assert!(
+            out.lines().all(|l| !l.starts_with("panelmap")),
+            "no live panelmap line may survive: {out}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_panel_line_is_stripped_not_trusted() {
+        // "does not parse" and "is harmless" are different claims.
+        let out = sandboxed("panelmap dock\n");
+        assert!(!out.contains("\npanelmap dock\n"), "{out}");
+    }
+
+    #[test]
+    fn a_trusted_vimrc_keeps_shortcut_targets() {
+        let out = apply_vimrc_policy(
+            "panelmap dock d <Shortcut>(filesystem_dock/delete)\n",
+            true,
+            crate::settings::ProjectVimrc::Trusted,
+        )
+        .unwrap_or_default();
+        assert!(out.contains("<Shortcut>"), "{out}");
+    }
+
+    #[test]
+    fn a_user_level_vimrc_is_never_sandboxed() {
+        // user:// is outside any repository, so it is the user's own machine.
+        let out = apply_vimrc_policy(
+            "panelmap dock d <Shortcut>(filesystem_dock/delete)\n",
+            false,
+            crate::settings::ProjectVimrc::Sandbox,
+        )
+        .unwrap_or_default();
+        assert!(out.contains("<Shortcut>"), "{out}");
+    }
+
+    #[test]
+    fn the_security_model_is_not_reachable_from_a_vimrc_at_all() {
+        // A `set` line that turned off the Foreign hard stop from a cloned
+        // project would be a real hole. It is closed by construction rather
+        // than by a denylist: no shipped option names a dispatcher guard, so
+        // there is nothing for a project vimrc to set. This test fails the
+        // day someone adds one.
+        let guard_words = ["navsafety", "panelsafety", "foreignstop", "barrier"];
+        let settings_src = include_str!("../settings/keys.rs");
+        for word in guard_words {
+            assert!(
+                !settings_src.contains(word),
+                "'{word}' became a setting — it must live in EditorSettings, \
+                 which res:// cannot reach, not in a vimrc-settable option"
+            );
+        }
     }
 }

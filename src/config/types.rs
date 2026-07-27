@@ -149,7 +149,13 @@ pub(crate) struct ParsedMapping {
 /// Boxed payload for [`ConfigLine::Mapping`]. Without boxing, the Mapping
 /// variant (~89 bytes) would inflate all other ConfigLine variants to the
 /// same size.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq` exist for the document-level round-trip property
+/// (`parse_config(serialize(&doc)) == doc`), which is the only formulation
+/// strong enough to see a line that lost its identity — a text-level fixpoint
+/// passes just as happily when a panel line has degraded to a `Comment`,
+/// because a `Comment` stores and re-emits its raw text verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MappingPayload {
     /// `Some` for preset-managed mappings; `None` for user-defined.
     pub(crate) preset_id: Option<String>,
@@ -157,12 +163,30 @@ pub(crate) struct MappingPayload {
     pub(crate) parsed: ParsedMapping,
 }
 
+/// Boxed payload for [`ConfigLine::PanelMap`], for the same size reason.
+///
+/// Holds the **parse**, not the source text: the writer re-renders through
+/// [`super::panelmap::render`], so a stored panel line that is not actually a
+/// panel line cannot survive a round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PanelPayload {
+    /// `false` for a `" disabled: panelmap …` line, which the Mapping Dialog
+    /// writes when a rule is toggled off. Panel rules are never
+    /// preset-managed, so there is no `preset_id` here.
+    pub(crate) enabled: bool,
+    pub(crate) parsed: super::panelmap::PanelLine,
+}
+
 /// A single line in the config file, preserving structure for roundtrip.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfigLine {
     Comment(String),
     BlankLine,
     Mapping(Box<MappingPayload>),
+    /// A `panelmap` / `panelunmap` directive. Distinct from [`Self::Other`]
+    /// so a disabled panel line round-trips as a panel line rather than
+    /// decaying into a comment.
+    PanelMap(Box<PanelPayload>),
     Setting(String),
     Leader(String),
     /// Unrecognized lines -- preserved verbatim for roundtrip fidelity.
@@ -171,7 +195,7 @@ pub(crate) enum ConfigLine {
 
 /// Structured representation of a `.godot-vimrc` file, preserving line
 /// ordering for roundtrip serialization.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigDocument {
     pub(crate) lines: Vec<ConfigLine>,
 }

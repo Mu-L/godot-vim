@@ -35,6 +35,8 @@
     reason = "consumed by the dispatcher cutover in P6; exercised in full by this module's tests"
 )]
 
+use std::fmt::Write as _;
+
 use compact_str::CompactString;
 use vim_core::keymap::KeyEvent;
 
@@ -322,6 +324,54 @@ fn parse_target(token: &str) -> Result<TargetSpec, PanelParseError> {
         return Ok(TargetSpec::Action(token.into()));
     }
     Err(PanelParseError::BadTarget(token.into()))
+}
+
+/// Render a parsed line back into the grammar it came from.
+///
+/// The inverse of [`parse_panel_line`], and the whole implementation of the
+/// writer's `PanelMap` arm. A stored panel line is re-emitted from its
+/// **parse**, never from the raw text it arrived as — which is what makes the
+/// document-level round-trip property able to see a line that silently lost
+/// its identity. Re-emitting raw text would round-trip a `ConfigLine::Comment`
+/// just as faithfully and prove nothing.
+///
+/// Flag order is canonical rather than as-typed. Parsing is order-independent
+/// (`flags_are_order_independent`), so `parse(render(parse(x))) == parse(x)`
+/// holds regardless; only the text of the first re-write can differ from what
+/// the user typed, and only in flag order.
+pub(crate) fn render(line: &PanelLine) -> String {
+    match line {
+        PanelLine::Unmap { surface, lhs } => format!("{UNMAP} {surface} {}", render_lhs(lhs)),
+        PanelLine::Map(map) => {
+            let mut out = String::from(MAP);
+            for (present, token) in [
+                (map.flags.physical, "<physical>"),
+                (map.flags.void, "<void>"),
+                (map.flags.norepeat, "<norepeat>"),
+                (map.flags.shift, "<shift>"),
+                (map.flags.nowait, "<nowait>"),
+            ] {
+                if present {
+                    out.push(' ');
+                    out.push_str(token);
+                }
+            }
+            let target = match &map.target {
+                TargetSpec::Action(id) => id.to_string(),
+                TargetSpec::Native => String::from("native"),
+                TargetSpec::Shortcut(path) => format!("<Shortcut>({path})"),
+            };
+            let _ = write!(out, " {} {} {target}", map.surface, render_lhs(&map.lhs));
+            for (key, value) in map.params.iter() {
+                let _ = write!(out, " {key}={value}");
+            }
+            out
+        }
+    }
+}
+
+fn render_lhs(lhs: &[KeyEvent]) -> String {
+    lhs.iter().map(KeyEvent::to_vim_notation).collect()
 }
 
 fn parse_params(tokens: &[&str]) -> Result<Params, PanelParseError> {
@@ -719,6 +769,84 @@ mod tests {
             err("panelunmap dock"),
             PanelParseError::MissingOperand("key sequence")
         );
+    }
+
+    // ── Rendering, and the fixpoint it exists to guarantee ───────────
+
+    #[test]
+    fn a_rendered_line_is_the_line_a_user_would_type() {
+        assert_eq!(
+            render(
+                &parse_panel_line("panelmap dock j godotvim.item.next")
+                    .unwrap()
+                    .unwrap()
+            ),
+            "panelmap dock j godotvim.item.next"
+        );
+        assert_eq!(
+            render(
+                &parse_panel_line("panelunmap dock.filesystem a")
+                    .unwrap()
+                    .unwrap()
+            ),
+            "panelunmap dock.filesystem a"
+        );
+        assert_eq!(
+            render(
+                &parse_panel_line(
+                    "panelmap <physical> <void> <norepeat> panel <C-h> godotvim.focus.left"
+                )
+                .unwrap()
+                .unwrap()
+            ),
+            "panelmap <physical> <void> <norepeat> panel <C-h> godotvim.focus.left"
+        );
+        assert_eq!(
+            render(
+                &parse_panel_line("panelmap dock <C-d> godotvim.item.next count=10")
+                    .unwrap()
+                    .unwrap()
+            ),
+            "panelmap dock <C-d> godotvim.item.next count=10"
+        );
+        assert_eq!(
+            render(
+                &parse_panel_line("panelmap dock.filesystem <C-h> native")
+                    .unwrap()
+                    .unwrap()
+            ),
+            "panelmap dock.filesystem <C-h> native"
+        );
+        assert_eq!(
+            render(
+                &parse_panel_line(
+                    "panelmap dock.filesystem <C-r> <Shortcut>(filesystem_dock/rename)"
+                )
+                .unwrap()
+                .unwrap()
+            ),
+            "panelmap dock.filesystem <C-r> <Shortcut>(filesystem_dock/rename)"
+        );
+    }
+
+    #[test]
+    fn parse_render_parse_is_a_fixpoint_even_when_the_text_is_not() {
+        // Flag order and whitespace are normalized on the first render, so
+        // text equality is NOT the property. Parse equality is, and it is the
+        // one the config round-trip depends on.
+        for line in [
+            "panelmap   <void>   <physical>  dock  j   godotvim.item.next",
+            "panelmap <shift> searchbox <CR> godotvim.search.accept",
+            "panelmap <nowait> dock.filesystem dd godotvim.fs.delete",
+            "panelmap dock x a.b flag=1 depth=-3",
+            "panelunmap    panel   <C-h>",
+            "panelmap dock.filesystem R godotvim.fs.refresh",
+        ] {
+            let once = parse_panel_line(line).unwrap().unwrap();
+            let twice = parse_panel_line(&render(&once)).unwrap().unwrap();
+            assert_eq!(once, twice, "'{line}' is not a fixpoint");
+            assert_eq!(render(&once), render(&twice), "'{line}' renders unstably");
+        }
     }
 
     // ── Diagnostics ──────────────────────────────────────────────────

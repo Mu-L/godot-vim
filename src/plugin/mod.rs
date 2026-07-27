@@ -88,6 +88,8 @@ pub struct GodotVimCore {
     /// provider tables into the same registry; nothing about the dispatcher
     /// changes when they do.
     actions: crate::actions::action::ActionRegistry,
+    /// Per-line load errors from the user's vimrc, surfaced by `:panelmap`.
+    binding_diagnostics: Vec<crate::actions::bind::PanelDiagnostic>,
     /// Which key, on which surface, means which verb.
     ///
     /// Rebuilt from the provider defaults (and, from the config phase, the
@@ -120,6 +122,7 @@ impl INode for GodotVimCore {
         let bindings = crate::actions::bind::builtin_index(&actions);
         Self {
             base,
+            binding_diagnostics: Vec::new(),
             controller: None,
             attached_editor: None,
             last_editor_id: None,
@@ -1255,6 +1258,36 @@ impl GodotVimCore {
     fn rebuild_bindings(&mut self) {
         let generation = self.bindings.generation.wrapping_add(1);
         let mut index = crate::actions::bind::builtin_index(&self.actions);
+
+        // The user layer, on top of the builtins. Two layers within ONE file
+        // — `config::path::resolve` picks exactly one vimrc (EditorSettings
+        // override, else res://, else user://), never several. Layering
+        // between files is not a thing here and must not become one.
+        //
+        // Sourced from the sandboxed text, so a project-level vimrc has
+        // already had `<Shortcut>` targets stripped before we see it.
+        let mut diagnostics = Vec::new();
+        if let Some(text) = self.read_sandboxed_config() {
+            let resolved = self.resolve_config_path();
+            crate::actions::bind::apply_text(
+                &mut index,
+                &self.actions,
+                &text,
+                &vim_core::keymap::MappingOwner::User,
+                &resolved.path,
+                crate::actions::bind::Provenance::User,
+                &mut diagnostics,
+            );
+        }
+        for d in &diagnostics {
+            // Warn-and-skip per line: one bad binding must not cost the user
+            // the rest of their config. The introspector surfaces these too,
+            // because a diagnostic nobody can read is the same as a silent
+            // dead key.
+            log::warn!("panelmap: {d:?}");
+        }
+        self.binding_diagnostics = diagnostics;
+
         index.generation = generation;
         self.bindings = index;
         // The chain cache is keyed on the generation, so this is belt and
@@ -1265,6 +1298,20 @@ impl GodotVimCore {
             "panelmap: rebuilt {} binding(s) at generation {generation}",
             self.bindings.len()
         );
+    }
+
+    /// The active vimrc's text, after the project-vimrc security policy.
+    ///
+    /// `None` when no config file exists — the zero-config case, where the
+    /// shipped defaults are the whole keyset.
+    fn read_sandboxed_config(&self) -> Option<String> {
+        let resolved = self.resolve_config_path();
+        let text = crate::config::writer::read_file(&resolved.path)?;
+        let project_vimrc = self
+            .settings
+            .as_ref()
+            .map_or(crate::settings::ProjectVimrc::Sandbox, |s| s.project_vimrc);
+        crate::config::sandbox::apply_vimrc_policy(&text, resolved.is_project_level, project_vimrc)
     }
 
     /// `:panelmap` and `:panelmap <lhs>` — the introspector.

@@ -55,6 +55,18 @@ pub(crate) fn serialize(doc: &ConfigDocument) -> String {
                 output.push_str(&cmd);
                 output.push('\n');
             }
+            ConfigLine::PanelMap(payload) => {
+                // The self-contained `" disabled: ` convention, reused rather
+                // than the preset-marker machinery above: panel rules are
+                // never preset-managed, so a marker line would have nothing to
+                // name and the parser would have to guess which of the two
+                // conventions it was reading.
+                if !payload.enabled {
+                    output.push_str("\" disabled: ");
+                }
+                output.push_str(&super::panelmap::render(&payload.parsed));
+                output.push('\n');
+            }
             ConfigLine::Setting(text) | ConfigLine::Leader(text) | ConfigLine::Other(text) => {
                 output.push_str(text);
                 output.push('\n');
