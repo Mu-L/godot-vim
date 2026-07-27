@@ -53,9 +53,40 @@ pub(crate) static DOCK: SurfaceSpec = SurfaceSpec {
     yields_to_engine: false,
 };
 
+/// Dock item navigation, plus `/` for the filter box.
+///
+/// Consumption is **elastic** — the default — which is what preserves `j` at
+/// the end of a list (`dock.rs:148-154`): the action declines, the key is not
+/// consumed, and Godot's own handling proceeds.
+///
+/// `h` and `l` are bound unconditionally and go inert on an `ItemList` through
+/// the capability gate rather than through a `DockKind` match arm: their verbs
+/// require `Caps::HIERARCHY`, which only a `Tree` contributes. That is the
+/// whole replacement for `matches!(dock_kind, DockKind::Tree)`.
+///
+/// `/` carries `<physical>` for the same reason the rest do, and it is the key
+/// whose shadowing bug (`dock.rs:127`, unreachable behind the hjkl arm on a
+/// physical-J layout) motivated the one-probe-list-per-keyset rule.
+/// Today's dock keyset, verbatim.
+///
+/// `dock_action_for` binds seven keys, not five: hjkl and `/` carry the
+/// positional probe because their meaning is a QWERTY *position*, while
+/// `<CR>` and `<Esc>` do not — a named key never receives one, so flagging
+/// them would be inert at best and misleading at worst.
+const DEFAULTS: &str = "\
+panelmap <physical> dock h godotvim.item.collapse
+panelmap <physical> dock j godotvim.item.next
+panelmap <physical> dock k godotvim.item.prev
+panelmap <physical> dock l godotvim.item.expand
+panelmap <physical> dock / godotvim.dock.search
+panelmap dock <CR> godotvim.item.activate
+panelmap dock <Esc> godotvim.focus.editor
+";
+
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.dock",
     surfaces: &[&DOCK],
+    defaults: DEFAULTS,
 };
 
 #[cfg(test)]

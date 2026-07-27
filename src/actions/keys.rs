@@ -32,7 +32,7 @@
 
 use godot::classes::InputEventKey;
 use godot::prelude::*;
-use vim_core::keymap::{Key, KeyEvent, LangmapTable, Modifiers};
+use vim_core::keymap::{Key, KeyEvent, LangmapTable, Modifiers, MAX_KEY_SEQUENCE_LEN};
 
 use godot::global::Key as GodotKey;
 
@@ -288,6 +288,12 @@ pub(crate) enum LhsError {
     Unparseable(String),
     /// Parsed to nothing.
     Empty,
+    /// Longer than `vim_core::keymap::MAX_KEY_SEQUENCE_LEN`.
+    ///
+    /// Rejected rather than truncated: a `KeySequence` is an `ArrayVec` of
+    /// that capacity, so a longer LHS would be silently shortened into a
+    /// binding the user never wrote — and one that shadows a real prefix.
+    TooLong(usize),
 }
 
 impl std::fmt::Display for LhsError {
@@ -300,6 +306,11 @@ impl std::fmt::Display for LhsError {
             ),
             Self::Unparseable(s) => write!(f, "cannot parse key notation '{s}'"),
             Self::Empty => write!(f, "empty key sequence"),
+            Self::TooLong(n) => write!(
+                f,
+                "key sequence is {n} keys long; at most \
+                 {MAX_KEY_SEQUENCE_LEN} are supported"
+            ),
         }
     }
 }
@@ -324,6 +335,51 @@ pub(crate) fn validate_lhs_key(k: KeyEvent) -> Result<(), LhsError> {
     }
 }
 
+/// The nav modes in which an `editor.*` surface is live.
+///
+/// Verbatim from `src/plugin/input.rs:118-123` — the modes in which the
+/// dispatcher intercepts a panel chord from the attached editor. A grammar
+/// prefix is only dangerous where the shell is allowed to consume, so these
+/// are exactly the modes the guard must ask about.
+const NAV_MODES: [vim_core::primitives::Mode; 3] = [
+    vim_core::primitives::Mode::Normal,
+    vim_core::primitives::Mode::Visual(vim_core::primitives::VisualType::Char),
+    vim_core::primitives::Mode::OperatorPending(vim_core::primitives::Operator::Delete),
+];
+
+/// Whether `key` puts vim-core's grammar into an `Awaiting*` state.
+///
+/// This is the `<C-w>` guard, and it asks vim-core's own state machine rather
+/// than a hand-written denylist. The reason a cheaper test cannot work:
+/// `Keymap::lookup` merges only the *user* mapping tables and never consults
+/// `CORE_KEYMAP`, so `could_start_mapping` structurally cannot see `<C-w>`;
+/// and `<C-w>` is `KeyClass::Action` in `CORE_KEYMAP`, not `Prefix`, so a
+/// class-based test misses it too. `<C-\>` is worse still — the parser
+/// intercepts it before classification and it appears in no table at all.
+///
+/// Consuming such a key at `_input()` destroys the follow-up key, which turns
+/// `<C-w>s` into a bare `s`: a destructive edit, silently, from a binding the
+/// user thought only moved focus. So a rule carrying one is rejected on any
+/// editor-reachable surface.
+///
+/// Conservative in the safe direction: bare digits answer `true`, which
+/// correctly forbids `panelmap panel 3 …` from breaking `3j`.
+#[allow(dead_code, reason = "consumed by the binding index in P5")]
+pub(crate) fn starts_vim_grammar_sequence(key: KeyEvent) -> bool {
+    // Core defaults only. User mappings are `could_start_mapping`'s job at
+    // dispatch time, not this one's at registration time.
+    let keymap = vim_core::keymap::Keymap::new();
+    NAV_MODES.iter().any(|&mode| {
+        // `:set sneak` makes `s`/`S` two-key operators, so the answer is
+        // genuinely setting-dependent and both must be asked.
+        [false, true].into_iter().any(|sneak| {
+            let mut parser = vim_core::grammar::Parser::new();
+            parser.set_sneak_mode(sneak);
+            parser.process(key, &keymap, mode).is_pending()
+        })
+    })
+}
+
 /// Parse a Vim-notation left-hand side into canonicalized key events.
 ///
 /// Uses vim-core's own multi-key parser so the shell plane and the editor
@@ -336,6 +392,9 @@ pub(crate) fn parse_lhs(notation: &str) -> Result<Vec<KeyEvent>, LhsError> {
     let keys = vim_core::execution::parse_keys_from_string(notation);
     if keys.is_empty() {
         return Err(LhsError::Unparseable(notation.to_string()));
+    }
+    if keys.len() > MAX_KEY_SEQUENCE_LEN {
+        return Err(LhsError::TooLong(keys.len()));
     }
     let keys: Vec<KeyEvent> = keys.into_iter().map(canonicalize).collect();
     for k in &keys {
@@ -477,6 +536,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_lhs_caps_the_sequence_length() {
+        // A `KeySequence` is an ArrayVec of MAX_KEY_SEQUENCE_LEN, so a longer
+        // LHS would be silently truncated into a binding nobody wrote — and
+        // one that then shadows the real prefix.
+        assert_eq!(parse_lhs("abcdefgh").map(|k| k.len()), Ok(8));
+        assert_eq!(parse_lhs("abcdefghi"), Err(LhsError::TooLong(9)));
+        assert!(parse_lhs("abcdefghi")
+            .unwrap_err()
+            .to_string()
+            .contains("at most 8"));
+    }
+
+    #[test]
     fn parse_lhs_rejects_empty_and_unspellable() {
         assert_eq!(parse_lhs(""), Err(LhsError::Empty));
         assert_eq!(
@@ -484,6 +556,86 @@ mod tests {
             Err(LhsError::UnspellableShift('1')),
             "a binding that can never fire must not load"
         );
+    }
+
+    // ── starts_vim_grammar_sequence ──────────────────────────────────
+
+    #[test]
+    fn the_vim_core_grammar_prefix_canary() {
+        // THE version canary. These six answers are what the `<C-w>` guard is
+        // built on, and all six come from vim-core's own state machine rather
+        // than from anything in this repo. A vim-core bump that changes one of
+        // them silently changes which panel bindings are legal — most sharply,
+        // `<C-w>` answering `false` would let `panelmap panel <C-w>s` load,
+        // and the next `<C-w>s` would delete a word instead of splitting.
+        //
+        // Written as one table so the failure message names the key that
+        // moved, not merely that "a" assertion failed.
+        let rows: &[(&str, KeyEvent, bool)] = &[
+            // Starts a grammar sequence: consuming it destroys the next key.
+            (
+                "<C-w>",
+                KeyEvent::new(Key::Char('w'), Modifiers::CTRL),
+                true,
+            ),
+            (
+                "<C-\\>",
+                KeyEvent::new(Key::Char('\\'), Modifiers::CTRL),
+                true,
+            ),
+            // The shipped panel keyset. All four MUST be false, or the plugin
+            // cannot ship its own defaults.
+            (
+                "<C-h>",
+                KeyEvent::new(Key::Char('h'), Modifiers::CTRL),
+                false,
+            ),
+            (
+                "<C-j>",
+                KeyEvent::new(Key::Char('j'), Modifiers::CTRL),
+                false,
+            ),
+            (
+                "<C-k>",
+                KeyEvent::new(Key::Char('k'), Modifiers::CTRL),
+                false,
+            ),
+            (
+                "<C-l>",
+                KeyEvent::new(Key::Char('l'), Modifiers::CTRL),
+                false,
+            ),
+        ];
+        for (name, key, want) in rows {
+            assert_eq!(
+                starts_vim_grammar_sequence(*key),
+                *want,
+                "vim-core changed its answer for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_is_reached_through_the_same_notation_users_type() {
+        // The canary above builds `KeyEvent`s by hand. This closes the gap
+        // between that and the parser the config path actually uses: a
+        // `panelmap` line spelling `<C-w>` must reach the same answer.
+        let lhs = parse_lhs("<C-w>").expect("valid notation");
+        assert!(starts_vim_grammar_sequence(lhs[0]));
+        let lhs = parse_lhs("<C-h>").expect("valid notation");
+        assert!(!starts_vim_grammar_sequence(lhs[0]));
+    }
+
+    #[test]
+    fn a_bare_digit_starts_a_count_and_is_therefore_a_prefix() {
+        // Conservative in the safe direction, and deliberately so: binding a
+        // digit on an editor-reachable surface would break `3j`.
+        for c in ['1', '9'] {
+            assert!(
+                starts_vim_grammar_sequence(ch(c)),
+                "{c} begins a count and must be refused"
+            );
+        }
     }
 
     // ── Probes ───────────────────────────────────────────────────────

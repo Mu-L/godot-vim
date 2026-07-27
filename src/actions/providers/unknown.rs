@@ -52,6 +52,10 @@ pub(crate) static UNKNOWN: SurfaceSpec = SurfaceSpec {
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.unknown",
     surfaces: &[&UNKNOWN],
+    // None. Everything reachable from `unknown` is inherited from `panel`,
+    // which is what keeps Ctrl+hjkl working with a focused Button, a
+    // GraphEdit, or no focus owner at all.
+    defaults: "",
 };
 
 #[cfg(test)]

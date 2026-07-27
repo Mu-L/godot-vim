@@ -22,8 +22,12 @@
 //!   `FocusChain` and the declared surface forest above it.
 //! - [`providers`] — one file per subsystem, declaring its surfaces in the
 //!   probe order that *is* the classification.
+//! - [`bind`] — the binding plane: one `MappingTrie` per surface over a side
+//!   arena of rules, and the registration-time validation that keeps a typo
+//!   from becoming a silent dead key.
 
 pub(crate) mod action;
+pub(crate) mod bind;
 pub(crate) mod caps;
 pub(crate) mod keys;
 pub(crate) mod outcome;

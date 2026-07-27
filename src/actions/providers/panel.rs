@@ -35,9 +35,30 @@ pub(crate) static PANEL: SurfaceSpec = SurfaceSpec {
     yields_to_engine: false,
 };
 
+/// Cross-panel focus, in the exact form a user would write it.
+///
+/// `<void>` reproduces `src/plugin/input.rs:126-134`, where
+/// `handle_window_nav`'s result is discarded at `:129` and
+/// `set_input_as_handled()` fires at `:132` even with no focus owner and no
+/// target found. `<norepeat>` keeps a held Ctrl+J from queueing a ~20/s storm
+/// of deferred `grab_focus` calls. `<physical>` is what gives a Dvorak or
+/// Cyrillic user the same four chords by position.
+///
+/// These four are also the reason the `<C-w>` grammar guard has to be a
+/// question rather than a denylist: `panel` is `editor.nav`'s parent, so every
+/// line here is validated against vim-core's own parser, and all four must
+/// come back clean.
+const DEFAULTS: &str = "\
+panelmap <physical> <void> <norepeat> panel <C-h> godotvim.focus.left
+panelmap <physical> <void> <norepeat> panel <C-j> godotvim.focus.down
+panelmap <physical> <void> <norepeat> panel <C-k> godotvim.focus.up
+panelmap <physical> <void> <norepeat> panel <C-l> godotvim.focus.right
+";
+
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.panel",
     surfaces: &[&PANEL],
+    defaults: DEFAULTS,
 };
 
 #[cfg(test)]

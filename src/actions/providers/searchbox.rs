@@ -36,9 +36,28 @@ pub(crate) static SEARCHBOX: SurfaceSpec = SurfaceSpec {
     yields_to_engine: false,
 };
 
+/// Leaving the filter box, keeping the filter.
+///
+/// The only two shipped rules carrying `<shift>`, and the reason the flag
+/// exists at all: `handle_search_input` rejects ctrl/alt/meta but **tolerates
+/// shift** (`dock.rs:212`), while a dock rejects every modifier including
+/// shift (`dock.rs:133-137`). A global "named key with SHIFT cleared" probe
+/// could not express that difference — it would newly fire
+/// `godotvim.item.activate` on Shift+Enter in every dock.
+///
+/// Both keys reach the same verb because both do the same thing today: Escape
+/// does **not** clear the filter, it leaves the box with the text intact.
+/// Neither takes `<physical>`: a named key never receives a positional probe,
+/// so the flag would be inert.
+const DEFAULTS: &str = "\
+panelmap <shift> searchbox <CR> godotvim.search.accept
+panelmap <shift> searchbox <Esc> godotvim.search.accept
+";
+
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.searchbox",
     surfaces: &[&SEARCHBOX],
+    defaults: DEFAULTS,
 };
 
 #[cfg(test)]

@@ -58,14 +58,26 @@ use super::surface::{Forest, SurfaceSpec};
 
 /// One subsystem's contribution to the plane.
 ///
-/// Grows in P5 with the actions it registers and its `panelmap` defaults; the
-/// `tag` is already here because every rule a provider registers is owned by
-/// it, and ownership is what makes "a third party cannot silently displace a
-/// builtin binding" checkable rather than aspirational.
+/// The `tag` is what every rule this provider installs is owned by, which
+/// makes "a third party cannot silently displace a builtin binding" checkable
+/// rather than aspirational.
 pub(crate) struct Provider {
     pub(crate) tag: &'static str,
     /// Surfaces this provider declares, in probe order.
     pub(crate) surfaces: &'static [&'static SurfaceSpec],
+    /// Default bindings, written in **exactly the text a user types** and
+    /// parsed by exactly the same parser (`crate::config::panelmap`).
+    ///
+    /// That is the anti-drift device of the whole design. Defaults built by
+    /// calling constructors directly could be expressed in a dialect the
+    /// documented grammar does not describe, the parser and the sandbox
+    /// whitelist could not be held to one property, and a user rebinding
+    /// Ctrl+hjkl could not reproduce the shipped semantics.
+    ///
+    /// A line here that fails to load is a `debug_assert!`, not a warning:
+    /// warn-and-skip is the policy for user text, and a shipped default that
+    /// silently vanishes is a keyset regression with a green test suite.
+    pub(crate) defaults: &'static str,
 }
 
 /// Probe order. See the module docs — every position here is load-bearing.

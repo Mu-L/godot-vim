@@ -54,9 +54,30 @@ pub(crate) static DOCK_FILESYSTEM: SurfaceSpec = SurfaceSpec {
     yields_to_engine: false,
 };
 
+/// The nvim-tree-flavoured file operations of `resolve_fs_action`
+/// (`filesystem_explorer.rs:374-386`).
+///
+/// `R` and `r` are two *keys*, not one key with a modifier: `bridge::input`
+/// folds Shift into the character itself, so the discriminant is carried by
+/// the char. Writing them as `R` and `r` here is therefore both the shipped
+/// behaviour and the only spelling that can match.
+///
+/// `dock.filesystem` is deeper in the forest than `dock`, so these five get
+/// first refusal while `j`/`k` still fall through to the parent. That depth is
+/// the entire replacement for the hardcoded branch at
+/// `src/plugin/input.rs:140-150`.
+const DEFAULTS: &str = "\
+panelmap <physical> dock.filesystem a godotvim.fs.create
+panelmap <physical> dock.filesystem d godotvim.fs.delete
+panelmap <physical> dock.filesystem r godotvim.fs.rename
+panelmap <physical> dock.filesystem y godotvim.fs.yank_path
+panelmap <physical> dock.filesystem R godotvim.fs.refresh
+";
+
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.filesystem",
     surfaces: &[&DOCK_FILESYSTEM],
+    defaults: DEFAULTS,
 };
 
 #[cfg(test)]

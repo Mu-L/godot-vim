@@ -75,6 +75,12 @@ pub(crate) static EDITOR_INSERT: SurfaceSpec = SurfaceSpec {
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.editor",
     surfaces: &[&EDITOR_NAV, &EDITOR_INSERT],
+    // Deliberately none, and this is the design's sharpest structural claim:
+    // `editor.nav` carries ZERO rules of its own, because `<C-h>` lives on
+    // `panel`, its declared parent. Duplicating the panel keyset here is what
+    // the surface forest makes unrepresentable rather than merely discouraged.
+    // `editor.insert` is a Barrier and cannot take a rule at all.
+    defaults: "",
 };
 
 #[cfg(test)]

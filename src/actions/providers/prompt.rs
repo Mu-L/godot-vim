@@ -48,6 +48,11 @@ pub(crate) static PROMPT: SurfaceSpec = SurfaceSpec {
 pub(crate) const PROVIDER: Provider = Provider {
     tag: "godotvim.prompt",
     surfaces: &[&PROMPT],
+    // None yet. The FS prompt's Escape is handled inside
+    // `FileSystemExplorer::handle_key` on the `gui_input` transport, which P6
+    // routes through the resolver; binding it here now would make the same
+    // key fire twice.
+    defaults: "",
 };
 
 #[cfg(test)]
