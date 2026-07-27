@@ -17,22 +17,46 @@ use super::dock_search::{find_sibling_nav_control, find_sibling_search_box};
 use super::focus::DockKind;
 use crate::scene_tree::{find_child_of_type, MAX_DISCOVERY_DEPTH};
 
-/// Tri-state result so callers can distinguish "consumed in place" from
-/// "consumed and moved focus" — the latter may need additional bookkeeping
-/// (e.g., updating the last-focused-editor tracking).
-#[derive(Debug)]
+/// Tri-state outcome of a shell-side key handler.
+///
+/// `FocusChanged` is currently treated identically to `Handled` by every
+/// caller — `is_consumed()` is the only method anyone calls. It is kept
+/// distinct because moving focus is the case that will need extra
+/// bookkeeping once dock keys become rebindable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
 pub(crate) enum DockInputResult {
     /// Event consumed — call `set_input_as_handled()`.
     Handled,
     /// Event consumed and focus moved to a different control.
     FocusChanged,
-    /// Event not consumed — let Godot's native handling proceed.
-    Ignored,
+    /// Not consumed — Godot's native handling proceeds.
+    ///
+    /// This is a first-class outcome, not a failure. Godot dispatches
+    /// `_input` strictly before `gui_input` and offers no replay channel, so
+    /// consuming here destroys the event permanently; declining is the only
+    /// way a control's own behaviour survives. Two unambiguous examples:
+    /// `Esc` when no script editor can be found (`handle_escape_from_dock`),
+    /// and `Enter` on a `RichTextLabel` (`handle_enter`).
+    ///
+    /// Note this variant currently conflates two different things —
+    /// "recognized the key but declined to act" (the `DockKind` gates) and
+    /// "never matched at all" (the modifier guards and the `_ =>` arms).
+    /// Separating them belongs to the resolver, not to this enum. Until
+    /// then, do not flatten this type to `bool`: a dispatcher that consumes
+    /// every key it recognizes is a wall, not a keymap.
+    Declined,
 }
 
 impl DockInputResult {
-    pub(crate) fn is_consumed(&self) -> bool {
-        !matches!(self, Self::Ignored)
+    /// Positive exhaustive match on purpose: a future variant becomes a
+    /// compile error here instead of silently defaulting to "consumed",
+    /// which would swallow the key.
+    pub(crate) const fn is_consumed(self) -> bool {
+        match self {
+            Self::Handled | Self::FocusChanged => true,
+            Self::Declined => false,
+        }
     }
 }
 
@@ -78,7 +102,7 @@ pub(crate) fn handle_dock_input(
         || key_event.is_meta_pressed()
         || key_event.is_shift_pressed()
     {
-        return DockInputResult::Ignored;
+        return DockInputResult::Declined;
     }
 
     // hjkl and / use logical-then-physical fallback for non-Latin layout support.
@@ -90,14 +114,14 @@ pub(crate) fn handle_dock_input(
                 if handle_navigation(&focused, NavDirection::Next, 0) {
                     DockInputResult::Handled
                 } else {
-                    DockInputResult::Ignored
+                    DockInputResult::Declined
                 }
             }
             DockHjkl::Up => {
                 if handle_navigation(&focused, NavDirection::Prev, 0) {
                     DockInputResult::Handled
                 } else {
-                    DockInputResult::Ignored
+                    DockInputResult::Declined
                 }
             }
             DockHjkl::Left => {
@@ -106,7 +130,7 @@ pub(crate) fn handle_dock_input(
                 {
                     DockInputResult::Handled
                 } else {
-                    DockInputResult::Ignored
+                    DockInputResult::Declined
                 }
             }
             DockHjkl::Right => {
@@ -115,7 +139,7 @@ pub(crate) fn handle_dock_input(
                 {
                     DockInputResult::Handled
                 } else {
-                    DockInputResult::Ignored
+                    DockInputResult::Declined
                 }
             }
         };
@@ -128,7 +152,7 @@ pub(crate) fn handle_dock_input(
         Key::ENTER => handle_enter(&focused, dock_kind),
         Key::ESCAPE => handle_escape_from_dock(),
         _ if physical == Key::SLASH => handle_slash(&focused),
-        _ => DockInputResult::Ignored,
+        _ => DockInputResult::Declined,
     }
 }
 
@@ -140,7 +164,7 @@ pub(crate) fn handle_search_input(
     key_event: &Gd<InputEventKey>,
 ) -> DockInputResult {
     if key_event.is_ctrl_pressed() || key_event.is_alt_pressed() || key_event.is_meta_pressed() {
-        return DockInputResult::Ignored;
+        return DockInputResult::Declined;
     }
 
     match key_event.get_keycode() {
@@ -154,7 +178,7 @@ pub(crate) fn handle_search_input(
                 handle_escape_from_dock()
             }
         }
-        _ => DockInputResult::Ignored,
+        _ => DockInputResult::Declined,
     }
 }
 
@@ -166,7 +190,7 @@ fn handle_slash(focused: &Gd<Control>) -> DockInputResult {
         node.call_deferred("select_all", &[]);
         DockInputResult::FocusChanged
     } else {
-        DockInputResult::Ignored
+        DockInputResult::Declined
     }
 }
 
@@ -184,7 +208,7 @@ fn handle_enter(focused: &Gd<Control>, dock_kind: DockKind) -> DockInputResult {
         }
         DockKind::ItemList => {
             let Ok(mut list) = focused.clone().try_cast::<godot::classes::ItemList>() else {
-                return DockInputResult::Ignored;
+                return DockInputResult::Declined;
             };
             let selected = list.get_selected_items();
             if !selected.is_empty() {
@@ -194,10 +218,10 @@ fn handle_enter(focused: &Gd<Control>, dock_kind: DockKind) -> DockInputResult {
                 control.emit_signal("item_activated", &[Variant::from(idx)]);
                 DockInputResult::Handled
             } else {
-                DockInputResult::Ignored
+                DockInputResult::Declined
             }
         }
-        DockKind::RichTextLabel => DockInputResult::Ignored,
+        DockKind::RichTextLabel => DockInputResult::Declined,
     }
 }
 
@@ -217,11 +241,11 @@ fn defer_grab_focus(target: &Gd<impl Inherits<Node>>) {
 fn handle_escape_from_dock() -> DockInputResult {
     let interface = EditorInterface::singleton();
     let Some(script_editor) = interface.get_script_editor() else {
-        return DockInputResult::Ignored;
+        return DockInputResult::Declined;
     };
     let Some(current) = script_editor.get_current_editor() else {
         log::debug!("dock_escape: no current editor found");
-        return DockInputResult::Ignored;
+        return DockInputResult::Declined;
     };
 
     let root = current.clone().upcast::<Node>();

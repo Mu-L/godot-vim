@@ -81,7 +81,7 @@ impl FileSystemExplorer {
 
         if key_event.is_ctrl_pressed() || key_event.is_alt_pressed() || key_event.is_meta_pressed()
         {
-            return DockInputResult::Ignored;
+            return DockInputResult::Declined;
         }
 
         let shift = key_event.is_shift_pressed();
@@ -93,7 +93,7 @@ impl FileSystemExplorer {
             (Some(Key::R), false) => self.begin_rename(control, kind),
             (Some(Key::Y), false) => self.yank_path(control, kind),
             (Some(Key::R), true) => self.refresh(),
-            _ => DockInputResult::Ignored,
+            _ => DockInputResult::Declined,
         }
     }
 

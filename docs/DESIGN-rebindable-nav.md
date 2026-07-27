@@ -44,9 +44,9 @@ The inventory below is exhaustive. It was derived by grepping every `Key::[A-Z]`
 | # | Keys | Where the key is decided | Where the behaviour lives | Transport |
 |---|---|---|---|---|
 | 1 | `Ctrl+h/j/k/l` (cross-panel focus) | `plugin/input.rs:84-135`; scancode→direction at `navigation/window.rs:27-39` | `window::handle_window_nav`, `window.rs:48-127` | `input()` |
-| 2 | `h/j/k/l` (intra-dock) | `navigation/dock.rs:47-62` (identity), `:87-122` (dispatch) | `dock_nav::handle_navigation` `:96-125`, `handle_hierarchy` `:127-136` | `input()` |
-| 3 | `/`, `Enter`, `Esc` (intra-dock) | `navigation/dock.rs:124-132` | `handle_slash` `:162-171`, `handle_enter` `:178-202`, `handle_escape_from_dock` `:217-243` | `input()` |
-| 4 | `Esc`, `Enter` (dock filter box) | `navigation/dock.rs:138-157` | same function; falls back to `handle_escape_from_dock()` at `:153` | `input()` |
+| 2 | `h/j/k/l` (intra-dock) | `navigation/dock.rs:71-86` (identity), `:87-122` (dispatch) | `dock_nav::handle_navigation` `:96-125`, `handle_hierarchy` `:127-136` | `input()` |
+| 3 | `/`, `Enter`, `Esc` (intra-dock) | `navigation/dock.rs:148-156` | `handle_slash` `:162-171`, `handle_enter` `:178-202`, `handle_escape_from_dock` `:217-243` | `input()` |
+| 4 | `Esc`, `Enter` (dock filter box) | `navigation/dock.rs:162-181` | same function; falls back to `handle_escape_from_dock()` at `:153` | `input()` |
 | 5 | `a`, `d`, `r`, `y`, `R` (FileSystem) | `navigation/filesystem_explorer.rs:87-97`; identity at `:363-378` | `begin_create` `:125-134`, `begin_delete`, `begin_rename`, `yank_path` `:109-115`, `refresh` `:117-123` | `input()` |
 | 6 | `Esc` (FS create/rename prompt) | `plugin/mod.rs:781-801` (`on_fs_prompt_gui_input`) | `FileSystemExplorer::dismiss_prompt` | the prompt LineEdit's own `gui_input` |
 | 7 | `Ctrl+@`, `Ctrl+N`, `Ctrl+P`, `Up`, `Down`, `Tab`, `Enter`, `Esc`, `Backspace` (completion popup) | `controller/completion.rs:32-125`, `:139-165` | inline; calls `CodeEdit` completion API directly | the attached editor's `gui_input` |
@@ -75,7 +75,7 @@ pub(crate) enum ControllerPhase {
 
 `engine()` and `engine_mut()` (`:157-169`) return a live `&VimEngine` in *both* arms — the comment at `:155` says so in the source: "Engine accessors (work in both attached and detached state)". `mode()` (`:484-486`) and `could_start_mapping()` (`:677-679`) are thin delegations to `engine()`, and `plugin/input.rs:110-117` already calls `could_start_mapping` from the global `input()` handler, on a keystroke that may have been typed with a dock focused. `self.controller` is `Some(..)` from `enter_tree` (`plugin/mod.rs:128`) to `exit_tree` (`:173`) and is never nulled in between, not even by `recover_controller_from_panic` (`:1015-1050`). The mapping trie is one field dereference away at every keystroke the plugin sees.
 
-The real knot is that **five independent decisions are fused into a single match arm**, and the fusion is what makes the keyset unaddressable. `src/navigation/dock.rs:89-95`:
+The real knot is that **five independent decisions are fused into a single match arm**, and the fusion is what makes the keyset unaddressable. `src/navigation/dock.rs:113-119`:
 
 ```rust
 DockHjkl::Down => {
@@ -90,14 +90,14 @@ DockHjkl::Down => {
 That expression decides which key, which widget kinds are eligible, what behaviour runs, whether the behaviour succeeded, and whether the event is consumed — all at once, in one place, with no intermediate term. §2 takes it apart. Three consequences of the fusion are visible in today's code:
 
 - **There is no name to bind to.** `Key::H => WindowNavDirection::Left` (`window.rs:35`) is a wire from a scancode to a function argument. Nothing between the two could appear on the right-hand side of a config line.
-- **Key identity is re-derived per site, three times, incompatibly.** `dock_hjkl` (`dock.rs:47-52`), `direction_from_hjkl` (`window.rs:23-29`) and `resolve_key` (`filesystem_explorer.rs:363-374`) each implement "logical keycode first, physical fallback" over a different key subset. The consequence is a live bug: for a keyboard layout where the QWERTY-J position emits a logical `/`, `dock_hjkl` matches on the *physical* fallback and returns at `dock.rs:88-121`, so the `Key::SLASH => handle_slash` arm at `:127` is never reached. `/` is unreachable, silently, on exactly the layouts the fallback was added to support.
+- **Key identity is re-derived per site, three times, incompatibly.** `dock_hjkl` (`dock.rs:71-76`), `direction_from_hjkl` (`window.rs:23-29`) and `resolve_key` (`filesystem_explorer.rs:363-374`) each implement "logical keycode first, physical fallback" over a different key subset. The consequence is a live bug: for a keyboard layout where the QWERTY-J position emits a logical `/`, `dock_hjkl` matches on the *physical* fallback and returns at `dock.rs:112-145`, so the `Key::SLASH => handle_slash` arm at `:127` is never reached. `/` is unreachable, silently, on exactly the layouts the fallback was added to support.
 - **Ordering is a hardcoded branch.** `plugin/input.rs:140-150` is a literal `if navigation::is_in_filesystem_dock(&control) { … fs first … } else { … }`. Adding a second specialised dock means adding a second `if`.
 
 **Why a naive `HashMap<Key, Action>` fails: it cuts at the wrong joint.** It separates decision (1) from decisions (2)-(5) and leaves (2)-(5) welded together. Every one of the following then survives the refactor:
 
 - Actions still know about widgets — `godotvim.item.collapse` must itself test `is_class("Tree")`, so widget taxonomy simply migrates from the dispatcher into the action bodies.
-- Actions still decide consumption — the map has no way to say "this key is bound, the action ran, and the event should still reach Godot", so either the tri-state at `dock.rs:24-31` is flattened to `bool` (regression) or every action returns a consumption verdict the user cannot influence.
-- A registered key is consumed whether or not the action did anything. `Tree::allow_search` defaults to `true` (`godot/scene/gui/tree.h:792`), and `_input` runs strictly before `gui_input` (`godot/scene/main/viewport.cpp:3544-3546`, with the in-source comment "must happen before GUI, order is `_input` -> gui input -> `_unhandled input`"). There is no replay channel out of `_input()`: a consumed key is destroyed. A table that consumes on every registered key therefore deletes Tree type-to-search, arrow navigation and F2 rename for every key it names.
+- Actions still decide consumption — the map has no way to say "this key is bound, the action ran, and the event should still reach Godot", so either the tri-state at `dock.rs:26-49` is flattened to `bool` (regression) or every action returns a consumption verdict the user cannot influence.
+- A registered key is consumed whether or not the action did anything. `Tree::allow_search` defaults to `true` (`godot/scene/gui/tree.h:792`), and `_input` runs strictly before `gui_input` (`godot/scene/main/viewport.cpp:3544-3546`, with the in-source comment "must happen before GUI, order is `_input` -> gui input -> `_unhandled input`"). There is no replay channel out of `_input()`: a consumed key is destroyed. A table that consumes on every registered key therefore deletes Tree type-to-search and arrow navigation (both `Tree::gui_input`) and the docks' F2/Delete `ED_SHORTCUT` accelerators (`shortcut_input`) for every key it names.
 - A new dock still needs new arms, because "which widgets does `godotvim.item.expand` apply to" has no representation. This is Helix #5505 reproduced: a flat keymap plus per-widget conditionals inside the commands.
 
 The map solves the *addressing* problem and leaves the *composition* problem exactly where it was.
@@ -114,10 +114,10 @@ Every row is a MUST. Each is transcribed from behaviour that exists today; the d
 | C4 | **Foreign is a hard stop.** A non-attached `CodeEdit`, a plain `TextEdit`, or a `LineEdit` with no sibling nav control: nothing is intercepted, ever | `plugin/input.rs:90`; `navigation/focus.rs:50-57`, `:73-87` | A terminating verdict evaluated before any lookup — never an emergent property of an empty binding set |
 | C5 | **FileSystem-first ordering.** In the FS dock, `a/d/r/y/R` get first refusal; if the FS handler declines, generic dock handling still runs | `plugin/input.rs:140-150` | Specificity must be a declared, total, machine-checkable relation. Godot's scene depth **inverts** it: `dock` is derived from the focus owner, `dock.filesystem` from an ancestor via `is_ancestor_of` (`filesystem_explorer.rs:380-386`) |
 | C6 | **Prompt exemption.** While the plugin's own FS create/rename `LineEdit` has focus, the `input()` path declines everything so that typing and `text_submitted` work; `Esc` is handled on the prompt's own `gui_input` | `plugin/input.rs:156-159`; `plugin/mod.rs:781-801` | Bare keys must be able to stop at a surface and fall through to the control, while modifier-bearing keys keep climbing. Both transports stay live: a floating script editor reparents into a separate `Window` (`godot/editor/gui/window_wrapper.cpp:74-79`) where per-viewport `_input` never fires |
-| C7 | Logical keycode first, **physical fallback second**, for non-Latin layouts | `window.rs:23-29`, `dock.rs:47-52`, `filesystem_explorer.rs:363-374` | Exactly one ordered probe applied to the whole key, once — not per match arm. Per-arm evaluation is what produces the `/`-shadowing bug in §1.2 and, generalised naively, fires `yank_path` when a QWERTZ user presses `z` |
+| C7 | Logical keycode first, **physical fallback second**, for non-Latin layouts | `window.rs:23-29`, `dock.rs:71-76`, `filesystem_explorer.rs:363-374` | Exactly one ordered probe applied to the whole key, once — not per match arm. Per-arm evaluation is what produces the `/`-shadowing bug in §1.2 and, generalised naively, fires `yank_path` when a QWERTZ user presses `z` |
 | C8 | `set_input_as_handled()` on the **transport's own viewport** | `plugin/input.rs:57-62` (EditorInterface base control) vs `:279-280` (`editor.get_viewport()`) | Viewport selection is a transport property, never a dispatcher one. They differ for floating script editors |
-| C9 | Focus changes are **deferred** — immediate `grab_focus()` during input processing is swallowed by Godot's dispatch loop | `dock.rs:204-211`; also `window.rs:121`, `cycle.rs:99`, `filesystem_explorer.rs:267` | One helper, four verbatim call sites preserved |
-| C10 | The **tri-state** result survives: `Handled` / `FocusChanged` / `Ignored`, where `Ignored` means "not consumed, Godot proceeds" | `dock.rs:20-37`; `:90-101` (end of list), `:196-198` (empty ItemList), `:200` (Enter on RichTextLabel), `:168-170` (no search box), `:219-225` (no script editor) | Declination is a primitive of the model, not an error path (§2) |
+| C9 | Focus changes are **deferred** — immediate `grab_focus()` during input processing is swallowed by Godot's dispatch loop | `dock.rs:228-235`; also `window.rs:121`, `cycle.rs:99`, `filesystem_explorer.rs:267` | One helper, four verbatim call sites preserved |
+| C10 | The **tri-state** result survives: `Handled` / `FocusChanged` / `Declined`, where `Declined` means "not consumed, Godot proceeds" | `dock.rs:20-61`; `:90-101` (end of list), `:220-222` (ItemList with nothing selected), `:200` (Enter on RichTextLabel), `:168-170` (no search box), `:219-225` (no script editor) | Declination is a primitive of the model, not an error path (§2) |
 | C11 | Failures degrade, never crash: every Godot entry point runs inside `panic_guard`, and malformed config warns-and-skips per token | `plugin/mod.rs:111-112`; `settings/reader.rs:238-264` | Registration and parse errors reject one line and keep the rest. Note `panic_guard` protects against panics only — it cannot detect a livelock |
 | C12 | **Zero-config guarantee.** With no `.godot-vimrc` present, and with `ProjectVimrc::Disabled` set, today's keyset works byte-identically | `config/path.rs:23-59`; `config/sandbox.rs:378-381` | Defaults live in provider code, never in the user's file, and never behind the config-load path |
 | C13 | vim-core stays pinned at `tag = "v0.7.1"` | `Cargo.toml:19` (`godot` is `v0.4.5` at `:18`) | Whatever is consumed must already be `pub` on the checked-out tag |
@@ -153,14 +153,14 @@ Make declination first-class and the rest of the architecture is forced.
 Here is the arm again, with the key identity that feeds it:
 
 ```rust
-// src/navigation/dock.rs:54-61
+// src/navigation/dock.rs:78-85
 fn hjkl_to_dock(key: Key) -> Option<DockHjkl> {
     match key {
         Key::J => Some(DockHjkl::Down),
         ...
 ```
 ```rust
-// src/navigation/dock.rs:87-102
+// src/navigation/dock.rs:111-126
 if let Some(direction) = dock_hjkl(key_event) {
     return match direction {
         DockHjkl::Down => {
@@ -177,15 +177,15 @@ Five decisions, one expression. Only the first is the user's business:
 
 | | Decision | Fused location today | New home |
 |---|---|---|---|
-| 1 | **which key** | `hjkl_to_dock`, `dock.rs:54-61` | a `vim_core::keymap::MappingTrie` the user owns, one per surface — key → *name* |
-| 2 | **which widgets are eligible** | `matches!(dock_kind, DockKind::Tree)`, `dock.rs:104,112` | `ActionSpec::requires: Caps`, a subset test evaluated in `resolve.rs` |
+| 1 | **which key** | `hjkl_to_dock`, `dock.rs:78-85` | a `vim_core::keymap::MappingTrie` the user owns, one per surface — key → *name* |
+| 2 | **which widgets are eligible** | `matches!(dock_kind, DockKind::Tree)`, `dock.rs:128,112` | `ActionSpec::requires: Caps`, a subset test evaluated in `resolve.rs` |
 | 3 | **what behaviour runs** | `handle_navigation(&focused, …)` | `run: fn(&mut ActionCtx<'_>) -> Outcome` — one signature for every verb in the plugin |
 | 4 | **did it succeed** | the `bool` return, collapsed inline | `Outcome::{Handled, FocusChanged, Declined}` — a value, with a right of declination |
 | 5 | **is the event consumed** | `Handled` vs `Ignored`, chosen by the executor | a declared `Consumption` policy applied *downstream* of (4), on the transport's own viewport |
 
 Two properties of decision (2) matter enough to state here, because getting either wrong re-imports the widget knowledge one abstraction layer down.
 
-**The capability must name an affordance, not a widget class.** Today `j`/`k` have *no* widget gate at all: `dock.rs:87-102` calls `handle_navigation` unconditionally, and `handle_navigation` has exactly three arms — `Tree` (move selection), `ItemList` (move selection), `RichTextLabel` (scroll 50px and return `true`) — at `dock_nav.rs:105-119` and `:284-298`. The tri-state return is the only gate there is. So the capability `godotvim.item.next` actually needs is *"answers vertical next/prev"*, one bit, held by all three classes: `Caps::VNAV`. Name it `LIST` after the widget taxonomy instead and a plain subset test cannot express "list **or** scrollable", and `j`/`k` silently stop working on the docs panel and the Output log — both focusable `RichTextLabel`s (`godot/editor/doc/editor_help.cpp:3490,3521`; `godot/editor/editor_log.cpp:519`), and the Output log is reachable through a shipped ex-command (`host/custom_commands.rs:70-84`). The surviving vocabulary is five affordances — `VNAV`, `HIERARCHY`, `ACTIVATE`, `TEXTENTRY`, `FILEOPS` — each traceable to one line of today's dispatch. `HIERARCHY` is what replaces `dock.rs:104,112`, and it is a strictly cleaner statement of a gate that is already redundant: `handle_hierarchy` returns `false` for every non-`Tree` class (`dock_nav.rs:127-136`).
+**The capability must name an affordance, not a widget class.** Today `j`/`k` have *no* widget gate at all: `dock.rs:111-126` calls `handle_navigation` unconditionally, and `handle_navigation` has exactly three arms — `Tree` (move selection), `ItemList` (move selection), `RichTextLabel` (scroll 50px and return `true`) — at `dock_nav.rs:105-119` and `:284-298`. The tri-state return is the only gate there is. So the capability `godotvim.item.next` actually needs is *"answers vertical next/prev"*, one bit, held by all three classes: `Caps::VNAV`. Name it `LIST` after the widget taxonomy instead and a plain subset test cannot express "list **or** scrollable", and `j`/`k` silently stop working on the docs panel and the Output log — both focusable `RichTextLabel`s (`godot/editor/doc/editor_help.cpp:3490,3521`; `godot/editor/editor_log.cpp:519`), and the Output log is reachable through a shipped ex-command (`host/custom_commands.rs:70-84`). The surviving vocabulary is five affordances — `VNAV`, `HIERARCHY`, `ACTIVATE`, `TEXTENTRY`, `FILEOPS` — each traceable to one line of today's dispatch. `HIERARCHY` is what replaces `dock.rs:128,112`, and it is a strictly cleaner statement of a gate that is already redundant: `handle_hierarchy` returns `false` for every non-`Tree` class (`dock_nav.rs:127-136`).
 
 **The gate lives in resolution, not in execution.** `Caps` filters *candidate bindings* during the forest walk; `registry.run(id, &mut ctx)` never consults `requires`. That single rule is what keeps `:action godotvim.fs.refresh` working from the command line, where there is no keystroke, no surface and no sampled widget. Actions that genuinely need a widget guard it themselves — `godotvim.fs.*` opens with the same `is_in_filesystem_dock` predicate the `dock.filesystem` probe uses (`filesystem_explorer.rs:380-386`), which is a no-op on the key path and the real guard on the invocation path.
 
@@ -194,8 +194,8 @@ Two properties of decision (2) matter enough to state here, because getting eith
 | Today | Mechanism today | Under this design |
 |---|---|---|
 | FileSystem-first refusal | `if navigation::is_in_filesystem_dock(&control) { … } else { … }`, `plugin/input.rs:140-150` | `dock.filesystem` is a declared child of `dock`. `a` resolves at the child; `j` finds nothing there and the walk continues to the parent. No branch |
-| `DockKind::Tree` gating `h`/`l` | `matches!(dock_kind, DockKind::Tree) && handle_hierarchy(…)`, `dock.rs:104,112` | the binding requires `Caps::HIERARCHY`; an `ItemList` does not contribute it; the candidate is skipped and the walk continues. No widget name in the dispatcher |
-| `j` at the end of a list | `if handle_navigation(…) { Handled } else { Ignored }`, `dock.rs:90-95` | the action returns `Declined`; the walk continues; nothing else matches; nothing is consumed. Godot's `Tree` sees the key |
+| `DockKind::Tree` gating `h`/`l` | `matches!(dock_kind, DockKind::Tree) && handle_hierarchy(…)`, `dock.rs:128,112` | the binding requires `Caps::HIERARCHY`; an `ItemList` does not contribute it; the candidate is skipped and the walk continues. No widget name in the dispatcher |
+| `j` at the end of a list | `if handle_navigation(…) { Handled } else { Ignored }`, `dock.rs:114-119` | the action returns `Declined`; the walk continues; nothing else matches; nothing is consumed. Godot's `Tree` sees the key |
 
 All three now say the same sentence — *this candidate did not take the key; continue* — and the dispatcher stops being a decision tree. It becomes **a fold over an ordered candidate list, terminated by the first non-declination.** That is why there are no priority integers, no `is_in_filesystem_dock` branch and no `DockKind` anywhere in the dispatch path, and why adding a debugger panel edits no dispatcher file.
 
@@ -228,7 +228,7 @@ That is the whole change. Once `godotvim.focus.left` exists as a name, decision 
 
 ### 3.1 The five fused decisions, and where each one goes
 
-One line of shipped code carries the whole problem. `src/navigation/dock.rs:87-102`:
+One line of shipped code carries the whole problem. `src/navigation/dock.rs:111-126`:
 
 ```rust
 if let Some(direction) = dock_hjkl(key_event) {
@@ -260,7 +260,7 @@ The architecture is one mechanism per decision, and each mechanism lives in exac
 | 4 | success | `Outcome::{Handled, FocusChanged, Declined}`, a first-class value with a right of declination | `src/actions/outcome.rs` |
 | 5 | consumption | `Consumption::{Elastic, Void}`, computed downstream of (4), applied by the transport on the transport's own viewport | `src/actions/resolve.rs` → `src/actions/dispatch.rs` |
 
-Decision (4) is the load-bearing one. `dock.rs:96-102` returns `Ignored` when `j` is pressed at the end of an `ItemList`, and `dock.rs:196-198` returns `Ignored` when Enter is pressed on an empty one. Those are not failures — they are how the plugin composes with Godot, whose `Tree` already implements incremental type-to-search (`allow_search` defaults true), arrow keys and F2 rename. `Declined` is the vocabulary word that keeps that behaviour alive, and it is what turns the dispatcher from a decision tree into a fold (§3.6).
+Decision (4) is the load-bearing one. `dock.rs:120-126` returns `Declined` when `j` is pressed at the end of an `ItemList`, and `dock.rs:220-222` returns `Declined` when Enter is pressed with nothing selected (the guard is `get_selected_items()`, so a populated list with no selection declines too). Those are not failures — they are how the plugin composes with Godot, whose `Tree` already implements incremental type-to-search (`allow_search` defaults true) and arrow keys, and above which the docks layer F2/Delete via `ED_SHORTCUT` (`godot/editor/docks/filesystem_dock.cpp:4466`) — F2 is not `Tree` behaviour; `scene/gui/tree.cpp` never mentions it. `Declined` is the vocabulary word that keeps that behaviour alive, and it is what turns the dispatcher from a decision tree into a fold (§3.6).
 
 ### 3.2 Module map
 
@@ -464,10 +464,10 @@ bitflags::bitflags! {
         const VNAV      = 1 << 0;
         /// Expand/collapse. Tree only: `handle_hierarchy` returns false for
         /// every other class (dock_nav.rs:127-136), which is why the
-        /// `DockKind::Tree` gates at dock.rs:104,113 are already redundant.
+        /// `DockKind::Tree` gates at dock.rs:128,113 are already redundant.
         const HIERARCHY = 1 << 1;
         /// Activate selection. Tree + ItemList; reproduces
-        /// `DockKind::RichTextLabel => Ignored` at dock.rs:200.
+        /// `DockKind::RichTextLabel => Ignored` at dock.rs:224.
         const ACTIVATE  = 1 << 2;
         /// Focus owner is a text input (LineEdit). Reproduces focus.rs:73-82.
         const TEXTENTRY = 1 << 3;
@@ -497,9 +497,9 @@ pub(crate) fn widget_caps(is_a: &dyn Fn(&str) -> bool) -> Caps {
 }
 ```
 
-**How RichTextLabel scroll survives.** Today `j`/`k` in a dock has *no* widget gate: `handle_dock_input` calls `handle_navigation` unconditionally (`dock.rs:87-102`), and `handle_navigation`'s third arm scrolls a `RichTextLabel` by `RICHTEXTLABEL_SCROLL_STEP = 50.0` px and returns `true` (`dock_nav.rs:284-298`). `godotvim.item.next` / `godotvim.item.prev` therefore declare `requires: Caps::VNAV`, and `RichTextLabel` contributes `VNAV`. The gate stays a plain subset test — no `requires_any`, no second action, no OR — and both live surfaces keep working: the docs panel (`EditorHelp`'s `class_desc`) and the Output panel (`EditorLog`'s `log`), the latter reachable by the shipped `:Output` ex-command through `grab_focus_on_dock`, whose focusable filter explicitly admits `RichTextLabel` (`src/host/custom_commands.rs:74-76`, `:193-205`). `LIST` is recoverable as `VNAV ∧ ACTIVATE` and `SCROLL` as `VNAV ∧ ¬ACTIVATE`, so nothing is lost; if a future action genuinely means "scrolls but is not a list", adding a `SCROLL` bit back is additive.
+**How RichTextLabel scroll survives.** Today `j`/`k` in a dock has *no* widget gate: `handle_dock_input` calls `handle_navigation` unconditionally (`dock.rs:111-126`), and `handle_navigation`'s third arm scrolls a `RichTextLabel` by `RICHTEXTLABEL_SCROLL_STEP = 50.0` px and returns `true` (`dock_nav.rs:284-298`). `godotvim.item.next` / `godotvim.item.prev` therefore declare `requires: Caps::VNAV`, and `RichTextLabel` contributes `VNAV`. The gate stays a plain subset test — no `requires_any`, no second action, no OR — and both live surfaces keep working: the docs panel (`EditorHelp`'s `class_desc`) and the Output panel (`EditorLog`'s `log`), the latter reachable by the shipped `:Output` ex-command through `grab_focus_on_dock`, whose focusable filter explicitly admits `RichTextLabel` (`src/host/custom_commands.rs:74-76`, `:193-205`). `LIST` is recoverable as `VNAV ∧ ACTIVATE` and `SCROLL` as `VNAV ∧ ¬ACTIVATE`, so nothing is lost; if a future action genuinely means "scrolls but is not a list", adding a `SCROLL` bit back is additive.
 
-The vocabulary is five flags, not nine. `PANEL` was a tautology (the forest root grants it to every non-Barrier path, so `requires: PANEL` can never fail — the `focus.*` actions carry `Caps::empty()`). `ESCAPE` had no possible grantor: returning focus to the script editor is a property of the script editor existing, and `handle_escape_from_dock` already declines when `get_script_editor()` or `get_current_editor()` is `None` (`dock.rs:217-243`) — declination is the correct gate. `SEARCHBOX` was redundant with `handle_slash`'s own decline when `find_sibling_search_box` returns `None` (`dock.rs:162-171`), and deleting it removes the depth-8-climb × depth-20-DFS (`src/navigation/dock_search.rs:15`, `:37`) from the per-focus-change path entirely — `handle_slash` runs it once per `/` press, exactly as today.
+The vocabulary is five flags, not nine. `PANEL` was a tautology (the forest root grants it to every non-Barrier path, so `requires: PANEL` can never fail — the `focus.*` actions carry `Caps::empty()`). `ESCAPE` had no possible grantor: returning focus to the script editor is a property of the script editor existing, and `handle_escape_from_dock` already declines when `get_script_editor()` or `get_current_editor()` is `None` (`dock.rs:241-267`) — declination is the correct gate. `SEARCHBOX` was redundant with `handle_slash`'s own decline when `find_sibling_search_box` returns `None` (`dock.rs:186-195`), and deleting it removes the depth-8-climb × depth-20-DFS (`src/navigation/dock_search.rs:15`, `:37`) from the per-focus-change path entirely — `handle_slash` runs it once per `/` press, exactly as today.
 
 **The gate is a binding-plane gate.** `requires` is a field of `ActionSpec`, not of `Rule`: the resolver reads it by resolving the rule's `RuleTarget::Action(id)` through `registry.spec(id)`, which is why `native` and `<Shortcut>` targets — which have no `ActionSpec` — are never capability-gated. It decides whether a *rule* is a candidate for a resolved keystroke on a surface path. `registry.spec(id).run(&mut cx)` never consults it. That one sentence is what makes `:action godotvim.fs.refresh` work from the command line, where there is no keystroke, no surface and no sampled widget. The safety `FILEOPS` provides on the key path is provided on the invocation path by the executor itself, with the same predicate: every `godotvim.fs.*` body opens with `if !crate::navigation::is_in_filesystem_dock(&t) { return Outcome::Declined; }`. On the key path that guard is unconditionally true — the `dock.filesystem` probe *is* `in_filesystem_dock` — so it is a strict no-op there and does not disturb the verbatim move. `FILEOPS` is the one genuinely non-tautological surface-granted cap, and it earns its place: without it, `panelmap dock a godotvim.fs.create` would create files at `res://` root from a focused Scene tree, because `get_selected_path` returns `None` for a non-FS `Tree` and `begin_create` falls back to `"res://"` (`filesystem_explorer.rs:126-130`).
 
@@ -723,7 +723,7 @@ Every item below was checked for existence and `pub` visibility at the tag. All 
 // src/actions/outcome.rs
 
 /// Result of running one action. This is today's `DockInputResult`
-/// (src/navigation/dock.rs:22-37) promoted out of the dock module.
+/// (src/navigation/dock.rs:20-61) promoted out of the dock module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Consumed in place.
@@ -732,7 +732,9 @@ pub(crate) enum Outcome {
     FocusChanged,
     /// This action refuses this keystroke. The walk continues to the next
     /// candidate; if none accepts, the key is NOT consumed and Godot's native
-    /// handling proceeds (Tree type-to-search, arrows, F2).
+    /// handling proceeds — `Tree`'s own type-to-search and arrow keys at the
+    /// `gui_input` stage, and the docks' `ED_SHORTCUT` accelerators (F2
+    /// rename, Delete) at the later `shortcut_input` stage.
     Declined,
 }
 
@@ -753,7 +755,7 @@ pub(crate) enum Disposition {
 
 #### The `Ignored` → `Declined` migration, mechanically
 
-A `type` alias does **not** alias variants. `pub(crate) type DockInputResult = Outcome;` leaves every `DockInputResult::Ignored` site broken, and the characterization suite written before the move names the variant too. The fix is to do the rename **first**, as a standalone behaviour-free commit at the head of the work, keeping the type name and module:
+A `type` alias *does* resolve variants — RFC 2338 landed in Rust 1.37, so `pub(crate) type DockInputResult = Outcome;` compiles `DockInputResult::Handled` in both expression and pattern position. What an alias cannot do is **rename** a variant: every `DockInputResult::Ignored` site fails with `E0599` because `Outcome` has no such variant. The stronger reason is P0's gate — the characterization suite is written *before* this move and names the variant in its assertions, so folding the rename into P2 would force P2 to edit P0's test files, destroying its own "P0 passes unmodified" acceptance criterion. The fix is to do the rename **first**, as a standalone behaviour-free commit at the head of the work, keeping the type name and module:
 
 ```sh
 git grep -l 'DockInputResult::Ignored' -- src/ \
@@ -763,7 +765,7 @@ git grep -l 'DockInputResult::Ignored' -- src/ \
 Verified count: **16 sites — 14 in `src/navigation/dock.rs`, 2 in `src/navigation/filesystem_explorer.rs`** (`grep -rn 'DockInputResult::Ignored' src/ | wc -l` → 16). Two traps:
 
 1. `WindowNavResult::Ignored` is a **different enum with the same variant name** (`src/navigation/window.rs:41-46`: `enum WindowNavResult { Ignored, Focused }`). A blind `sed` on `::Ignored` hits it. Scope the pattern to `DockInputResult::`.
-2. `DockInputResult::is_consumed(&self)` (`dock.rs:33-36`) has 5 call sites in `src/plugin/input.rs` (`:142,151,154,161,164`); the alias must keep it working, which is why `Outcome::is_consumed` exists alongside `accepted` rather than only the latter.
+2. `DockInputResult::is_consumed(&self)` (`dock.rs:51-61`) has 5 call sites in `src/plugin/input.rs` (`:142,151,154,161,164`); the alias must keep it working, which is why `Outcome::is_consumed` exists alongside `accepted` rather than only the latter.
 
 `WindowNavResult` is then **deleted, not aliased**, in the same commit that introduces `Outcome`: `Focused → Outcome::FocusChanged` (`window.rs:122`), `Ignored → Outcome::Declined` (`window.rs:54`, `:125`) — 3 sites. `handle_cycle_focus` (`cycle.rs:52-100`) is widened from `-> ()` to `-> Outcome`; its two silent early returns (`:56-58`, `:61-63`) become `Declined`, and its sole caller already discards the value (`cycle.rs:32-33`), so this is behaviour-preserving.
 
@@ -771,7 +773,7 @@ After the rename, `pub(crate) type DockInputResult = crate::actions::Outcome;` g
 
 ### 4.3 `Caps`
 
-`Caps` names **affordances, not widget classes**. That is the whole of the F2 fix: `handle_navigation` (`src/navigation/dock_nav.rs:96-125`) has exactly three arms — Tree (selection move), ItemList (selection move), RichTextLabel (50 px scroll at `dock_nav.rs:284-298`, returning `true`) — and `j`/`k` has **no widget gate at all** today (`dock.rs:87-102` calls it unconditionally). A `LIST` bit that RichTextLabel does not hold would kill `j`/`k` on the EditorHelp and Output panels, both of which are focusable RichTextLabels (`godot/editor/doc/editor_help.cpp:3490,3521`; `godot/editor/editor_log.cpp:519`) and one of which is reachable by the shipped `:Output` ex-command (`src/host/custom_commands.rs:74-76`). The correct bit is one that all three classes hold.
+`Caps` names **affordances, not widget classes**. That is the whole of the F2 fix: `handle_navigation` (`src/navigation/dock_nav.rs:96-125`) has exactly three arms — Tree (selection move), ItemList (selection move), RichTextLabel (50 px scroll at `dock_nav.rs:284-298`, returning `true`) — and `j`/`k` has **no widget gate at all** today (`dock.rs:111-126` calls it unconditionally). A `LIST` bit that RichTextLabel does not hold would kill `j`/`k` on the EditorHelp and Output panels, both of which are focusable RichTextLabels (`godot/editor/doc/editor_help.cpp:3490,3521`; `godot/editor/editor_log.cpp:519`) and one of which is reachable by the shipped `:Output` ex-command (`src/host/custom_commands.rs:74-76`). The correct bit is one that all three classes hold.
 
 ```rust
 // src/actions/caps.rs
@@ -787,10 +789,10 @@ bitflags::bitflags! {
         const VNAV      = 1 << 0;
         /// Expand/collapse. Tree only: `handle_hierarchy` returns false for
         /// every other class (dock_nav.rs:127-136), which is why the
-        /// `DockKind::Tree` gates at dock.rs:104,112 are already redundant.
+        /// `DockKind::Tree` gates at dock.rs:128,112 are already redundant.
         const HIERARCHY = 1 << 1;
         /// Activate selection. Tree + ItemList. Reproduces the
-        /// `DockKind::RichTextLabel => Ignored` arm at dock.rs:200.
+        /// `DockKind::RichTextLabel => Ignored` arm at dock.rs:224.
         const ACTIVATE  = 1 << 2;
         /// Focus owner is a text input (LineEdit). Reproduces focus.rs:73-82.
         const TEXTENTRY = 1 << 3;
@@ -821,7 +823,7 @@ pub(crate) fn widget_caps(is_a: &dyn Fn(&str) -> bool) -> Caps {
 
 **The requirement expression is a plain subset test** — `spec.requires ⊆ path.caps` — and it stays that way. There is no second gate axis and no disjunction. `LIST` is recoverable as `VNAV ∧ ACTIVATE` and `SCROLL` as `VNAV ∧ ¬ACTIVATE` if anything ever needs them; re-adding a `SCROLL` bit later is purely additive.
 
-Three flags from the original vocabulary are **deleted**: `PANEL` (granted by the forest root to every non-barrier surface, so `requires: PANEL` is a tautology — `godotvim.focus.*` take `Caps::empty()`), `ESCAPE` (has no possible grantor; `handle_escape_from_dock` already declines when the script editor is missing, `dock.rs:219-225`), and `SEARCHBOX` (redundant with `handle_slash`'s own decline when `find_sibling_search_box` returns `None`, `dock.rs:168-170`). Deleting `SEARCHBOX` is what removes the depth-8-climb × depth-20-DFS (`dock_search.rs:37-58`) from the per-focus-change path entirely — `handle_slash` runs it itself, once per `/` press, exactly as today.
+Three flags from the original vocabulary are **deleted**: `PANEL` (granted by the forest root to every non-barrier surface, so `requires: PANEL` is a tautology — `godotvim.focus.*` take `Caps::empty()`), `ESCAPE` (has no possible grantor; `handle_escape_from_dock` already declines when the script editor is missing, `dock.rs:243-249`), and `SEARCHBOX` (redundant with `handle_slash`'s own decline when `find_sibling_search_box` returns `None`, `dock.rs:192-194`). Deleting `SEARCHBOX` is what removes the depth-8-climb × depth-20-DFS (`dock_search.rs:37-58`) from the per-focus-change path entirely — `handle_slash` runs it itself, once per `/` press, exactly as today.
 
 `FILEOPS` is the one non-tautological surface-granted cap and must stay: without it, `panelmap dock a godotvim.fs.create` would create files at `res://` root when focus is on a Scene tree, because `get_selected_path` returns `None` for a non-FS Tree and `target_dir` falls back to `"res://"` (`filesystem_explorer.rs:126-130`).
 
@@ -1124,7 +1126,7 @@ impl ActionCtx<'_> {
 
     /// Deferred because an immediate `grab_focus()` during input processing is
     /// swallowed by Godot's event dispatch loop. Single home for the four
-    /// copies at dock.rs:210, window.rs:121, cycle.rs:99,
+    /// copies at dock.rs:234, window.rs:121, cycle.rs:99,
     /// filesystem_explorer.rs:267 — all four are `.call_deferred("grab_focus", &[])`.
     pub(crate) fn defer_grab_focus(&mut self, target: &Gd<Control>);
 
@@ -1205,7 +1207,7 @@ use vim_core::keymap::{Key, KeyEvent, LangmapTable, Modifiers, MAX_KEY_SEQUENCE_
 
 /// Ordered probe list for a single physical keystroke. Applied to the WHOLE
 /// key, in this order, first hit wins — which is why `/` on a physical-J layout
-/// can no longer be shadowed the way the hjkl block at dock.rs:87-122 shadows
+/// can no longer be shadowed the way the hjkl block at dock.rs:111-146 shadows
 /// the SLASH arm at :127.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct KeyProbes {
@@ -1221,8 +1223,8 @@ pub(crate) fn probes(ev: &Gd<godot::classes::InputEventKey>, langmap: &LangmapTa
 
 There are **three** probes, not four. A fourth "named key with SHIFT cleared" stage was rejected: it is not a key-identity probe but a per-binding matching tolerance, and globally it would newly fire `godotvim.item.activate` on Shift+Enter and `godotvim.focus.editor` on Shift+Esc in a dock. Three distinct shift regimes exist today and a global stage can express only two:
 
-* `handle_dock_input` rejects **all** modifiers including shift (`dock.rs:76-82`);
-* `handle_search_input` rejects ctrl/alt/meta but **not** shift (`dock.rs:142`);
+* `handle_dock_input` rejects **all** modifiers including shift (`dock.rs:100-106`);
+* `handle_search_input` rejects ctrl/alt/meta but **not** shift (`dock.rs:166`);
 * `FileSystemExplorer::handle_key` uses shift as a **discriminant**: `match (key, shift)` with `(Some(Key::R), true) => refresh` (`filesystem_explorer.rs:87-97`).
 
 So tolerance is `Rule::shift_tolerant`, expanded at registration into two LHS pointing at one `SlotId` (§4.7).
@@ -1342,7 +1344,7 @@ pub(crate) enum RuleTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Consumption {
     /// Consume iff the action accepted. Preserves `j` at end-of-list
-    /// (dock.rs:89-102) and Enter on an empty ItemList (dock.rs:196-198).
+    /// (dock.rs:113-126) and Enter with nothing selected (dock.rs:220-222).
     Elastic,
     /// Consume regardless of outcome AND terminate the walk — the declarative
     /// form of src/plugin/input.rs:126-134, where `handle_window_nav`'s result
@@ -1371,7 +1373,7 @@ pub(crate) struct Rule {
     /// 5 are not counted twice. Not generalized to every key.
     pub(crate) physical: bool,
     /// Also register this LHS with SHIFT set. True on exactly the two
-    /// `searchbox` rules (dock.rs:142 tolerates shift; dock.rs:76-82 does not).
+    /// `searchbox` rules (dock.rs:166 tolerates shift; dock.rs:100-106 does not).
     pub(crate) shift_tolerant: bool,
     /// `<nowait>`: build the trie entry with `MappingEntry::new_nowait`
     /// (trie.rs:75) so `lookup()` promotes `Prefix` to `ExactOnly` internally
@@ -1774,7 +1776,7 @@ Named rather than smoothed over:
 3. **`ActionPlane` as a plain field is a decision, not a discovery.** The plane is a field on `GodotVimCore` rather than `Rc<RefCell<ActionPlane>>` cloned into `ControllerContext`. The tie-breaker is that a `RefCell` guard must not span action execution and the introspector no longer needs controller-side read access. If a future consumer on the controller side does appear, the `Rc<RefCell<…>>` shape returns — and with it the discipline that no borrow may outlive a statement.
 4. **`Resolution::Pending` is typed but its timer is not specified here.** The `timeout_ms` source, the shell-side timer instance (which must *not* be `self.mapping_timer`, whose callback early-returns with no editor attached, `src/plugin/input.rs:311`), and the flush semantics belong to the dispatch model; only the type shape is fixed here.
 5. **`Rule::physical` is claimed at 14 rules**: 4 `panel` Ctrl+hjkl, 4 `dock` hjkl, 1 `dock` `/`, 5 `dock.filesystem` `a/d/r/y/R`. The four `panel` rules gain the flag as a deliberate pre-registered change (today the physical fallback works from a dock but not from the editor, because the escape-hatch block at `input.rs:110-116` matches the logical keycode only and returns before `direction_from_hjkl`'s physical fallback at `:126` is reached). The FS five are counted once and not twice: `resolve_key` (`filesystem_explorer.rs:364-374`, with `is_fs_key` covering `A|D|R|Y` at `:376-378`) *is* the FileSystem path, not a sixth site on top of it. Verify the enumeration against the default rule table in §12.1 before shipping; a miscount is a silently dead binding on a non-QWERTY layout.
-6. **`emit_signal` arity on `Gd<Control>` in gdext v0.4.5** is taken from shipped code (`src/navigation/dock.rs:182,193,194`: `control.emit_signal("item_activated", &[])` and `&[Variant::from(idx)]`). Any executor that moves those calls must preserve both emits and their order; the array `const ITEM_LIST_ACTIVATION_SIGNALS: [&str; 2] = ["item_selected", "item_activated"]` exists so a pure test can catch a dropped emit that no headless test could otherwise see.
+6. **`emit_signal` arity on `Gd<Control>` in gdext v0.4.5** is taken from shipped code (`src/navigation/dock.rs:206,193,194`: `control.emit_signal("item_activated", &[])` and `&[Variant::from(idx)]`). Any executor that moves those calls must preserve both emits and their order; the array `const ITEM_LIST_ACTIVATION_SIGNALS: [&str; 2] = ["item_selected", "item_activated"]` exists so a pure test can catch a dropped emit that no headless test could otherwise see.
 
 ---
 
@@ -1849,7 +1851,7 @@ S0 is unchanged from today (`src/plugin/input.rs:33-76`) and runs inside the exi
 
 ### 5.3 S1 — one global key identity
 
-`src/actions/keys.rs` replaces all three ad-hoc per-site fallbacks that exist today: `dock_hjkl`/`hjkl_to_dock` (`src/navigation/dock.rs:48-62`), `direction_from_hjkl`/`hjkl_direction` (`src/navigation/window.rs:27-38`), and `resolve_key`/`is_fs_key` (`src/navigation/filesystem_explorer.rs:364-378`).
+`src/actions/keys.rs` replaces all three ad-hoc per-site fallbacks that exist today: `dock_hjkl`/`hjkl_to_dock` (`src/navigation/dock.rs:72-86`), `direction_from_hjkl`/`hjkl_direction` (`src/navigation/window.rs:27-38`), and `resolve_key`/`is_fs_key` (`src/navigation/filesystem_explorer.rs:364-378`).
 
 Pipeline: `parse_godot_key` (`src/bridge/input.rs:446`) → `LangmapTable::remap_key_event` → `normalize_key_for_mapping` (`src/controller/process.rs:542`) → `canonicalize`. The langmap table comes from `controller.engine().options().langmap()` — `VimEngine::options` is `pub const fn options(&self) -> &VimOptions` (`vim-core/src/execution/engine/public_api.rs:649`), `VimOptions::langmap` is `pub fn langmap(&self) -> &str` (`vim-core/src/primitives/vim_options.rs:969`), and `LangmapTable::parse` / `remap_key_event` are public at `vim-core/src/keymap/langmap.rs:140` and `:240`. godot-vim uses langmap nowhere today; this is new plumbing, cached and rebuilt at config-source time.
 
@@ -1861,7 +1863,7 @@ The result is three probes, tried **in this order against the whole key**, first
 | 2 | `latin_key` collapsed | Cyrillic / Greek | only when `latin_key` is `Some` — set at `src/bridge/input.rs:410-412` for non-ASCII output only |
 | 3 | `physical_to_ascii(physical, shift)` (`src/bridge/input.rs:97`) | Colemak / Dvorak / AZERTY / QWERTZ | **only for rules carrying the `physical` flag** |
 
-There is no fourth probe. The synthesis carried a "named key with SHIFT cleared" probe; it is deleted, because it is not a key *identity* question but a per-binding matching *tolerance*, and there are three regimes in today's source, not two: `handle_dock_input` rejects all modifiers including shift (`dock.rs:76-82`), `handle_search_input` rejects ctrl/alt/meta but tolerates shift (`dock.rs:142`), and `FileSystemExplorer::handle_key` uses shift as a *discriminant* — `match (key, shift) { (Some(Key::R), true) => self.refresh(), … }` (`filesystem_explorer.rs:87-97`). A global stage cannot express that; a per-surface bool expresses only two of three. It is modelled instead as `Rule::shift_tolerant`, expanded at **registration** into a second trie LHS pointing at the same `SlotId`. Exactly two rules carry it (`searchbox <CR>` and `searchbox <Esc>`), and dispatch gains no stage.
+There is no fourth probe. The synthesis carried a "named key with SHIFT cleared" probe; it is deleted, because it is not a key *identity* question but a per-binding matching *tolerance*, and there are three regimes in today's source, not two: `handle_dock_input` rejects all modifiers including shift (`dock.rs:100-106`), `handle_search_input` rejects ctrl/alt/meta but tolerates shift (`dock.rs:166`), and `FileSystemExplorer::handle_key` uses shift as a *discriminant* — `match (key, shift) { (Some(Key::R), true) => self.refresh(), … }` (`filesystem_explorer.rs:87-97`). A global stage cannot express that; a per-surface bool expresses only two of three. It is modelled instead as `Rule::shift_tolerant`, expanded at **registration** into a second trie LHS pointing at the same `SlotId`. Exactly two rules carry it (`searchbox <CR>` and `searchbox <Esc>`), and dispatch gains no stage.
 
 ### Shift canonicalization
 
@@ -1901,7 +1903,7 @@ Shifted **non-alphabetic** characters are not foldable at all and must not prete
 
 The physical-position fallback is not wrong; evaluating it *inside a match arm* is. Both live instances are the same category error.
 
-**Instance 1 — `/` shadowed by hjkl.** `handle_dock_input` evaluates `if let Some(direction) = dock_hjkl(key_event)` at `dock.rs:87` and returns from inside that arm, before the `match keycode` at `dock.rs:126-132` that owns `Key::SLASH`, `Key::ENTER` and `Key::ESCAPE`. `dock_hjkl` is `hjkl_to_dock(logical).or_else(|| hjkl_to_dock(physical))` (`dock.rs:48-52`). So *any* keystroke sitting at a physical H/J/K/L position is claimed by the hjkl arm regardless of what it logically produces — and both `Key::SLASH => handle_slash` at `:127` and the explicit `_ if physical == Key::SLASH => handle_slash` at `:130` are unreachable for it. The `:130` arm is the author's own attempt to give `/` a physical fallback, defeated by an earlier arm's physical fallback. Which concrete layouts put a `/`-producing key at H/J/K/L is layout-database-dependent and I have not enumerated it; the *structural* unreachability is what matters and is directly readable at those line numbers.
+**Instance 1 — `/` shadowed by hjkl.** `handle_dock_input` evaluates `if let Some(direction) = dock_hjkl(key_event)` at `dock.rs:111` and returns from inside that arm, before the `match keycode` at `dock.rs:150-156` that owns `Key::SLASH`, `Key::ENTER` and `Key::ESCAPE`. `dock_hjkl` is `hjkl_to_dock(logical).or_else(|| hjkl_to_dock(physical))` (`dock.rs:72-76`). So *any* keystroke sitting at a physical H/J/K/L position is claimed by the hjkl arm regardless of what it logically produces — and both `Key::SLASH => handle_slash` at `:127` and the explicit `_ if physical == Key::SLASH => handle_slash` at `:130` are unreachable for it. The `:130` arm is the author's own attempt to give `/` a physical fallback, defeated by an earlier arm's physical fallback. Which concrete layouts put a `/`-producing key at H/J/K/L is layout-database-dependent and I have not enumerated it; the *structural* unreachability is what matters and is directly readable at those line numbers.
 
 **Instance 2 — QWERTZ `z` fires `yank_path`.** This one is not hypothetical. `is_fs_key` matches `Key::A | Key::D | Key::R | Key::Y` (`filesystem_explorer.rs:376-378`) and `resolve_key` tries logical then physical (`:364-374`). German QWERTZ swaps Y and Z, so the key producing `z` sits at physical `Key::Y`: `is_fs_key(Key::Z)` is false, `is_fs_key(Key::Y)` is true, and a QWERTZ user typing `z` in the FileSystem dock executes `godotvim.fs.yank_path`.
 
@@ -1915,7 +1917,7 @@ Two consequences worth naming rather than hiding. First, this is a behaviour *ch
 
 `FocusChain::sample()` is the single Godot→Rust seam. It walks `viewport.gui_get_focus_owner()` upward, bounded by `MAX_DISCOVERY_DEPTH` (`src/scene_tree.rs:41`), and enriches the chain **once per focus change** — cached on `(focus_owner InstanceId, plugin_epoch, index_generation)`, where the epoch bumps on prompt open/close and config reload. Per-node it precomputes the class chain and `widget_caps` from `node.is_class(c)` — the string predicate `classify_focus` already uses and the one verified by compiling code (`src/scene_tree.rs:30-36`). A `ClassDb::is_parent_class` memoization keyed on class name is a permitted optimisation, not the design: it is unverified against gdext v0.4.5 (§4.12) and may only be adopted once the invariant test in §3.7 passes with it. Per-chain it precomputes `attached_editor`, `editor_mode`, `in_filesystem_dock` (`FileSystemDock::is_ancestor_of`, `filesystem_explorer.rs:380-386`), `sibling_nav_control` (the discriminant `classify_focus` uses at `focus.rs:73-82` to separate a dock filter box from a foreign `LineEdit`) and `is_plugin_prompt`.
 
-There is deliberately **no** `sibling_search_box` field. The depth-20 sibling DFS (`src/navigation/dock_search.rs:37-58`) stays inside `handle_slash`, run once per `/` press exactly as today (`dock.rs:162-171`, which already declines when it finds nothing), rather than once per focus change. That is what removes the eager-versus-lazy cost question entirely.
+There is deliberately **no** `sibling_search_box` field. The depth-20 sibling DFS (`src/navigation/dock_search.rs:37-58`) stays inside `handle_slash`, run once per `/` press exactly as today (`dock.rs:186-195`, which already declines when it finds nothing), rather than once per focus change. That is what removes the eager-versus-lazy cost question entirely.
 
 Every `SurfaceSpec::probe` is then `fn(&FocusChain) -> Option<Anchor>` — pure, constructible from literals, no Godot linkage.
 
@@ -2007,9 +2009,9 @@ Four things this encodes.
 
 **`ordered_probes` is where `physical` opt-in lives.** Probes 1 and 2 are offered for every surface; probe 3 is offered only if the index holds a `physical`-flagged rule on that surface. A rule flagged `physical` whose LHS is multi-key applies the flag to the first key only, which is the only key that can enter the trie before the rule is known — stated explicitly because the interaction was previously undefined.
 
-**The capability gate is a plain subset test, and the vocabulary is five affordances.** `Caps` is `VNAV | HIERARCHY | ACTIVATE | TEXTENTRY | FILEOPS`. There is no `LIST` and no `SCROLL`: `LIST` named a widget taxonomy, not an affordance, and a subset test cannot express "LIST or SCROLL". `handle_navigation` has exactly three arms — Tree, ItemList, RichTextLabel (`src/navigation/dock_nav.rs:105-119`) — and today `j`/`k` has **no** widget gate at all (`dock.rs:87-102` calls it unconditionally). The affordance an action needs is "answers vertical next/prev", held by all three classes including `RichTextLabel`, whose arm scrolls 50px and returns `true` (`dock_nav.rs:284-298`). So Tree contributes `VNAV|HIERARCHY|ACTIVATE`, ItemList `VNAV|ACTIVATE`, RichTextLabel `VNAV`, LineEdit `TEXTENTRY`; `godotvim.item.next/prev` requires `VNAV` and `j`/`k` keep scrolling the EditorHelp docs panel and the Output log. `PANEL`, `ESCAPE` and `SEARCHBOX` are deleted as tautologies or dead gates — `PANEL` was granted by the forest root to everything, `ESCAPE` had no possible grantor (`handle_escape_from_dock` already declines when the script editor is missing, `dock.rs:219-225`), and `SEARCHBOX` duplicated `handle_slash`'s own decline. `FILEOPS` survives because it is genuinely non-tautological: without it, `panelmap dock a godotvim.fs.create` on a Scene tree would create files at `res://` root, since `get_selected_path` returns `None` for a non-FS Tree and `begin_create` falls back to `"res://"` (`filesystem_explorer.rs:126-130`).
+**The capability gate is a plain subset test, and the vocabulary is five affordances.** `Caps` is `VNAV | HIERARCHY | ACTIVATE | TEXTENTRY | FILEOPS`. There is no `LIST` and no `SCROLL`: `LIST` named a widget taxonomy, not an affordance, and a subset test cannot express "LIST or SCROLL". `handle_navigation` has exactly three arms — Tree, ItemList, RichTextLabel (`src/navigation/dock_nav.rs:105-119`) — and today `j`/`k` has **no** widget gate at all (`dock.rs:111-126` calls it unconditionally). The affordance an action needs is "answers vertical next/prev", held by all three classes including `RichTextLabel`, whose arm scrolls 50px and returns `true` (`dock_nav.rs:284-298`). So Tree contributes `VNAV|HIERARCHY|ACTIVATE`, ItemList `VNAV|ACTIVATE`, RichTextLabel `VNAV`, LineEdit `TEXTENTRY`; `godotvim.item.next/prev` requires `VNAV` and `j`/`k` keep scrolling the EditorHelp docs panel and the Output log. `PANEL`, `ESCAPE` and `SEARCHBOX` are deleted as tautologies or dead gates — `PANEL` was granted by the forest root to everything, `ESCAPE` had no possible grantor (`handle_escape_from_dock` already declines when the script editor is missing, `dock.rs:243-249`), and `SEARCHBOX` duplicated `handle_slash`'s own decline. `FILEOPS` survives because it is genuinely non-tautological: without it, `panelmap dock a godotvim.fs.create` on a Scene tree would create files at `res://` root, since `get_selected_path` returns `None` for a non-FS Tree and `begin_create` falls back to `"res://"` (`filesystem_explorer.rs:126-130`).
 
-The gate reads `ActionSpec::requires`, reached by resolving the rule's `RuleTarget::Action(id)` through the registry — `Rule` carries no `requires` of its own, which is why `native` and `<Shortcut>` targets are never gated. A gated-out candidate is skipped *as if `NoMatch`* and the walk continues. That is what makes `h`/`l` inert on an `ItemList` with zero widget knowledge in the dispatcher, replacing the `matches!(dock_kind, DockKind::Tree)` gates at `dock.rs:104,112`.
+The gate reads `ActionSpec::requires`, reached by resolving the rule's `RuleTarget::Action(id)` through the registry — `Rule` carries no `requires` of its own, which is why `native` and `<Shortcut>` targets are never gated. A gated-out candidate is skipped *as if `NoMatch`* and the walk continues. That is what makes `h`/`l` inert on an `ItemList` with zero widget knowledge in the dispatcher, replacing the `matches!(dock_kind, DockKind::Tree)` gates at `dock.rs:128,112`.
 
 **`RuleTarget::Native` terminates the walk; it is not a declining action.** This distinction is load-bearing and easy to get wrong. If `native` were modelled as an `ActionSpec` returning `Declined`, the walk would continue to `panel`'s `<C-h>` rule — which is `Consumption::Void` — and consume the key anyway, silently defeating the documented escape hatch. `RuleTarget::Native` returns `Resolution::None` at the surface where it is declared, so `panelmap dock.filesystem <C-h> native` gives Ctrl+H back to Godot inside the FileSystem dock while leaving it bound everywhere else. `panelunmap` is a *different* verb: it removes a rule and lets the walk continue to the parent.
 
@@ -2199,7 +2201,7 @@ for (spec, params, consume) in plan {
 if disposition == Disposition::Consume { viewport.set_input_as_handled(); }
 ```
 
-- **`Elastic`** (the default, and every non-`panel` rule) consumes iff the action accepted. This is what preserves the two tri-state returns the whole design rests on: `j` at the end of an `ItemList` (`dock.rs:89-102`) and Enter on an empty `ItemList` (`dock.rs:196-198`) are not consumed, so Godot's Tree type-to-search, arrows and F2 still see the key.
+- **`Elastic`** (the default, and every non-`panel` rule) consumes iff the action accepted. This is what preserves the two tri-state returns the whole design rests on: `j` at the end of an `ItemList` (`dock.rs:113-126`) and Enter with nothing selected (`dock.rs:220-222`) are not consumed, so Godot's Tree type-to-search and arrows (`gui_input`) and the docks' F2/Delete accelerators (`shortcut_input`) still see the key.
 - **`Void`** (the four `panel` Ctrl+hjkl rules) consumes regardless of outcome **and terminates the walk**. That termination is not cosmetic: it is the difference between transcribing `input.rs:132-133` and inventing something. The cost is real and should be stated — a `Void` rule is a hard key sink on every surface it is registered on, and the way out is `panelmap <surface> <key> native`, not `panelunmap`.
 
 `Outcome` is `Handled | FocusChanged | Declined` with `accepted() == !matches!(self, Declined)`. `FocusChanged` is `Handled` for consumption purposes; the distinction exists for the callers that need focus bookkeeping.
@@ -2290,8 +2292,8 @@ Each row: keystroke and context → sampled chain → surface path (deepest firs
 |---|---|---|---|---|---|---|
 | 1 | `d`, FileSystem dock Tree focused | `[Tree(VNAV\|HIER\|ACT), …, FileSystemDock]`, `in_filesystem_dock: true` | `[dock.filesystem, dock, panel]`, caps `VNAV\|HIER\|ACT\|FILEOPS` | p1 `d` → `dock.filesystem d` → `godotvim.fs.delete` (needs `FILEOPS` ✓) | `Handled` | **Yes** — Elastic + accepted |
 | 2 | `j`, same context | same | same | p1 `j`: `dock.filesystem` `NoMatch` → walk continues → `dock j` → `godotvim.item.next` (needs `VNAV` ✓) | `Handled` | **Yes**. FileSystem-first refusal is now precedence, not the `if fs_result.is_consumed()` branch at `input.rs:139-147` |
-| 3 | `j`, Script list `ItemList`, last item already selected | `[ItemList(VNAV\|ACT), …]` | `[dock, panel]` | p1 `j` → `dock j` → `item.next` | `Declined` (`handle_navigation` returns false, `dock.rs:89-95`) | **No** — walk exhausts; Godot's ItemList sees the key |
-| 4 | `l`, same `ItemList` | same | same | p1 `l` → `dock l` → `item.expand` requires `HIERARCHY`; path caps are `VNAV\|ACT` → **gated out**, treated as `NoMatch`; `panel` has no `l` | — (never ran) | **No** — replaces the `DockKind::Tree` gate at `dock.rs:112` |
+| 3 | `j`, Script list `ItemList`, last item already selected | `[ItemList(VNAV\|ACT), …]` | `[dock, panel]` | p1 `j` → `dock j` → `item.next` | `Declined` (`handle_navigation` returns false, `dock.rs:113-119`) | **No** — walk exhausts; Godot's ItemList sees the key |
+| 4 | `l`, same `ItemList` | same | same | p1 `l` → `dock l` → `item.expand` requires `HIERARCHY`; path caps are `VNAV\|ACT` → **gated out**, treated as `NoMatch`; `panel` has no `l` | — (never ran) | **No** — replaces the `DockKind::Tree` gate at `dock.rs:136` |
 | 5 | `j`, EditorHelp `class_desc` RichTextLabel | `[RichTextLabel(VNAV), …]` | `[dock, panel]` | p1 `j` → `dock j` → `item.next` (needs `VNAV` ✓) | `Handled` (scrolls 50px, `dock_nav.rs:284-298`) | **Yes**. Under the old `Caps::LIST` gate this was a silent regression on two shipped surfaces (docs panel and the `:Output` log) |
 | 6 | `<C-h>`, **no focus owner at all** | `nodes: []` | `unknown` probes `Anchor::Rootless` → `[unknown, panel]`, caps empty | p1 `<C-h>` → `panel <C-h>` → `godotvim.focus.left` (requires `Caps::empty()` ✓) | `Declined` — `cx.target()` is `None`, so `handle_window_nav` is skipped, verbatim `input.rs:127-130` | **Yes** — `Consumption::Void` consumes and stops the walk, verbatim `input.rs:132-133` |
 | 7 | `<C-h>`, attached CodeEdit focused, Normal mode, user has `:nnoremap <C-h> x` | `[CodeEdit]`, `attached_editor: Some(id)`, `editor_mode: Some(Normal)` | `[editor.nav, panel]`; `editor.nav` carries **zero** rules and sets `yields_to_engine` | p1 `<C-h>` → `editor.nav` `NoMatch` → `panel <C-h>` → `focus.left`; `matched = <C-h>` | **S6 gate fires**: anchor yields ∧ `vim_claims(<C-h>)` = `could_start_mapping` = true → `Resolution::None` | **No** — flows to `gui_input`, engine runs `x`. Without the mapping the gate is false and focus moves left |
@@ -2496,7 +2498,7 @@ panelmap dock.filesystem <leader>ff godotvim.fs.create
 "    Sealed: an unbound BARE key stops there and reaches the LineEdit (typing
 "    works, text_submitted fires), while a modifier-bearing key continues to
 "    `panel` so Ctrl+hjkl still escapes both. <shift> reproduces
-"    handle_search_input's guard at dock.rs:142, which rejects ctrl/alt/meta
+"    handle_search_input's guard at dock.rs:166, which rejects ctrl/alt/meta
 "    but tolerates shift.
 panelmap <shift> searchbox <CR>  godotvim.search.accept
 panelmap <shift> searchbox <Esc> godotvim.search.cancel
@@ -2935,7 +2937,7 @@ The fork bill went **7 → ~14 production sites** under critique, plus `:map`-st
 
 **`inventory` / `linkme` link-time provider registration.** Life-before-main constructors in a `cdylib` that the Godot editor `dlopen`s, under `lto = "fat"` (`Cargo.toml:32`) with linker section GC and `reloadable = true` hot-reload, is a cross-platform footgun for zero semantic gain, and it is hostile to the `panic_guard` envelope. A `const PROVIDERS: &[fn(&mut Registrar<'_>)]` array is compile-time checked, reviewable in a diff, and matches the repo's own idiom (`FILTER_CHAIN` in `src/controller/passthrough.rs`, `PRESETS` in `src/config/presets.rs`). The requirement is zero *dispatcher* edits, which the array satisfies exactly.
 
-**A blanket physical-keycode fallback evaluated per match arm.** This is the live `/`-on-physical-J bug: the hjkl block at `src/navigation/dock.rs:87-122` precedes the `Key::SLASH` arm at `:127`, so on a Colemak/Dvorak layout the logical `/` never reaches `handle_slash`. Generalized naively it fires `godotvim.fs.yank_path` when a QWERTZ user presses `z`. Replaced by exactly one ordered probe applied once to the whole key — as-typed after langmap, then `latin_key` normalization, then US-QWERTY position; there is no fourth "named key with SHIFT cleared" stage, because that is a per-binding tolerance (`Rule::shift_tolerant`) rather than a key identity (§5.3) — with the physical probe opt-in per rule, set on exactly the fourteen rules that have that fallback today (fourteen *rules*, not thirteen: `R`/refresh also routes through `resolve_key` at `src/navigation/filesystem_explorer.rs:88`, feeding the `(Some(Key::R), true)` arm at `:95`).
+**A blanket physical-keycode fallback evaluated per match arm.** This is the live `/`-on-physical-J bug: the hjkl block at `src/navigation/dock.rs:111-146` precedes the `Key::SLASH` arm at `:127`, so on a Colemak/Dvorak layout the logical `/` never reaches `handle_slash`. Generalized naively it fires `godotvim.fs.yank_path` when a QWERTZ user presses `z`. Replaced by exactly one ordered probe applied once to the whole key — as-typed after langmap, then `latin_key` normalization, then US-QWERTY position; there is no fourth "named key with SHIFT cleared" stage, because that is a per-binding tolerance (`Rule::shift_tolerant`) rather than a key identity (§5.3) — with the physical probe opt-in per rule, set on exactly the fourteen rules that have that fallback today (fourteen *rules*, not thirteen: `R`/refresh also routes through `resolve_key` at `src/navigation/filesystem_explorer.rs:88`, feeding the `(Some(Key::R), true)` arm at `:95`).
 
 **Moving completion-popup routing out of `gui_input` into the `input()` registry.** `_input` is registered per-viewport (`input_group = "_vp_input" + id`), so it never fires for floating script editors, where `gui_input` does — completion navigation would silently stop working there. It also sits outside the IME guard, so a Japanese user committing a kanji candidate with Enter would have the commit swallowed, and it cannot express `try_handle_completion`'s "handled but do not consume" outcome that lets Godot's own CodeEdit navigate the list. If completion becomes rebindable it stays on the `gui_input` transport (P9).
 
@@ -2953,14 +2955,14 @@ Three properties this ordering buys. **(i)** P0–P5 are all zero-behaviour-chan
 
 Two prerequisite commits land ahead of, or inside, P0 and are independently revertable:
 
-- **Rename `DockInputResult::Ignored` → `Declined` in place** (16 sites: `src/navigation/dock.rs` ×14, `src/navigation/filesystem_explorer.rs` ×2), as a standalone leading commit *before* the characterization suite is written. A Rust `type` alias aliases the type, not its variants, so the P2 "existing call sites compile unchanged" gate is only true if the rename has already happened. Adding `Declined` as an associated `const` alias instead is worse, not better: a const in pattern position does not participate in exhaustiveness checking.
+- **Rename `DockInputResult::Ignored` → `Declined` in place** (16 sites: `src/navigation/dock.rs` ×14, `src/navigation/filesystem_explorer.rs` ×2), as a standalone leading commit *before* the characterization suite is written. A `type` alias does resolve variants (RFC 2338, Rust 1.37+), but it cannot *rename* one: `DockInputResult::Ignored` would fail `E0599` against an `Outcome` that has no such variant. The stronger reason is that P0's characterization assertions name the variant, so folding this into P2 would make P2 edit P0's tests and void its own "P0 passes unmodified" gate. Adding `Declined` as an associated `const` alias instead is worse, not better: a const in pattern position does not participate in exhaustiveness checking.
 - **Thread `attached_editor_id: Option<InstanceId>` into `is_navigable_control`** (`src/scene_tree.rs:30-36`) and into `is_window_candidate` / `is_cycle_candidate`, so a non-attached CodeEdit stops being a legal Ctrl+hjkl target. This is a five-file mechanical edit that fixes a live one-way focus trap and is shippable on its own; `src/navigation/window.rs:166-169` already applies exactly this reasoning to plain TextEdit and simply forgot that a foreign CodeEdit classifies as `Foreign` too. All call sites already hold the id.
 
 ### P0 — Characterization harness (deps: none)
 
 **Why first.** `grep -rn "cfg(test)" src/navigation/ src/scene_tree.rs` returns **zero matches** — verified. `src/plugin/input.rs` (532 lines) likewise has no test module. This subsystem has never been tested, and every later phase is unverifiable until it is.
 
-**Work.** Build `src/testing/focus_fixture.rs`: `FocusChain` as literal data (class chain, instance ids, precomputed facts) with no `Gd<T>` anywhere, plus `src/testing/action_recorder.rs`, a `RecordingCtx` that logs `grab_focus` / `emit_signal` / `push_input` calls with their arguments instead of performing them. Then characterize *current* behaviour of all seven hardcoded sites: the Ctrl+hjkl direction table (`src/navigation/window.rs:23-39`), dock `j`/`k`/`h`/`l` including the `DockKind::Tree` gates (`src/navigation/dock.rs:87-122`), `/`/Enter/Esc (`:124-132`), search-box Esc/Enter with its Shift tolerance (`:138-159`), FS `a`/`d`/`r`/`y` with the `(Some(Key::R), true)` refresh discriminant (`src/navigation/filesystem_explorer.rs:87-97`), the FS prompt's hardcoded `Key::ESCAPE` (`src/plugin/mod.rs:789-798`), and both tri-state `Declined` returns (`dock.rs:96-102`, `:195-198`).
+**Work.** Build `src/testing/focus_fixture.rs`: `FocusChain` as literal data (class chain, instance ids, precomputed facts) with no `Gd<T>` anywhere, plus `src/testing/action_recorder.rs`, a `RecordingCtx` that logs `grab_focus` / `emit_signal` / `push_input` calls with their arguments instead of performing them. Then characterize *current* behaviour of all seven hardcoded sites: the Ctrl+hjkl direction table (`src/navigation/window.rs:23-39`), dock `j`/`k`/`h`/`l` including the `DockKind::Tree` gates (`src/navigation/dock.rs:111-146`), `/`/Enter/Esc (`:124-132`), search-box Esc/Enter with its Shift tolerance (`:138-159`), FS `a`/`d`/`r`/`y` with the `(Some(Key::R), true)` refresh discriminant (`src/navigation/filesystem_explorer.rs:87-97`), the FS prompt's hardcoded `Key::ESCAPE` (`src/plugin/mod.rs:789-798`), and both tri-state `Declined` returns (`dock.rs:120-126`, `:195-198`).
 
 **Files.** NEW `src/testing/{focus_fixture,action_recorder}.rs`; NEW `#[cfg(test)]` modules in `src/navigation/{dock,dock_nav,window,cycle,filesystem_explorer,focus}.rs`.
 
@@ -2970,7 +2972,7 @@ Two prerequisite commits land ahead of, or inside, P0 and are independently reve
 
 ### P1 — One key vocabulary, behind today's dispatcher (deps: P0)
 
-**Work.** Widen `physical_to_ascii` (`src/bridge/input.rs:97`) and `normalize_key_for_mapping` (`src/controller/process.rs:541`) to `pub(crate)`. Add `src/actions/keys.rs` with `probes()`, `canonicalize()`, `validate_lhs_key()` and `parse_lhs()`. Plumb `LangmapTable::parse(controller.engine().options().langmap())` into a table rebuilt at the config-source sites — new plumbing; godot-vim uses langmap nowhere today. Call `parse_godot_key` once at the top of `handle_input_impl` and thread the probe list into the three existing handlers, deleting `dock_hjkl`/`hjkl_to_dock` (`dock.rs:47-62`), `direction_from_hjkl`/`hjkl_direction` (`window.rs:23-39`) and `resolve_key`/`is_fs_key` (`filesystem_explorer.rs:363-378`).
+**Work.** Widen `physical_to_ascii` (`src/bridge/input.rs:97`) and `normalize_key_for_mapping` (`src/controller/process.rs:541`) to `pub(crate)`. Add `src/actions/keys.rs` with `probes()`, `canonicalize()`, `validate_lhs_key()` and `parse_lhs()`. Plumb `LangmapTable::parse(controller.engine().options().langmap())` into a table rebuilt at the config-source sites — new plumbing; godot-vim uses langmap nowhere today. Call `parse_godot_key` once at the top of `handle_input_impl` and thread the probe list into the three existing handlers, deleting `dock_hjkl`/`hjkl_to_dock` (`dock.rs:71-86`), `direction_from_hjkl`/`hjkl_direction` (`window.rs:23-39`) and `resolve_key`/`is_fs_key` (`filesystem_explorer.rs:363-378`).
 
 **Files.** MOD `src/bridge/input.rs`, `src/controller/process.rs`, `src/plugin/input.rs`, `src/navigation/{dock,window,filesystem_explorer}.rs`; NEW `src/actions/keys.rs`.
 
@@ -2980,13 +2982,13 @@ Two prerequisite commits land ahead of, or inside, P0 and are independently reve
 
 ### P2 — Control plane: every executor becomes a named `ActionSpec` (deps: P0)
 
-**Work.** Zero behaviour change. Move `DockInputResult` to `src/actions/outcome.rs` as `Outcome` (the variant rename already happened, so a `type` alias genuinely does compile every remaining site). Add `Caps` (final vocabulary: `VNAV`, `HIERARCHY`, `ACTIVATE`, `TEXTENTRY`, `FILEOPS`) plus the transitional `dock_kind_of`, `ActionSpec`, `ActionId`, `ActionRegistry` over `vim_core::keymap::NameRegistry`, `ActionCtx` with the single `defer_grab_focus()` helper collapsing the four `call_deferred("grab_focus", &[])` copies (`dock.rs:207-210`, `window.rs:118-121`, `cycle.rs:96-99`, `filesystem_explorer.rs:264-267`), `Params` with a clamped `count()`, and `RuleTarget::{Action, Native, Shortcut}`. Every existing executor body becomes an `ActionSpec::run`. The old match arms now call `registry.run(id, &mut ctx)`.
+**Work.** Zero behaviour change. Move `DockInputResult` to `src/actions/outcome.rs` as `Outcome` (the variant rename already happened, so a `type` alias genuinely does compile every remaining site). Add `Caps` (final vocabulary: `VNAV`, `HIERARCHY`, `ACTIVATE`, `TEXTENTRY`, `FILEOPS`) plus the transitional `dock_kind_of`, `ActionSpec`, `ActionId`, `ActionRegistry` over `vim_core::keymap::NameRegistry`, `ActionCtx` with the single `defer_grab_focus()` helper collapsing the four `call_deferred("grab_focus", &[])` copies (`dock.rs:231-234`, `window.rs:118-121`, `cycle.rs:96-99`, `filesystem_explorer.rs:264-267`), `Params` with a clamped `count()`, and `RuleTarget::{Action, Native, Shortcut}`. Every existing executor body becomes an `ActionSpec::run`. The old match arms now call `registry.run(id, &mut ctx)`.
 
 **Two members of §4's types land here as stubs, and the staging is deliberate.** `ActionCtx` ships **chain-less** at P2 — its `chain: Rc<FocusChain>` field cannot exist before `FocusChain` does, and `FocusChain` is P4 — so `run_action_now(spec, params, target)` builds a `{ viewport, target, params, plugin }` context until P4 adds the fifth field. Its signature does not change when it does. Likewise `plane.rs` ships holding only `registry`, `diagnostics` and `generation`: `forest: Forest` arrives with P4 and `index: Rc<BindingIndex>` with P5, which is why P5's file list reads `MOD src/actions/plane.rs`. Neither stub is a shortcut around a dependency; both are the reason P2 can depend on P0 alone.
 
 **Files.** NEW `src/actions/{mod,outcome,caps,action,plane}.rs`; MOD `src/navigation/{dock,dock_nav,window,cycle,filesystem_explorer}.rs` (bodies extracted, logic unchanged); MOD `src/plugin/input.rs`.
 
-**Gate.** P0's suite passes **unmodified** — that is the entire point of doing this behind the old dispatcher. Plus: id interning is idempotent; `as_key(id).key() == Key::Action(id.0)`; every registered action id contains a dot (a registration-time assertion, because P3's name split depends on it); the `RecordingCtx` proves `godotvim.item.activate` on an ItemList emits **both** `item_selected(idx)` and `item_activated(idx)` (`dock.rs:186-197`), which a "verbatim move" can silently halve.
+**Gate.** P0's suite passes **unmodified** — that is the entire point of doing this behind the old dispatcher. Plus: id interning is idempotent; `as_key(id).key() == Key::Action(id.0)`; every registered action id contains a dot (a registration-time assertion, because P3's name split depends on it); the `RecordingCtx` proves `godotvim.item.activate` on an ItemList emits **both** `item_selected(idx)` and `item_activated(idx)` (`dock.rs:210-221`), which a "verbatim move" can silently halve.
 
 **Shippable / revertable.** Yes.
 
@@ -3022,7 +3024,7 @@ Two prerequisite commits land ahead of, or inside, P0 and are independently reve
 
 ### P6 — Dispatcher cutover + introspector, shipped together (deps: P1, P2, P3, P4, P5)
 
-**Work.** Add `src/actions/{resolve,dispatch,introspect}.rs`. Rewrite `handle_input_impl` (`src/plugin/input.rs:32-172`) to the staged model of §5: guards → probes → sample → barrier → hooks → resolve → arbitrate → execute → consume. `classify_focus` and `FocusContext` are deleted **in the same commit that removes their last caller** — `src/plugin/input.rs:76` and the two `FocusContext` matches at `:88-123` and `:137-167`. `DockKind` moves to `dock.rs` rather than dying with `focus.rs`, because `dock.rs:104,113,178-200` and `filesystem_explorer.rs:72,109,125,474-498` use it independently. Route the FS prompt's `gui_input` (`src/plugin/mod.rs:789-798`) through the same resolver on surface `prompt`, with an explicit primary-viewport discriminator rather than deleting either transport. Add re-entrancy protection for `run_editor_shortcut` (keyed fingerprint, frame window, hard per-frame budget) and the `has_shortcut_api` gate with `try_call`. Ship the introspector in the same merge, at three tiers: **push** (every index build emits diagnostics through `godot_warn!`/`godot_print!` directly, never `log::warn!`, because the default log level is Off), **pull via the command line** (`:panelmap`, `:panelmap <lhs>`, `:checkhealth godotvim`, intercepted in `GodotHost::handle_request_inner` beside `vimdebug` and relayed to the plugin as `PendingUiAction::PanelCommand` — the plane lives on `GodotVimCore`, and a multi-line report belongs in the Output panel rather than the one-line status bar), and **pull with no command line at all** (a one-shot `plugins/GodotVim/diagnostics/print_report` bool that `on_settings_changed` reads and writes back to false — Editor Settings is reachable from the menu bar with zero scripts open and zero working keybindings).
+**Work.** Add `src/actions/{resolve,dispatch,introspect}.rs`. Rewrite `handle_input_impl` (`src/plugin/input.rs:32-172`) to the staged model of §5: guards → probes → sample → barrier → hooks → resolve → arbitrate → execute → consume. `classify_focus` and `FocusContext` are deleted **in the same commit that removes their last caller** — `src/plugin/input.rs:76` and the two `FocusContext` matches at `:88-123` and `:137-167`. `DockKind` moves to `dock.rs` rather than dying with `focus.rs`, because `dock.rs:128,113,178-200` and `filesystem_explorer.rs:72,109,125,474-498` use it independently. Route the FS prompt's `gui_input` (`src/plugin/mod.rs:789-798`) through the same resolver on surface `prompt`, with an explicit primary-viewport discriminator rather than deleting either transport. Add re-entrancy protection for `run_editor_shortcut` (keyed fingerprint, frame window, hard per-frame budget) and the `has_shortcut_api` gate with `try_call`. Ship the introspector in the same merge, at three tiers: **push** (every index build emits diagnostics through `godot_warn!`/`godot_print!` directly, never `log::warn!`, because the default log level is Off), **pull via the command line** (`:panelmap`, `:panelmap <lhs>`, `:checkhealth godotvim`, intercepted in `GodotHost::handle_request_inner` beside `vimdebug` and relayed to the plugin as `PendingUiAction::PanelCommand` — the plane lives on `GodotVimCore`, and a multi-line report belongs in the Output panel rather than the one-line status bar), and **pull with no command line at all** (a one-shot `plugins/GodotVim/diagnostics/print_report` bool that `on_settings_changed` reads and writes back to false — Editor Settings is reachable from the menu bar with zero scripts open and zero working keybindings).
 
 **Files.** NEW `src/actions/{resolve,dispatch,introspect}.rs`; MOD `src/plugin/input.rs` (net ~90 lines removed), `src/plugin/mod.rs`, `src/bridge/{godot_host,godot_calls}.rs`, `src/host/dispatch.rs`; DELETE `src/navigation/focus.rs`.
 
@@ -3070,16 +3072,16 @@ Two prerequisite commits land ahead of, or inside, P0 and are independently reve
 
 It pins all seven hardcoded sites, and four cases in particular that a reviewer would otherwise "tidy":
 
-- **`godotvim.item.activate` on a Tree returns `Handled` even with no selection** (`src/navigation/dock.rs:180-184` emits `item_activated` with no arguments and returns `Handled` unconditionally), while the ItemList branch declines when nothing is selected (`:195-197`). Pre-existing asymmetry, preserved verbatim, pinned explicitly.
+- **`godotvim.item.activate` on a Tree returns `Handled` even with no selection** (`src/navigation/dock.rs:204-208` emits `item_activated` with no arguments and returns `Handled` unconditionally), while the ItemList branch declines when nothing is selected (`:195-197`). Pre-existing asymmetry, preserved verbatim, pinned explicitly.
 - **The ItemList double-emit** — `item_selected(idx)` *and* `item_activated(idx)` (`:190-194`), because different editor docks listen to different signals. Verified through `RecordingCtx`, since `Gd<Control>::emit_signal` is unreachable headlessly.
-- **`j`/`k` on a RichTextLabel scroll 50px and return `Handled`** (`src/navigation/dock_nav.rs:284-298`), reached because `dock.rs:87-102` has no `DockKind` gate on `j`/`k` at all. The tests must name **EditorHelp's `class_desc` and EditorLog's `log` specifically**, not "a RichTextLabel": in Godot 4.8-dev a RichTextLabel is focusable only where `set_selection_enabled(true)` has run, so a generic fixture would pin a case that cannot occur. Both are reachable, and `:Output` is a shipped ex-command that focuses one.
+- **`j`/`k` on a RichTextLabel scroll 50px and return `Handled`** (`src/navigation/dock_nav.rs:284-298`), reached because `dock.rs:111-126` has no `DockKind` gate on `j`/`k` at all. The tests must name **EditorHelp's `class_desc` and EditorLog's `log` specifically**, not "a RichTextLabel": in Godot 4.8-dev a RichTextLabel is focusable only where `set_selection_enabled(true)` has run, so a generic fixture would pin a case that cannot occur. Both are reachable, and `:Output` is a shipped ex-command that focuses one.
 - **Ctrl+H navigates panels from a focused attached CodeEdit in Normal mode with no user mapping present**, and `:nnoremap <C-h> x` flips it. This is the direct regression guard on the arbitration seam.
 
 **Four deliberately-RED tests**, `#[ignore]`d at P0 with a documented reason and turning green at a named phase. A refactor that fixes a bug it did not intend to fix is suspicious, so every intended fix is pre-registered as an assertion rather than discovered in review:
 
 | Red test | Turns green | Why it is red today |
 |---|---|---|
-| `/` on a logical-SLASH / physical-J layout reaches `handle_slash` | P1 | the hjkl block at `dock.rs:87-122` shadows the SLASH arm at `:127` |
+| `/` on a logical-SLASH / physical-J layout reaches `handle_slash` | P1 | the hjkl block at `dock.rs:111-146` shadows the SLASH arm at `:127` |
 | Numpad Enter activates in a dock | P1 | never routed through `parse_godot_key`, though `get_named_key` already maps `KP_ENTER → Key::Enter` (`src/bridge/input.rs:23`) |
 | Ctrl+hjkl navigates from the **editor** on a Cyrillic/Greek layout | P1 | the escape-hatch block at `src/plugin/input.rs:110-116` matches the logical keycode only and `return false`s before the physical fallback at `:126` is reached |
 | A foreign CodeEdit is not a Ctrl+hjkl target | prerequisite commit | `is_navigable_control` admits any CodeEdit (`src/scene_tree.rs:30-36`), creating a one-way trap |
@@ -3149,19 +3151,19 @@ Zero-config migration is achieved **by construction, not by a compatibility shim
 | `panel` | `<C-j>` | `godotvim.focus.down` | same | same |
 | `panel` | `<C-k>` | `godotvim.focus.up` | same | same |
 | `panel` | `<C-l>` | `godotvim.focus.right` | same | same |
-| `dock` | `j` | `godotvim.item.next` | `<physical>` | `dock.rs:89-95`; declines at end-of-list |
-| `dock` | `k` | `godotvim.item.prev` | `<physical>` | `dock.rs:96-102` |
-| `dock` | `h` | `godotvim.item.collapse` | `<physical>` | `dock.rs:104` — the `DockKind::Tree` gate becomes `requires: Caps::HIERARCHY` |
-| `dock` | `l` | `godotvim.item.expand` | `<physical>` | `dock.rs:112` |
-| `dock` | `/` | `godotvim.dock.search` | `<physical>` | `dock.rs:127`, `:130` |
-| `dock` | `<CR>` | `godotvim.item.activate` | — | `dock.rs:128`; `requires: Caps::ACTIVATE` reproduces `RichTextLabel => Ignored` at `:200` |
-| `dock` | `<Esc>` | `godotvim.focus.editor` | — | `dock.rs:129` |
+| `dock` | `j` | `godotvim.item.next` | `<physical>` | `dock.rs:113-119`; declines at end-of-list |
+| `dock` | `k` | `godotvim.item.prev` | `<physical>` | `dock.rs:120-126` |
+| `dock` | `h` | `godotvim.item.collapse` | `<physical>` | `dock.rs:128` — the `DockKind::Tree` gate becomes `requires: Caps::HIERARCHY` |
+| `dock` | `l` | `godotvim.item.expand` | `<physical>` | `dock.rs:136` |
+| `dock` | `/` | `godotvim.dock.search` | `<physical>` | `dock.rs:151`, `:130` |
+| `dock` | `<CR>` | `godotvim.item.activate` | — | `dock.rs:152`; `requires: Caps::ACTIVATE` reproduces `RichTextLabel => Ignored` at `:200` |
+| `dock` | `<Esc>` | `godotvim.focus.editor` | — | `dock.rs:153` |
 | `dock.filesystem` | `a` | `godotvim.fs.create` | `<physical>` | `filesystem_explorer.rs:91` |
 | `dock.filesystem` | `d` | `godotvim.fs.delete` | `<physical>` | `:92` — keeps `trigger_dock_shortcut` verbatim |
 | `dock.filesystem` | `r` | `godotvim.fs.rename` | `<physical>` | `:93` |
 | `dock.filesystem` | `y` | `godotvim.fs.yank_path` | `<physical>` | `:94` |
 | `dock.filesystem` | `R` | `godotvim.fs.refresh` | `<physical>` | `:95` — `<S-r>` and `R` fold to one key, so the shipped default is spelled `R` |
-| `searchbox` | `<CR>` | `godotvim.search.accept` | `<shift>` | `dock.rs:142,147` — rejects ctrl/alt/meta, tolerates shift |
+| `searchbox` | `<CR>` | `godotvim.search.accept` | `<shift>` | `dock.rs:166,147` — rejects ctrl/alt/meta, tolerates shift |
 | `searchbox` | `<Esc>` | `godotvim.search.cancel` | `<shift>` | same |
 | `prompt` | `<Esc>` | `godotvim.prompt.dismiss` | — | `src/plugin/mod.rs:795` |
 
@@ -3252,7 +3254,7 @@ Contrast the rejected alternative: had the context been carried inside the mappi
 
 Four, all improvements, all pre-registered as tests that are deliberately RED at P0 and turn GREEN at the cutover — because a refactor that fixes a bug it did not intend to fix is suspicious, and making the fix an explicit prior assertion is what distinguishes it from a regression:
 
-1. **`/` works on a physical-J layout.** Today the hjkl block at `dock.rs:87-122` precedes the `Key::SLASH` arm at `:127`, so logical `/` is shadowed. The global probe order applies to the whole key, once, so it cannot recur.
+1. **`/` works on a physical-J layout.** Today the hjkl block at `dock.rs:111-146` precedes the `Key::SLASH` arm at `:127`, so logical `/` is shadowed. The global probe order applies to the whole key, once, so it cannot recur.
 2. **Numpad Enter works in docks.** `get_named_key` already maps `KP_ENTER → Key::Enter` (`src/bridge/input.rs:23`); routing through `parse_godot_key` picks it up for free.
 3. **Ctrl+hjkl uses the physical fallback from the editor too.** Today it works from a dock but not from the editor, because the escape-hatch block at `input.rs:110-116` matches the *logical* keycode only and returns before `direction_from_hjkl`'s physical fallback at `:126` is reached. The follow-on correctness requirement is that the arbitration gate is evaluated on the **same `KeyEvent` that produced the winning candidate**, so `:nnoremap <C-h> x` still wins on a Cyrillic layout — which is why `resolve` returns the matched key alongside the candidate list.
 4. **Holding Ctrl+J no longer fires a ~20/s storm of deferred `grab_focus` calls**, because `<norepeat>` drops echo events on the four focus rules. Held `j`/`k` in a dock still auto-repeats, because `Repeat` is per-binding rather than a global `is_echo` filter.
