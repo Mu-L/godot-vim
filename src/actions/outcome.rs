@@ -54,3 +54,23 @@ impl Outcome {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_declined_is_unconsumed() {
+        assert!(Outcome::Handled.is_consumed());
+        assert!(Outcome::FocusChanged.is_consumed());
+        assert!(!Outcome::Declined.is_consumed());
+    }
+
+    // Compile-time proof that `is_consumed` stays `const`-evaluable. Nothing
+    // in production evaluates it in a const context yet, so these three lines
+    // are the only thing holding the signature; dropping the `const` would
+    // otherwise be a silent, and later expensive, change.
+    const _: () = assert!(Outcome::Handled.is_consumed());
+    const _: () = assert!(Outcome::FocusChanged.is_consumed());
+    const _: () = assert!(!Outcome::Declined.is_consumed());
+}

@@ -274,9 +274,9 @@ pub(crate) static SEARCH_ACCEPT: ActionSpec = ActionSpec {
 /// The focused control and the signal contract it follows.
 ///
 /// `Declined` on a missing `DockKind` reproduces the old dispatch
-/// precondition exactly: `FocusContext::Dock(kind, control)` could only be
-/// constructed for a Tree, ItemList or RichTextLabel, so `handle_key` was
-/// unreachable for anything else.
+/// precondition exactly: the classifier that preceded the surface forest
+/// could only produce its dock answer for a Tree, ItemList or RichTextLabel,
+/// so the dock handler was unreachable for anything else.
 fn dock_target(
     cx: &mut ActionCtx<'_>,
 ) -> Option<(

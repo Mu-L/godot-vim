@@ -473,14 +473,19 @@ impl GodotVimCore {
         }
     }
 
-    /// Drop the cached chain. Called wherever a fact the probes read can
-    /// change without the focus owner, the mode, the prompt or the index
-    /// generation changing with it — teardown and re-enable, mainly.
+    /// Drop the cached chain and the pending prefix.
     ///
-    /// The pending prefix goes with it: this is the config-reload clearing
-    /// site (`rebuild_bindings` calls it), and a buffer outliving the index it
-    /// was opened against is exactly the hot-reload bug the generation key
-    /// exists to prevent.
+    /// It has exactly one caller — `rebuild_bindings` — and that is the whole
+    /// story rather than an omission. Every other fact a probe reads is
+    /// already a `ChainKey` component (focus owner, attached editor, mode,
+    /// prompt instance, index generation), so the cache invalidates itself on
+    /// the next keystroke and nothing has to remember to call this. Read the
+    /// key, not this function, when asking what can go stale.
+    ///
+    /// What `rebuild_bindings` needs beyond the key is the pending prefix: the
+    /// `generation` bump already moves the key, but a multi-key buffer opened
+    /// against the old index must not survive into the new one, and clearing
+    /// it is not something re-sampling would do.
     pub(super) fn invalidate_focus_chain(&mut self) {
         self.chain_cache = None;
         self.pending.clear();

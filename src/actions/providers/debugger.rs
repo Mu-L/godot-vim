@@ -64,10 +64,6 @@
 //! be a key that consumes nothing and does nothing — the exact silent dead key
 //! the whole design exists to prevent. F10/F11/F12 keep working because we
 //! never claim them.
-#![allow(
-    dead_code,
-    reason = "the surface and its verbs are reached through PROVIDERS, not by name"
-)]
 
 use godot::classes::{DisplayServer, Tree};
 use godot::prelude::*;

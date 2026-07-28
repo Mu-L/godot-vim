@@ -151,10 +151,18 @@ impl Probes {
 
     /// Resolve against a per-key table, trying each probe in turn.
     ///
-    /// This is the shape every shell-side handler uses: the table covers the
-    /// handler's *entire* keyset, so probe 1 is tested against all bindings
-    /// before probe 2 is tested against any. That ordering is the whole point
-    /// of the module.
+    /// The shape every shell-side handler used before the binding index: the
+    /// table covers the handler's *entire* keyset, so probe 1 is tested
+    /// against all bindings before probe 2 is tested against any.
+    ///
+    /// Production resolves through `actions::resolve::walk_path` instead,
+    /// which does the same thing surface-by-surface. This stays as the
+    /// smallest statement of the ordering rule that needs no index, no forest
+    /// and no registry — see the two tests below.
+    #[allow(
+        dead_code,
+        reason = "the ordering rule's minimal statement; production walks the binding index"
+    )]
     pub(crate) fn resolve<T>(&self, mut table: impl FnMut(KeyEvent) -> Option<T>) -> Option<T> {
         self.iter().find_map(&mut table)
     }
@@ -342,7 +350,6 @@ pub(crate) fn probes(event: &Gd<InputEventKey>, langmap: Option<&LangmapTable>) 
 /// is a property of the key vocabulary, not of the config syntax: the same
 /// canonicalization that makes a runtime probe must make a parsed binding, or
 /// the two planes disagree and the binding is dead on arrival.
-#[allow(dead_code, reason = "consumed by the panelmap parser in P5")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LhsError {
     /// A shifted non-alphabetic key has no layout-independent spelling.
@@ -384,7 +391,6 @@ impl std::fmt::Display for LhsError {
 /// produces `Char('1') + SHIFT` — it produces `!` on US and `+` on DE — so a
 /// binding written `<S-1>` is silently dead. Failing at load with a message
 /// telling the user to write `!` is strictly better than accepting it.
-#[allow(dead_code, reason = "consumed by the panelmap parser in P5")]
 pub(crate) fn validate_lhs_key(k: KeyEvent) -> Result<(), LhsError> {
     match k.key() {
         Key::Char(c)
@@ -427,7 +433,6 @@ const NAV_MODES: [vim_core::primitives::Mode; 3] = [
 ///
 /// Conservative in the safe direction: bare digits answer `true`, which
 /// correctly forbids `panelmap panel 3 …` from breaking `3j`.
-#[allow(dead_code, reason = "consumed by the binding index in P5")]
 pub(crate) fn starts_vim_grammar_sequence(key: KeyEvent) -> bool {
     // Core defaults only. User mappings are `could_start_mapping`'s job at
     // dispatch time, not this one's at registration time.
@@ -447,7 +452,6 @@ pub(crate) fn starts_vim_grammar_sequence(key: KeyEvent) -> bool {
 ///
 /// Uses vim-core's own multi-key parser so the shell plane and the editor
 /// plane cannot disagree about what `<Space>ff` or `<C-w>` means.
-#[allow(dead_code, reason = "consumed by the panelmap parser in P5")]
 pub(crate) fn parse_lhs(notation: &str) -> Result<Vec<KeyEvent>, LhsError> {
     if notation.is_empty() {
         return Err(LhsError::Empty);
@@ -699,6 +703,42 @@ mod tests {
                 "{c} begins a count and must be refused"
             );
         }
+    }
+
+    // ── CMD_MODS ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cmd_mods_is_ctrl_alt_and_meta_but_never_shift() {
+        // The shared "this is the IDE's key, not mine" vocabulary, asserted
+        // directly rather than as a side effect of some handler's behaviour.
+        // A dropped bit silently widens what a sealed surface acts on: drop
+        // ALT and `Alt+Esc` in a dock filter box stops breaking the seal, so
+        // it reaches `godotvim.search.accept` instead of the LineEdit.
+        //
+        // SHIFT is deliberately absent. `canonicalize` folds it into the
+        // character, so treating it as a command modifier would make `J` in a
+        // dock read as "not ours" rather than as an unbound key.
+        assert!(CMD_MODS.contains(Modifiers::CTRL));
+        assert!(CMD_MODS.contains(Modifiers::ALT));
+        assert!(CMD_MODS.contains(Modifiers::META));
+        assert!(!CMD_MODS.contains(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn has_command_modifier_answers_once_per_modifier() {
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::META] {
+            let p = Probes::from_slice(&[KeyEvent::new(Key::Escape, m)]);
+            assert!(p.has_command_modifier(), "{m:?} is a command chord");
+        }
+        for m in [Modifiers::NONE, Modifiers::SHIFT] {
+            let p = Probes::from_slice(&[KeyEvent::new(Key::Escape, m)]);
+            assert!(!p.has_command_modifier(), "{m:?} is not a command chord");
+        }
+        // …and it is an ANY over the whole list, not a question about probe 1:
+        // a Cyrillic `Ctrl+х` decodes to a bare char first on some layouts and
+        // only recovers the chord on a later probe.
+        let mixed = Probes::from_slice(&[ch('j'), KeyEvent::new(Key::Char('j'), Modifiers::ALT)]);
+        assert!(mixed.has_command_modifier());
     }
 
     // ── Probes ───────────────────────────────────────────────────────

@@ -8,58 +8,20 @@
 
 use godot::classes::{Control, EditorInterface, Node};
 use godot::prelude::*;
-use vim_core::keymap::{Key as VimKey, KeyEvent, Modifiers};
-
-use crate::actions::keys::Probes;
 
 use crate::bridge::godot_calls;
 
+/// The cross-panel direction a `godotvim.focus.*` verb carries.
+///
+/// Which keystroke produces which direction is not this file's question: the
+/// `panel` surface binds `<C-h>`/`<C-j>`/`<C-k>`/`<C-l>` and `actions::specs`
+/// maps each verb to its variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowNavDirection {
     Down,
     Up,
     Left,
     Right,
-}
-
-/// The cross-panel direction bound to a single key interpretation.
-///
-/// Requires Ctrl and nothing else: `Ctrl+hjkl` is the panel chord, while
-/// bare `hjkl` belongs to whichever dock has focus.
-#[allow(
-    dead_code,
-    reason = "the live table is the binding index; this is P0's characterization oracle"
-)]
-fn direction_for(key: KeyEvent) -> Option<WindowNavDirection> {
-    if key.modifiers() != Modifiers::CTRL {
-        return None;
-    }
-    match key.key() {
-        VimKey::Char('j') => Some(WindowNavDirection::Down),
-        VimKey::Char('k') => Some(WindowNavDirection::Up),
-        VimKey::Char('h') => Some(WindowNavDirection::Left),
-        VimKey::Char('l') => Some(WindowNavDirection::Right),
-        _ => None,
-    }
-}
-
-/// Resolve a keystroke to a cross-panel direction and the interpretation that
-/// matched.
-///
-/// Each probe is tried against the whole hjkl set before the next probe is
-/// tried against any of it, so a lower-priority interpretation can never
-/// outrank what the user actually typed. See `crate::actions::keys`.
-///
-/// The matched `KeyEvent` is returned because the dispatcher must ask the
-/// engine about *that* key — not the raw logical keycode — when deciding
-/// whether a user mapping claims it. Asking about the wrong one is what used
-/// to deny Cyrillic users panel navigation from inside the editor.
-#[allow(
-    dead_code,
-    reason = "the live table is the binding index; this is P0's characterization oracle"
-)]
-pub(crate) fn resolve_panel_key(probes: &Probes) -> Option<(KeyEvent, WindowNavDirection)> {
-    probes.resolve(|k| direction_for(k).map(|dir| (k, dir)))
 }
 
 #[derive(Debug)]
@@ -250,105 +212,16 @@ fn is_window_candidate(control: &Gd<Control>) -> bool {
     true
 }
 
-// ─── Characterization tests (P0) ─────────────────────────────────────────
+// ─── The spatial cone, and the fold that uses it ─────────────────────────
 //
-// These pin CURRENT behaviour of cross-panel navigation's pure decision
-// layer. They must survive the dispatcher cutover UNMODIFIED — that is the
-// acceptance gate for the rebindable-nav work. If a later phase needs to
-// change one of these, the behaviour change is intentional and must be
-// argued in the commit, not absorbed by editing the test.
+// `in_cone` and `beats_incumbent` are the pure core of `handle_window_nav` —
+// the one part of cross-panel navigation that is testable without a Godot
+// runtime, and the part a resolver rewrite cannot reach. Everything above
+// them (which keystroke means which direction) is the binding index's
+// question now and is asserted in `actions::resolve` and `actions::bind`.
 #[cfg(test)]
-mod characterization {
+mod cone {
     use super::*;
-    use crate::actions::keys::Probes;
-    use vim_core::keymap::Key as VK;
-
-    fn ctrl(c: char) -> KeyEvent {
-        KeyEvent::new(VK::Char(c), Modifiers::CTRL)
-    }
-    fn probes(keys: &[KeyEvent]) -> Probes {
-        Probes::from_slice(keys)
-    }
-    fn direction_of(p: &Probes) -> Option<WindowNavDirection> {
-        resolve_panel_key(p).map(|(_, dir)| dir)
-    }
-
-    // ── The Ctrl+hjkl direction table ────────────────────────────────
-
-    #[test]
-    fn hjkl_maps_to_vim_directions() {
-        assert_eq!(direction_for(ctrl('h')), Some(WindowNavDirection::Left));
-        assert_eq!(direction_for(ctrl('j')), Some(WindowNavDirection::Down));
-        assert_eq!(direction_for(ctrl('k')), Some(WindowNavDirection::Up));
-        assert_eq!(direction_for(ctrl('l')), Some(WindowNavDirection::Right));
-    }
-
-    #[test]
-    fn non_hjkl_keys_are_not_directions() {
-        for c in ['a', 'z', '/', '1'] {
-            assert_eq!(direction_for(ctrl(c)), None, "{c} should not navigate");
-        }
-        assert_eq!(
-            direction_for(KeyEvent::new(VK::Enter, Modifiers::CTRL)),
-            None
-        );
-    }
-
-    #[test]
-    fn panel_navigation_requires_ctrl_and_nothing_else() {
-        // Bare hjkl belongs to whichever dock has focus; Ctrl+Shift and
-        // Ctrl+Alt are different chords entirely.
-        assert_eq!(
-            direction_for(KeyEvent::new(VK::Char('j'), Modifiers::NONE)),
-            None
-        );
-        for extra in [Modifiers::SHIFT, Modifiers::ALT, Modifiers::META] {
-            assert_eq!(
-                direction_for(KeyEvent::new(VK::Char('j'), Modifiers::CTRL | extra)),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn the_as_typed_probe_wins_when_it_is_hjkl() {
-        assert_eq!(
-            direction_of(&probes(&[ctrl('j')])),
-            Some(WindowNavDirection::Down)
-        );
-        // Probe 1 is authoritative even when a later probe would mean
-        // something else — that is what makes an OS-level remap take effect.
-        assert_eq!(
-            direction_of(&probes(&[ctrl('j'), ctrl('l')])),
-            Some(WindowNavDirection::Down)
-        );
-    }
-
-    #[test]
-    fn a_later_probe_is_the_fallback_for_non_latin_layouts() {
-        // Cyrillic: probe 1 is the Cyrillic char, probe 2/3 recover `j`.
-        // Without the fallback, Ctrl+hjkl would be dead on this layout.
-        assert_eq!(
-            direction_of(&probes(&[ctrl('о'), ctrl('j')])),
-            Some(WindowNavDirection::Down)
-        );
-    }
-
-    #[test]
-    fn no_probe_matching_hjkl_yields_nothing() {
-        assert_eq!(direction_of(&probes(&[ctrl('a'), ctrl('b')])), None);
-        assert_eq!(direction_of(&Probes::default()), None);
-    }
-
-    #[test]
-    fn resolve_panel_key_reports_the_probe_that_matched() {
-        // The dispatcher asks the engine about THIS key, not the raw logical
-        // keycode — asking about the wrong one denied Cyrillic users panel
-        // navigation from inside the editor.
-        let (matched, dir) = resolve_panel_key(&probes(&[ctrl('о'), ctrl('j')])).unwrap();
-        assert_eq!(matched, ctrl('j'));
-        assert_eq!(dir, WindowNavDirection::Down);
-    }
 
     // ── The spatial cone ─────────────────────────────────────────────
 

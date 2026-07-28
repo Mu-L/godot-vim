@@ -1075,6 +1075,172 @@ mod tests {
         );
     }
 
+    // ── The retired P0 oracles, restated against the live path ───────
+    //
+    // P0's characterization suite pinned three hand-written decision tables —
+    // `dock_action_for`, `direction_for` and `fs_action_for` in
+    // `crate::navigation` — that the binding index replaced. Those tables are
+    // gone. Most of what they asserted was already stated above against
+    // `resolve`; what was not is stated here, so no behaviour lost its only
+    // test when the oracles were deleted.
+
+    #[test]
+    fn a_dock_binds_no_modified_key_of_its_own() {
+        // `dock_action_for` opened with `if modifiers() != NONE { return None }`.
+        // Live that is not a guard but an absence: the `dock` surface binds
+        // seven BARE keys and nothing else, so a modified `j` walks past it.
+        let dock = path("dock", TREE);
+        for m in [
+            Modifiers::ALT,
+            Modifiers::META,
+            Modifiers::SHIFT,
+            Modifiers::CTRL | Modifiers::SHIFT,
+            Modifiers::CTRL | Modifiers::ALT,
+        ] {
+            assert_eq!(
+                stop_of(&run_on(
+                    &dock,
+                    &[KeyEvent::new(VimKey::Char('j'), m)],
+                    NEVER
+                )),
+                Some(Stop::Exhausted),
+                "{m:?}+j must not navigate a dock"
+            );
+        }
+        // The one deliberate divergence from the old table, which answered
+        // `None` for every modifier alike: `Ctrl+j` is not the dock's key, it
+        // is `panel`'s, and the walk is what reaches it.
+        assert_eq!(
+            action_of(&run_on(&dock, &[ctrl('j')], NEVER)),
+            Some("godotvim.focus.down")
+        );
+    }
+
+    #[test]
+    fn every_dock_key_is_tried_at_each_probe_before_the_next_probe_runs() {
+        // The `/`-shadowing bug, restated per key. Under the old per-arm
+        // fallback the hjkl arm consulted the physical position and returned
+        // before the arm owning `/` was reached, so on a layout whose QWERTY-J
+        // position types `/` the filter box was unreachable. `row5_*` covers
+        // the `/`-over-`j` pair; these are the rest of the keyset, including
+        // the two named keys, which a positional probe can never synthesize
+        // and which therefore only ever lead.
+        let dock = path("dock", TREE);
+        for (keys, want) in [
+            (vec![ch('j'), ch('/')], "godotvim.item.next"),
+            (vec![ch('ю'), ch('/')], "godotvim.dock.search"),
+            (
+                vec![named(VimKey::Escape), ch('j')],
+                "godotvim.focus.editor",
+            ),
+            (
+                vec![named(VimKey::Enter), ch('l')],
+                "godotvim.item.activate",
+            ),
+        ] {
+            assert_eq!(
+                action_of(&run_on(&dock, &keys, NEVER)),
+                Some(want),
+                "{keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_box_swallows_typing_and_breaks_its_seal_only_for_a_chord() {
+        let search = path("searchbox", Caps::TEXTENTRY);
+        // `<CR>` and `<Esc>` leave the box, keeping the filter text.
+        for key in [VimKey::Enter, VimKey::Escape] {
+            assert_eq!(
+                action_of(&run_on(&search, &[named(key)], NEVER)),
+                Some("godotvim.search.accept"),
+                "{key:?} must leave the filter box"
+            );
+        }
+        // Everything else reaches the LineEdit — `j` and `/` included. They
+        // are the dock's keys, and the seal is the whole reason they do not
+        // fire in the box the user is typing a filter into.
+        for key in [ch('a'), ch('j'), ch('/'), named(VimKey::Backspace)] {
+            assert_eq!(
+                stop_of(&run_on(&search, &[key], NEVER)),
+                Some(Stop::Sealed("searchbox")),
+                "{key} must reach the LineEdit"
+            );
+        }
+        // Ctrl/Alt/Meta break the seal — and then match nothing, rather than
+        // accepting the filter. This asymmetry is what `CMD_MODS` means, and
+        // until `keys::cmd_mods_is_ctrl_alt_and_meta_but_never_shift` existed
+        // the ALT and META bits of that constant were pinned by exactly one
+        // test, which was an oracle test.
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::META] {
+            assert_eq!(
+                stop_of(&run_on(&search, &[KeyEvent::new(VimKey::Escape, m)], NEVER)),
+                Some(Stop::Exhausted),
+                "{m:?}+Esc must not accept the filter"
+            );
+        }
+    }
+
+    #[test]
+    fn the_four_panel_chords_are_the_only_chords_bound_anywhere() {
+        // `direction_for` answered `Some` only for Ctrl+hjkl, and only when
+        // Ctrl was the sole modifier. Live, both halves are one question:
+        // does any OTHER chord resolve? Asked from `dock`, whose walk passes
+        // through `panel`, where all four live.
+        let dock = path("dock", TREE);
+        for c in ['a', 'z', '/', '1', 'd', 'w'] {
+            assert_eq!(
+                stop_of(&run_on(&dock, &[ctrl(c)], NEVER)),
+                Some(Stop::Exhausted),
+                "Ctrl+{c} is not a panel chord"
+            );
+        }
+        assert_eq!(
+            stop_of(&run_on(
+                &dock,
+                &[KeyEvent::new(VimKey::Enter, Modifiers::CTRL)],
+                NEVER
+            )),
+            Some(Stop::Exhausted),
+            "Ctrl+Enter is not a panel chord"
+        );
+        // Probe 1 is authoritative even when a later probe is also a chord —
+        // that is what makes an OS-level remap take effect.
+        assert_eq!(
+            action_of(&run_on(&dock, &[ctrl('j'), ctrl('l')], NEVER)),
+            Some("godotvim.focus.down")
+        );
+    }
+
+    #[test]
+    fn the_filesystem_keyset_is_five_bare_keys_and_nothing_adjacent() {
+        // `fs_action_for` bound exactly a/d/r/y/R and rejected every modifier.
+        // Two of the near misses are destructive and neither is hypothetical:
+        // a shifted `D` reaching `godotvim.fs.delete` would delete a file on a
+        // keystroke nobody bound, and `Ctrl+d` — half-page-down everywhere
+        // else in this plugin — must not reach it either.
+        let fs = path("dock.filesystem", TREE | Caps::FILEOPS);
+        for c in ['A', 'D', 'Y', 'n', 'z', 'q'] {
+            assert_eq!(
+                stop_of(&run_on(&fs, &[ch(c)], NEVER)),
+                Some(Stop::Exhausted),
+                "{c} must be unbound in the FileSystem dock"
+            );
+        }
+        for m in [Modifiers::ALT, Modifiers::META, Modifiers::CTRL] {
+            assert_eq!(
+                stop_of(&run_on(&fs, &[KeyEvent::new(VimKey::Char('d'), m)], NEVER)),
+                Some(Stop::Exhausted),
+                "{m:?}+d must not delete"
+            );
+        }
+        // …and a non-Latin layout still reaches the keyset by a later probe.
+        assert_eq!(
+            action_of(&run_on(&fs, &[ch('ф'), ch('a')], NEVER)),
+            Some("godotvim.fs.create")
+        );
+    }
+
     #[test]
     fn every_shipped_default_resolves_to_a_registered_verb() {
         // Anti-drift: a default that loads but names nothing is a key that

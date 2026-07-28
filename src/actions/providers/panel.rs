@@ -11,10 +11,6 @@
 //! could never fail — and the `godotvim.focus.*` actions carry
 //! `Caps::empty()` instead. Requiring nothing is exactly what lets cross-panel
 //! movement still fire when there is no focus owner at all.
-#![allow(
-    dead_code,
-    reason = "surfaces are registered by P5's `Registrar` and classified by P6's dispatcher"
-)]
 
 use crate::actions::caps::Caps;
 use crate::actions::surface::{Seal, SurfaceSpec};

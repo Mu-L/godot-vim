@@ -31,10 +31,6 @@
 //! it answers `Unknown` for a Button and never reaches the FS explorer at all.
 //! The probe is the conjunction: in the dock **and** on a widget the dock
 //! surfaces know how to drive.
-#![allow(
-    dead_code,
-    reason = "surfaces are registered by P5's `Registrar` and classified by P6's dispatcher"
-)]
 
 use crate::actions::caps::Caps;
 use crate::actions::surface::{Anchor, Seal, SurfaceSpec};
@@ -54,8 +50,8 @@ pub(crate) static DOCK_FILESYSTEM: SurfaceSpec = SurfaceSpec {
     // auto-dismiss that used to sit at the top of `FileSystemExplorer::
     // handle_key`, before the modifier filter and before any key was
     // resolved. Extracting the keyset into rules would otherwise have lost
-    // it, and it is reachable for MORE keys here than it was there —
-    // `should_intercept_hjkl` used to return before the dock arm ran, so
+    // it, and it is reachable for MORE keys here than it was there — the old
+    // dispatcher's intercept predicate returned before the dock arm ran, so
     // Ctrl+L with the create prompt open moved focus away and left the prompt
     // pointing at a Tree it would later steal focus back to.
     on_key: Some(|cx| {

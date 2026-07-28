@@ -2,9 +2,9 @@
 //!
 //! One surface would not do. The same widget must be a *navigable* place where
 //! Ctrl+hjkl moves between panels, and an *insert-like* place where Ctrl+H is
-//! backspace and Ctrl+J is a newline. Today that split is a mode test inside
-//! `should_intercept_hjkl` (`src/plugin/input.rs`); here it is two
-//! surfaces with different seals, and the dispatcher never mentions a mode.
+//! backspace and Ctrl+J is a newline. The old dispatcher made that split with
+//! a mode test inline in its intercept predicate; here it is two surfaces with
+//! different seals, and the dispatcher never mentions a mode.
 //!
 //! # Why `editor.insert` is written as a negation
 //!
@@ -15,10 +15,6 @@
 //! "focus is the attached CodeEdit", totality is a tautology (`A ∧ P` xor
 //! `A ∧ ¬P`) rather than a test. The test exists anyway, so that a future edit
 //! to either probe fails the suite instead of a user's Ctrl+H.
-#![allow(
-    dead_code,
-    reason = "surfaces are registered by P5's `Registrar` and classified by P6's dispatcher"
-)]
 
 use vim_core::primitives::Mode;
 
@@ -59,8 +55,8 @@ pub(crate) static EDITOR_NAV: SurfaceSpec = SurfaceSpec {
     // `panel`'s four rules carry `<physical>`, and this surface's declared
     // parent IS `panel`, so without this flag a Dvorak `Ctrl+d` would reach
     // `panel <C-h>` by position and become panel-left instead of half-page
-    // down. Verbatim transcription of the `resolve_panel_key_typed` branch at
-    // `src/plugin/input.rs`.
+    // down. This is the surface-plane form of the typed-probes-only lookup
+    // the old dispatcher performed inside the editor.
     refuses_positional: true,
 };
 
@@ -208,8 +204,8 @@ mod tests {
 
     #[test]
     fn a_code_edit_that_is_not_ours_is_neither() {
-        // It falls through to `foreign`. Attachment is instance identity, not
-        // class identity — the split at focus.rs.
+        // It falls through to `foreign`. Attachment is instance identity,
+        // not class identity.
         let theirs = FocusChain {
             nodes: vec![code_edit(9)],
             attached_editor: Some(id(ATTACHED)),

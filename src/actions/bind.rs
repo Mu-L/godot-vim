@@ -32,11 +32,6 @@
 //!
 //! See `docs/DESIGN-rebindable-nav.md` §4.7, §5.6 and §6.3.
 
-// Dead by design in P5, and that is the phase's whole claim: the index is
-// fully built and fully tested while `handle_input_impl` reads nothing from
-// it, so the commit is revertable on its own. P6 does the cutover.
-#![allow(dead_code, reason = "consumed by the dispatcher cutover in P6")]
-
 use compact_str::CompactString;
 use vim_core::keymap::{
     Key, KeyEvent, MappingEntry, MappingKind, MappingOwner, MappingTrie, Modifiers, TrieLookup,
@@ -615,12 +610,24 @@ impl BindingIndex {
         self.rules().count()
     }
 
+    /// Test-only, and load-bearing there: `index.is_empty()` is the whole
+    /// assertion for six distinct registration-rejection tests, each of which
+    /// would go vacuous without it.
+    #[allow(
+        dead_code,
+        reason = "the assertion for six registration-rejection tests"
+    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Whether any rule points at `id` — the `:checkhealth` "this verb is
-    /// registered but unreachable" test.
+    /// Whether any rule points at `id` — the "this verb is registered but
+    /// unreachable" question. No production caller: `:checkhealth`, which
+    /// would have been the one, was never built.
+    #[allow(
+        dead_code,
+        reason = "asked only by tests; the :checkhealth command it was written for was never built"
+    )]
     pub(crate) fn any_rule_targets(&self, id: super::action::ActionId) -> bool {
         self.rules()
             .any(|rule| rule.target == RuleTarget::Action(id))
@@ -1297,8 +1304,10 @@ mod tests {
 
     #[test]
     fn a_dock_rule_is_not_shift_tolerant() {
-        // The asymmetry `handle_dock_input` has today, pinned: Shift+j must
-        // not navigate. It is `J`, a different key.
+        // Half of the asymmetry the old dock handler had, pinned at the index
+        // level: Shift+j must not navigate. It is `J`, a different key. The
+        // other half — the filter box tolerating exactly this — is
+        // `the_shift_tolerant_defaults_match_their_shifted_spelling_too`.
         let index = builtin_index(&registry());
         assert!(resolve(&index, "dock", &[ch('j')]).is_some());
         assert!(resolve(

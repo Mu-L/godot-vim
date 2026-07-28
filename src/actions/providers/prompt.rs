@@ -23,10 +23,6 @@
 //! the `LineEdit`'s own `gui_input`, so typing a filename types and `<CR>`
 //! still reaches `text_submitted`, while Ctrl+hjkl continues up to `panel` and
 //! can still escape.
-#![allow(
-    dead_code,
-    reason = "surfaces are registered by P5's `Registrar` and classified by P6's dispatcher"
-)]
 
 use crate::actions::caps::Caps;
 use crate::actions::surface::{Anchor, Seal, SurfaceSpec};

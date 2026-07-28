@@ -3,9 +3,9 @@
 //! Everything the other probes did not recognize: a `GraphEdit`, a focused
 //! `Button`, a container, a third-party control — and the case with no focus
 //! owner at all. Its parent is `panel`, so Ctrl+hjkl still works from all of
-//! them, which is exactly what `FocusContext::Unknown => true` buys today
-//! (`src/plugin/input.rs`). There is deliberately no `graph` surface:
-//! a `GraphEdit` lands here and inherits panel navigation, which is the
+//! them — the behaviour the old dispatcher got by classifying anything
+//! unrecognized as interceptable. There is deliberately no `graph` surface: a
+//! `GraphEdit` lands here and inherits panel navigation, which is the
 //! behaviour that already ships.
 //!
 //! # The total probe
@@ -18,16 +18,13 @@
 //! # Why `Rootless` exists
 //!
 //! `viewport.gui_get_focus_owner()` returning `None` is a real, mandatory
-//! state — click the editor's empty background and it happens. Today
-//! `classify_focus` answers `Unknown` (`focus.rs`), `input.rs` intercepts
-//! Ctrl+hjkl, finds no focus owner, skips `handle_window_nav` entirely and
-//! calls `set_input_as_handled()` anyway. With an empty `nodes` vector there is
-//! no chain index to anchor at, so `Option<usize>` could not express it and the
-//! case would silently become "no surface", i.e. a key given back to Godot.
-#![allow(
-    dead_code,
-    reason = "surfaces are registered by P5's `Registrar` and classified by P6's dispatcher"
-)]
+//! state — click the editor's empty background and it happens. The old
+//! dispatcher intercepted Ctrl+hjkl there, found no focus owner, skipped the
+//! window-nav walk entirely and called `set_input_as_handled()` anyway; the
+//! `<void>` consumption on `panel`'s four rules is what preserves that. With
+//! an empty `nodes` vector there is no chain index to anchor at, so
+//! `Option<usize>` could not express it and the case would silently become
+//! "no surface", i.e. a key given back to Godot.
 
 use crate::actions::caps::Caps;
 use crate::actions::surface::{Anchor, Seal, SurfaceSpec};

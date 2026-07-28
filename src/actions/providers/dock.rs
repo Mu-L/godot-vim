@@ -22,10 +22,6 @@
 //! currently-dead `find_best_nav_target` recursion in
 //! `src/navigation/dock_nav.rs`, and `j`/`k` would start moving a `Tree` the
 //! user is not focused on.
-#![allow(
-    dead_code,
-    reason = "surfaces are registered by P5's `Registrar` and classified by P6's dispatcher"
-)]
 
 use crate::actions::caps::Caps;
 use crate::actions::surface::{Anchor, FocusChain, Seal, SurfaceSpec};

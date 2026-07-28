@@ -30,10 +30,6 @@
 // P5 builds and tests the parser; P6 is the phase that reads it on the
 // dispatch path. Shipping it inert is what makes this commit revertable on
 // its own.
-#![allow(
-    dead_code,
-    reason = "consumed by the dispatcher cutover in P6; exercised in full by this module's tests"
-)]
 
 use std::fmt::Write as _;
 

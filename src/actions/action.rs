@@ -60,10 +60,6 @@ pub(crate) const MAX_ACTION_COUNT: i64 = 100;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Params(Vec<(CompactString, i64)>);
 
-#[allow(
-    dead_code,
-    reason = "set_int/iter are consumed by the panelmap parser in P5"
-)]
 impl Params {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -98,6 +94,9 @@ impl Params {
         self.int("count", 1).clamp(1, MAX_ACTION_COUNT) as u32
     }
 
+    /// Test-only: `panelmap`'s introspector prints parameters rather than
+    /// asking whether there are any.
+    #[allow(dead_code, reason = "asserted by tests; the introspector uses `iter`")]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -131,8 +130,10 @@ pub(crate) struct ActionNames {
     inner: vim_core::keymap::NameRegistry,
 }
 
-#[allow(dead_code, reason = "name_of feeds the introspector in P6")]
 impl ActionNames {
+    /// Test-only: production interners arrive through `ActionRegistry`'s
+    /// `Default`, which builds this field for them.
+    #[allow(dead_code, reason = "production builds ActionNames via Default")]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -168,7 +169,6 @@ impl ActionNames {
 /// target legal at every trust tier because it can only *reduce* what the
 /// plugin consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "Native/Shortcut gain their consumers in P5/P9")]
 pub(crate) enum RuleTarget {
     /// Run one of the plugin's own registered actions.
     Action(ActionId),
@@ -183,10 +183,6 @@ pub(crate) enum RuleTarget {
 /// Values are `static`s. `Caps` combinators are `const fn` in bitflags 2, and
 /// a non-capturing closure coerces to a `fn` pointer in a static initializer,
 /// so `run: |cx| { … }` is legal there.
-#[allow(
-    dead_code,
-    reason = "desc feeds the introspector in P6; host_invocable gates the host bridge in P3"
-)]
 pub(crate) struct ActionSpec {
     pub(crate) id: &'static str,
     pub(crate) desc: &'static str,
@@ -329,6 +325,15 @@ pub(crate) struct ActionCtx<'a> {
     target: Option<Gd<Control>>,
     pub(crate) params: Params,
     /// Records side effects instead of performing them, under test.
+    ///
+    /// Set only by [`ActionCtx::recording`], which is `#[cfg(test)]`, so the
+    /// field is `None` in every production context. It is not itself
+    /// `#[cfg(test)]` only because every constructor would then need cfg-ing
+    /// too.
+    #[allow(
+        dead_code,
+        reason = "written only by the #[cfg(test)] `recording` constructor"
+    )]
     pub(crate) recorder: Option<&'a mut Vec<Effect>>,
     /// The FileSystem dock's prompt/executor state.
     ///
@@ -361,27 +366,25 @@ pub(crate) struct ActionCtx<'a> {
 
 /// One observable side effect of running an action.
 ///
-/// Exists so a test can assert what an action *did* without a Godot runtime.
-/// The `ItemList` activation path is the reason: it must emit **both**
-/// `item_selected` and `item_activated`, because different editor docks
-/// listen to different ones, and a "verbatim move" can silently halve that.
+/// Exists so a test can assert what an action *did* without a Godot runtime,
+/// and today exactly one test spec uses it. It is **not** what protects the
+/// `ItemList` activation path's double emit — `item_selected` and
+/// `item_activated` both matter because different editor docks listen to
+/// different ones, but `handle_enter` emits them directly on the control, not
+/// through [`ActionCtx::emit`]. What protects that pair is `handle_enter`
+/// being an unmodified verbatim body, and nothing else.
 #[allow(
     dead_code,
-    reason = "GrabFocus is recorded once P4 moves the focus executors"
+    reason = "constructed only by `emit`, whose only caller is a #[cfg(test)] spec"
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Effect {
-    GrabFocus,
     EmitSignal {
         name: &'static str,
         arg: Option<i64>,
     },
 }
 
-#[allow(
-    dead_code,
-    reason = "defer_grab_focus adopts the remaining executors in P4"
-)]
 impl<'a> ActionCtx<'a> {
     /// Capabilities are deliberately NOT a field: the gate lives on the
     /// binding path (see [`ActionRegistry::caps_allow`]), so by the time a
@@ -498,6 +501,15 @@ impl<'a> ActionCtx<'a> {
     }
 
     /// Emit a Godot signal, or record the intent under test.
+    ///
+    /// No shipped verb routes through here yet: `handle_enter` emits on the
+    /// control directly. Kept because it is the only way an executor body can
+    /// be asserted without a Godot runtime, and the test spec in `specs`
+    /// exercises it.
+    #[allow(
+        dead_code,
+        reason = "the only caller is the #[cfg(test)] PROBE spec in `specs`"
+    )]
     pub(crate) fn emit(&mut self, name: &'static str, arg: Option<i64>) {
         if let Some(rec) = self.recorder.as_deref_mut() {
             rec.push(Effect::EmitSignal { name, arg });
@@ -510,22 +522,6 @@ impl<'a> ActionCtx<'a> {
             Some(v) => target.emit_signal(name, &[Variant::from(v as i32)]),
             None => target.emit_signal(name, &[]),
         };
-    }
-
-    /// Move focus, deferred.
-    ///
-    /// Deferred because an immediate `grab_focus()` during input processing is
-    /// swallowed by Godot's event dispatch loop. Single home for what were
-    /// four identical `call_deferred("grab_focus", &[])` copies.
-    pub(crate) fn defer_grab_focus(&mut self, target: &Gd<Control>) {
-        if let Some(rec) = self.recorder.as_deref_mut() {
-            rec.push(Effect::GrabFocus);
-            return;
-        }
-        target
-            .clone()
-            .upcast::<godot::classes::Node>()
-            .call_deferred("grab_focus", &[]);
     }
 }
 
@@ -541,7 +537,6 @@ pub(crate) struct ActionRegistry {
     specs: Vec<&'static ActionSpec>,
 }
 
-#[allow(dead_code, reason = "iter/len/name_of feed the introspector in P6")]
 impl ActionRegistry {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -574,11 +569,21 @@ impl ActionRegistry {
         self.names.name_of(id)
     }
 
+    /// Test-only. Kept together with `iter` and `caps_allow` because each is
+    /// the assertion a registry test is built on, and each would take its
+    /// test's meaning with it.
+    #[allow(dead_code, reason = "the registry tests assert against it")]
     pub(crate) fn len(&self) -> usize {
         self.specs.len()
     }
 
-    /// Every registered action, for the introspector.
+    /// Every registered action. Written for the introspector, which ended up
+    /// enumerating the binding index instead; the registry-completeness tests
+    /// are the callers today.
+    #[allow(
+        dead_code,
+        reason = "the registry-completeness tests enumerate through it"
+    )]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (ActionId, &'static ActionSpec)> + '_ {
         self.specs
             .iter()
@@ -609,6 +614,14 @@ impl ActionRegistry {
     ///
     /// A miss is a **declination**: it is how `h`/`l` go inert on a list with
     /// no hierarchy without the dispatcher naming a widget class.
+    ///
+    /// The shipped gate is the same comparison inlined in `resolve::hit_from`,
+    /// which reaches the spec it already looked up rather than re-resolving
+    /// the id. This spelling is what the capability tests assert against.
+    #[allow(
+        dead_code,
+        reason = "resolve::hit_from inlines this comparison; the capability tests use this form"
+    )]
     pub(crate) fn caps_allow(&self, id: ActionId, caps: Caps) -> bool {
         let Some(spec) = self.get(id) else {
             return false;

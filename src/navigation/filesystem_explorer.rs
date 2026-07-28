@@ -2,17 +2,17 @@
 //!
 //! Adds nvim-tree-style keybindings (`a` create, `d` delete, `r` rename,
 //! `y` yank path, `R` refresh) when focus is on the FileSystem dock's Tree
-//! or ItemList. Routes through `GodotVimCore::handle_input_impl` before
-//! the generic dock navigation in `dock.rs`.
+//! or ItemList. These are **executors**: the keyset itself lives on the
+//! `dock.filesystem` surface in `actions::providers::filesystem`, and the
+//! shape of it — five bare keys, `R` a discriminant rather than a modifier,
+//! and nothing adjacent reachable — is asserted there and in
+//! `resolve::the_filesystem_keyset_is_five_bare_keys_and_nothing_adjacent`.
 
 use godot::classes::{
     Control, DirAccess, DisplayServer, EditorInterface, FileAccess, HBoxContainer, Input,
     InputEventKey, ItemList, Label, LineEdit, Node, Tree, VBoxContainer,
 };
 use godot::prelude::*;
-use vim_core::keymap::{Key as VimKey, KeyEvent, Modifiers};
-
-use crate::actions::keys::Probes;
 
 use crate::bridge::godot_calls;
 
@@ -356,49 +356,6 @@ impl FileSystemExplorer {
     }
 }
 
-/// nvim-tree-style file operation bound to a plain keystroke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FsAction {
-    Create,
-    Delete,
-    Rename,
-    YankPath,
-    Refresh,
-    None,
-}
-
-/// The FileSystem action bound to a single key interpretation.
-///
-/// Shift is a *discriminant* here, not a filter: `R` refreshes while `r`
-/// renames. Because `bridge::input` folds Shift into the character itself,
-/// that distinction is carried by the char, not by a modifier bit.
-#[allow(
-    dead_code,
-    reason = "the live table is the binding index; this is P0's characterization oracle"
-)]
-fn fs_action_for(key: KeyEvent) -> Option<FsAction> {
-    if key.modifiers() != Modifiers::NONE {
-        return None;
-    }
-    match key.key() {
-        VimKey::Char('a') => Some(FsAction::Create),
-        VimKey::Char('d') => Some(FsAction::Delete),
-        VimKey::Char('r') => Some(FsAction::Rename),
-        VimKey::Char('y') => Some(FsAction::YankPath),
-        VimKey::Char('R') => Some(FsAction::Refresh),
-        _ => None,
-    }
-}
-
-/// Resolve a keystroke to a FileSystem-dock action, probe by probe.
-#[allow(
-    dead_code,
-    reason = "the live table is the binding index; this is P0's characterization oracle"
-)]
-fn resolve_fs_action(probes: &Probes) -> FsAction {
-    probes.resolve(fs_action_for).unwrap_or(FsAction::None)
-}
-
 /// `y` — copy the selected path to the clipboard.
 ///
 /// A free function rather than a method because it reads nothing from the
@@ -557,92 +514,5 @@ fn get_selected_path(control: &Gd<Control>, kind: DockKind) -> Option<String> {
             Some(path.to_string())
         }
         DockKind::RichTextLabel => None,
-    }
-}
-
-// ─── Characterization tests (P0) ─────────────────────────────────────────
-//
-// Pins CURRENT behaviour of the FileSystem dock's nvim-tree-style keyset.
-// Must survive the dispatcher cutover UNMODIFIED.
-#[cfg(test)]
-mod characterization {
-    use super::*;
-    use crate::actions::keys::Probes;
-
-    fn ch(c: char) -> KeyEvent {
-        KeyEvent::new(VimKey::Char(c), Modifiers::NONE)
-    }
-    fn probes(keys: &[KeyEvent]) -> Probes {
-        Probes::from_slice(keys)
-    }
-
-    #[test]
-    fn the_shipped_keyset() {
-        assert_eq!(fs_action_for(ch('a')), Some(FsAction::Create));
-        assert_eq!(fs_action_for(ch('d')), Some(FsAction::Delete));
-        assert_eq!(fs_action_for(ch('r')), Some(FsAction::Rename));
-        assert_eq!(fs_action_for(ch('y')), Some(FsAction::YankPath));
-        assert_eq!(fs_action_for(ch('R')), Some(FsAction::Refresh));
-    }
-
-    #[test]
-    fn shift_is_a_discriminant_only_for_r() {
-        // `R` refreshes, `r` renames. Because `bridge::input` folds Shift into
-        // the character itself, that distinction rides on the char, not on a
-        // modifier bit. Shifted forms of the other four are simply unbound.
-        assert_eq!(fs_action_for(ch('R')), Some(FsAction::Refresh));
-        assert_eq!(fs_action_for(ch('r')), Some(FsAction::Rename));
-        for c in ['A', 'D', 'Y'] {
-            assert_eq!(fs_action_for(ch(c)), None, "{c} should be unbound");
-        }
-    }
-
-    #[test]
-    fn unbound_keys_decline() {
-        for c in ['n', 'j', 'z', 'q'] {
-            assert_eq!(resolve_fs_action(&probes(&[ch(c)])), FsAction::None);
-        }
-    }
-
-    #[test]
-    fn modified_keys_are_never_filesystem_actions() {
-        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::META] {
-            assert_eq!(fs_action_for(KeyEvent::new(VimKey::Char('d'), m)), None);
-        }
-    }
-
-    #[test]
-    fn a_later_probe_recovers_the_keyset_on_a_non_latin_layout() {
-        // Cyrillic: probe 1 is the Cyrillic char, a later probe recovers `a`.
-        assert_eq!(
-            resolve_fs_action(&probes(&[ch('ф'), ch('a')])),
-            FsAction::Create
-        );
-    }
-
-    #[test]
-    fn the_as_typed_probe_wins_when_it_is_bound() {
-        // The user typed `d`; a physical position of `y` must not win.
-        assert_eq!(
-            resolve_fs_action(&probes(&[ch('d'), ch('y')])),
-            FsAction::Delete
-        );
-    }
-
-    #[test]
-    fn a_qwertz_z_still_reaches_the_physical_alias() {
-        // Was `known_bug_qwertz_z_yanks_the_path`, and it is NOT a bug that
-        // P1 fixes — it is the deliberate cost of supporting position-based
-        // layouts (Dvorak, Colemak, AZERTY). On QWERTZ the QWERTY-Y position
-        // emits `z`; `z` is unbound, so the physical probe wins and yanks.
-        //
-        // What P1 changes is that the alias is now ordered — probe 1 always
-        // gets first refusal. It becomes escapable at P5, when a user can
-        // write `panelmap dock.filesystem z <target>` and win probe 1; the
-        // same phase scopes the alias to the fourteen rules that want it.
-        assert_eq!(
-            resolve_fs_action(&probes(&[ch('z'), ch('y')])),
-            FsAction::YankPath
-        );
     }
 }

@@ -5,9 +5,9 @@
 //! Project Settings field. `Seal::Barrier` makes "never intercept here"
 //! structural rather than conditional — dispatch returns `Ignore` before any
 //! lookup, no ancestor is consulted, and `panel`'s Ctrl+hjkl rules are
-//! unreachable. That is the transcription of `FocusContext::Foreign => false`
-//! at `src/plugin/input.rs`, and it is the reason typing Ctrl+H in a
-//! Project Settings field still backspaces.
+//! unreachable. That is the structural form of the old dispatcher's flat
+//! refusal to touch a foreign text input, and it is the reason typing Ctrl+H
+//! in a Project Settings field still backspaces.
 //!
 //! # Position in `PROVIDERS` is load-bearing in both directions
 //!
@@ -28,10 +28,6 @@
 //! attachment test is instance identity, which is what makes it a *foreign*
 //! CodeEdit rather than a class question — and the attached one is claimed by
 //! `editor.nav`/`editor.insert` several probes earlier regardless.
-#![allow(
-    dead_code,
-    reason = "surfaces are registered by P5's `Registrar` and classified by P6's dispatcher"
-)]
 
 use crate::actions::caps::Caps;
 use crate::actions::surface::{Anchor, Seal, SurfaceSpec};
@@ -46,12 +42,11 @@ pub(crate) static FOREIGN: SurfaceSpec = SurfaceSpec {
     grants: |_| Caps::empty(),
     probe: |chain| {
         let node = chain.focus()?;
-        // A CodeEdit that is not ours, or a plain TextEdit (focus.rs
-        // and :90-92).
+        // A CodeEdit that is not ours, or a plain TextEdit.
         if node.is("TextEdit") && !chain.attached_editor_focused() {
             return Some(Anchor::Node(0));
         }
-        // A LineEdit that is nobody's filter box (focus.rs).
+        // A LineEdit that is nobody's filter box.
         if node.is("LineEdit") && chain.sibling_nav_control.is_none() {
             return Some(Anchor::Node(0));
         }

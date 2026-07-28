@@ -2,18 +2,15 @@
 //!
 //! The discriminant is not the class and not the placeholder text: it is
 //! whether the `LineEdit` has a *sibling navigable control* inside the same
-//! dock boundary (`src/navigation/focus.rs`). A filter box always does,
-//! because filtering is filtering *something*; a Project Settings field never
-//! does. `FocusChain::sibling_nav_control` records the answer at sample time,
+//! dock boundary — the same discriminant the classifier this plane replaced
+//! used. A filter box always does, because filtering is filtering *something*;
+//! a Project Settings field never does.
+//! `FocusChain::sibling_nav_control` records the answer at sample time,
 //! so the depth-8 climb over a depth-20 DFS runs once per focus change instead
 //! of once per keystroke.
 //!
 //! `Seal::Sealed`, for the same reason as `prompt`: bare keys must reach the
 //! control or the box cannot be typed in, while Ctrl+hjkl must still escape it.
-#![allow(
-    dead_code,
-    reason = "surfaces are registered by P5's `Registrar` and classified by P6's dispatcher"
-)]
 
 use crate::actions::caps::Caps;
 use crate::actions::surface::{Anchor, Seal, SurfaceSpec};
@@ -26,8 +23,8 @@ pub(crate) static SEARCHBOX: SurfaceSpec = SurfaceSpec {
     seal: Seal::Sealed,
     grants: |_| Caps::empty(),
     // `LineEdit` and not merely "accepts text": a `TextEdit` with a sibling
-    // Tree is a foreign multi-line editor, not a filter box, and
-    // `classify_focus` reaches this arm only for `LineEdit` (focus.rs).
+    // Tree is a foreign multi-line editor, not a filter box. The classifier
+    // this replaced reached its filter-box arm only for `LineEdit` too.
     probe: |chain| {
         (chain.focus_is("LineEdit") && chain.sibling_nav_control.is_some())
             .then_some(Anchor::Node(0))

@@ -60,10 +60,6 @@
 //! now reach the vim engine, which is both more correct and — unlike before —
 //! visible and reversible from a vimrc (`panelmap <shift> editor.completion
 //! <Up> godotvim.completion.navigate` restores the Shift+Up half).
-#![allow(
-    dead_code,
-    reason = "the surface and its verbs are reached through PROVIDERS and by name from the gui_input transport"
-)]
 
 use crate::actions::action::{ActionCtx, ActionSpec, CompletionOps};
 use crate::actions::caps::Caps;

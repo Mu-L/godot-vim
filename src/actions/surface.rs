@@ -26,16 +26,6 @@
 //!
 //! See `docs/DESIGN-rebindable-nav.md` §3.3, §3.7, §4.4 and §5.4.
 
-// Dead by design in P4, and that is the phase's whole claim: the plane is
-// fully built and fully tested while nothing in production reads it, so the
-// commit is revertable on its own. P5 builds the binding index against these
-// types; P6 samples a chain in `handle_input_impl` and deletes `classify_focus`
-// in the same commit.
-#![allow(
-    dead_code,
-    reason = "the surface plane gains its production callers in P5 (binding index) and P6 (dispatcher cutover)"
-)]
-
 use bitflags::bitflags;
 use compact_str::CompactString;
 use godot::prelude::{Gd, InstanceId};
@@ -182,11 +172,11 @@ pub(crate) struct FocusChain {
     /// unbounded (`src/navigation/filesystem_explorer.rs`). Grants
     /// [`Caps::FILEOPS`] through the `dock.filesystem` surface.
     pub(crate) in_filesystem_dock: bool,
-    /// Discriminant for the `searchbox` probe ONLY, reproducing
-    /// `src/navigation/focus.rs`. There is deliberately no
-    /// `sibling_search_box` field: the depth-20 DFS that finds one stays
-    /// inside `handle_slash`, run once per `/` press exactly as today, rather
-    /// than once per focus change.
+    /// Discriminant for the `searchbox` probe ONLY, reproducing the
+    /// filter-box test the classifier this plane replaced ran. There is
+    /// deliberately no `sibling_search_box` field: the depth-20 DFS that finds
+    /// one stays inside `handle_slash`, run once per `/` press exactly as
+    /// today, rather than once per focus change.
     pub(crate) sibling_nav_control: Option<InstanceId>,
     /// Instance equality against the `FileSystemExplorer` prompt `LineEdit`.
     /// Probed before `searchbox` **and** before `foreign`; see the ordering
@@ -220,6 +210,13 @@ impl FocusChain {
 
     /// Affordances of the focus owner. Ancestors contribute nothing — a
     /// surface that wants to add capabilities does it through `grants`.
+    ///
+    /// A convenience wrapper for fixture assertions. Production classification
+    /// calls [`ChainNode::widget_caps`] on the focus node directly.
+    #[allow(
+        dead_code,
+        reason = "fixture-assertion wrapper; production calls ChainNode::widget_caps"
+    )]
     pub(crate) fn widget_caps(&self) -> Caps {
         self.focus()
             .map_or_else(Caps::empty, ChainNode::widget_caps)
@@ -290,9 +287,9 @@ impl FocusChain {
 /// Where on the chain a surface matched.
 ///
 /// Not `Option<usize>`, because "no focus owner at all" has no chain index and
-/// is a state the dispatcher must still act in: `classify_focus` returns
-/// `Unknown` for it (`src/navigation/focus.rs`), `input.rs` maps that to
-/// intercept, and then calls `set_input_as_handled()` with no target found.
+/// is a state the dispatcher must still act in: the `unknown` surface claims
+/// it, `panel`'s `<void>` rules resolve from there, and the key is consumed
+/// with no target found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Anchor {
     /// Anchored at `chain.nodes[idx]`.
@@ -318,8 +315,9 @@ pub(crate) enum Seal {
     /// Ctrl+hjkl still escapes both.
     Sealed,
     /// Total hard stop: dispatch returns `Ignore` before any lookup. The
-    /// structural form of `FocusContext::Foreign => false` and of
-    /// "never intercept in insert-like modes".
+    /// structural form of the two unconditional refusals the pre-surface-plane
+    /// dispatcher spelled as `if` arms: a foreign text input is never touched,
+    /// and an insert-like mode never intercepts.
     Barrier,
 }
 
@@ -352,8 +350,9 @@ pub(crate) struct SurfaceSpec {
     /// from every surface on the path — even from a rule that carries
     /// `<physical>`.
     ///
-    /// This is the surface-plane transcription of `resolve_panel_key_typed`
-    /// (`src/plugin/input.rs`), and it is a guard, not a preference.
+    /// This is the surface-plane form of the typed-probes-only lookup the
+    /// old dispatcher performed inside the editor, and it is a guard, not a
+    /// preference.
     /// On Dvorak the QWERTY-H position emits `d`, so honouring the positional
     /// probe inside the attached editor turns `Ctrl+d` — half-page-down —
     /// into panel-left; Colemak does the same to `Ctrl+n` and `Ctrl+e`. It
@@ -418,10 +417,6 @@ impl Forest {
         self.specs.iter().map(|s| s.id)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.specs.len()
-    }
-
     /// The declared path from `leaf` to its root, deepest first.
     ///
     /// Bounded by `self.specs.len()` iterations. A declared cycle is rejected
@@ -449,6 +444,14 @@ impl Forest {
     /// The partition audit's input: two claimants that are not forest-related
     /// mean two providers disagree about who owns a control, resolved by array
     /// position — nondeterministic to the authors and invisible to the user.
+    ///
+    /// The audit it feeds is a test (`providers::ordering`), not a runtime
+    /// check: production takes the first claimant via [`Forest::classify`] and
+    /// never enumerates the rest.
+    #[allow(
+        dead_code,
+        reason = "input to the partition audit in providers::ordering, which is a test"
+    )]
     pub(crate) fn claimants(&self, chain: &FocusChain) -> Vec<(SurfaceId, Anchor)> {
         self.specs
             .iter()
@@ -637,7 +640,7 @@ mod tests {
     #[test]
     fn a_code_edit_answers_text_edit() {
         // `foreign` claims "a TextEdit that is not ours", which must catch a
-        // foreign CodeEdit — the arm at focus.rs.
+        // foreign CodeEdit.
         let ce = code_edit(1);
         assert!(ce.is("CodeEdit"));
         assert!(ce.is("TextEdit"));
@@ -699,7 +702,7 @@ mod tests {
     #[test]
     fn attachment_is_instance_identity_not_class_identity() {
         // Two CodeEdits with the same class; only the one we attached to is
-        // ours. This is the whole `Editor` vs `Foreign` split at focus.rs.
+        // ours. This is the whole `editor.*` versus `foreign` split.
         let ours = FocusChain {
             nodes: vec![code_edit(7)],
             attached_editor: Some(id(7)),

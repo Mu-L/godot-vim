@@ -26,7 +26,7 @@
 //! 2. **`foreign` must therefore precede `unknown`.** Behind it, a Project
 //!    Settings `LineEdit` would resolve to `unknown` → `panel` instead of to a
 //!    `Barrier`, and Ctrl+hjkl would be consumed mid-word — a direct violation
-//!    of `FocusContext::Foreign => false` (`src/plugin/input.rs`).
+//!    of the old dispatcher's refusal to touch a foreign text input.
 //! 3. **`foreign` must not be first.** Its predicate claims "a `LineEdit` with
 //!    no sibling nav control", and whether the plugin's own FileSystem prompt
 //!    has one is an editor-runtime fact nobody can settle from source. Ahead
@@ -49,10 +49,6 @@
 //! Every clause above is a test in this module's `ordering` block, each
 //! written so that reordering the array fails the suite rather than a user's
 //! keyboard.
-#![allow(
-    dead_code,
-    reason = "the provider array is consumed by `ActionPlane::rebuild` in P5 and by the dispatcher in P6"
-)]
 
 pub(crate) mod completion;
 pub(crate) mod debugger;
@@ -917,9 +913,11 @@ mod tests {
         }
     }
 
-    // ── Agreement with the classifier still in production ────────────
+    // ── Agreement with the classifier this plane replaced ────────────
 
-    /// `classify_focus`'s five answers (`src/navigation/focus.rs`).
+    /// The five answers the pre-surface-plane `classify_focus` gave. That
+    /// function and the file it lived in are gone; this enum and the
+    /// transcription below are all that remain of it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Legacy {
         Editor,
@@ -929,15 +927,15 @@ mod tests {
         Unknown,
     }
 
-    /// `classify_focus` (`src/navigation/focus.rs`) transcribed against
-    /// the sampled chain instead of a live `Gd<Control>` — same order, same
-    /// predicates, same fallthrough.
+    /// The old `classify_focus`, transcribed against the sampled chain
+    /// instead of a live `Gd<Control>` — same order, same predicates, same
+    /// fallthrough.
     ///
-    /// This is the testable half of the shadow comparison the design asks for.
-    /// The other half — running both over a scripted corpus inside a live
-    /// editor — needs a sampled chain on the dispatch path, which P4
-    /// deliberately does not add: `handle_input_impl` still calls
-    /// `classify_focus` and reads nothing from this plane.
+    /// It has no production twin any more: the classifier it copies was
+    /// deleted with its last caller, and the forest is the only classifier
+    /// left. What this still buys is a second, independently written
+    /// statement of the five-way split, so a probe reordering that quietly
+    /// changes who owns a control fails here as well as in `ordering`.
     fn classify_focus_equivalent(chain: &FocusChain) -> Legacy {
         let Some(node) = chain.focus() else {
             return Legacy::Unknown;
