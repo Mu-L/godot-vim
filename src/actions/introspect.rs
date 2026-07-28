@@ -22,7 +22,7 @@
 //! one-line status bar — a resolution trace is a dozen lines and the default
 //! `log` level is Off.
 //!
-//! See `docs/DESIGN-rebindable-nav.md` §5.9 and the `P6` block in §10.
+//! See `DESIGN-rebindable-nav.md` (design notes, kept outside this repo) §5.9 and the `P6` block in §10.
 
 use std::fmt::Write as _;
 

@@ -45,7 +45,7 @@
 //!      into `Tree` incremental search. A deliberate divergence from Vim,
 //!      which would flush both as literals.
 //!
-//! See `docs/DESIGN-rebindable-nav.md` §5.10 and the `P8` block in §10.
+//! See `DESIGN-rebindable-nav.md` (design notes, kept outside this repo) §5.10 and the `P8` block in §10.
 
 use vim_core::keymap::{KeyEvent, TrieLookup, MAX_KEY_SEQUENCE_LEN};
 

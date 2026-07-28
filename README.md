@@ -181,7 +181,7 @@ Record with `qa`, replay with `@a`. Named registers `"a`-`"z`, system clipboard 
 
 **For bug reports:** Set **Log Level** to `Debug` in Editor Settings > GodotVim, reproduce the issue, then copy the Output panel into GitHub issue. The debug log shows every keystroke and what command was executed.
 
-For a large log, [LOGGING.md](LOGGING.md) explains the per-keystroke summary line and carries ready-made `grep` patterns — mode transitions, text mutations, a specific key sequence, editor lifecycle — which is usually faster than reading it top to bottom. It also documents the conventions log messages follow, if you are adding any.
+For a large log, [docs/DEBUGGING.md](docs/DEBUGGING.md) explains the per-keystroke summary line and carries ready-made `grep` patterns — mode transitions, text mutations, a specific key sequence, editor lifecycle — which is usually faster than reading it top to bottom.
 
 ## Architecture
 

@@ -152,7 +152,7 @@ struct ChainKey {
 impl GodotVimCore {
     /// Global `input()` handler (Godot stage 1 — fires before `gui_input`).
     ///
-    /// The staged model of `docs/DESIGN-rebindable-nav.md` §5, in order:
+    /// The staged model of `DESIGN-rebindable-nav.md` (design notes, kept outside this repo) §5, in order:
     /// transport guards → surface sampling → barrier → probes → per-surface
     /// hooks → resolution → arbitration → execution → consumption.
     ///

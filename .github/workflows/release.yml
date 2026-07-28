@@ -226,11 +226,13 @@ jobs:
           # is the onboarding artifact they point at. Both travel with it, so the
           # links resolve from wherever the addon folder ends up.
           #
-          # REFERENCE.md only. docs/DESIGN-*.md are internal implementation
-          # design notes — hundreds of KB of rationale aimed at contributors,
-          # not something to drop into every user's project tree.
+          # docs/ is user documentation only — design notes live outside this
+          # repo entirely, so there is nothing here to exclude. Copied file by
+          # file rather than `cp -r` so a future internal doc landing in docs/
+          # cannot silently ship to every user's project tree.
           mkdir -p "$ADDON/docs"
           cp docs/REFERENCE.md "$ADDON/docs/"
+          cp docs/DEBUGGING.md "$ADDON/docs/"
           cp .godot-vimrc.sample "$ADDON/"
 
           # The repo README uses relative media/ paths so GitHub renders it.

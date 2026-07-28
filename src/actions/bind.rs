@@ -30,7 +30,7 @@
 //! the active path — never from a single LHS. Conflating the two sources is
 //! what would destroy `panelunmap` and last-writer-wins.
 //!
-//! See `docs/DESIGN-rebindable-nav.md` §4.7, §5.6 and §6.3.
+//! See `DESIGN-rebindable-nav.md` (design notes, kept outside this repo) §4.7, §5.6 and §6.3.
 
 use compact_str::CompactString;
 use vim_core::keymap::{

@@ -39,7 +39,7 @@
 //! - **Consumption is computed downstream of the outcome**, from the winning
 //!   rule's declared policy, never by the action.
 //!
-//! See `docs/DESIGN-rebindable-nav.md` §5.6 through §5.9.
+//! See `DESIGN-rebindable-nav.md` (design notes, kept outside this repo) §5.6 through §5.9.
 
 use compact_str::CompactString;
 use vim_core::keymap::{KeyEvent, MappingEntry, TrieLookup};

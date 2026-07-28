@@ -24,7 +24,7 @@
 //! the first `Some` wins, which is how N independent predicates keep the mutual
 //! exclusivity today's one `if`-chain gets for free.
 //!
-//! See `docs/DESIGN-rebindable-nav.md` §3.3, §3.7, §4.4 and §5.4.
+//! See `DESIGN-rebindable-nav.md` (design notes, kept outside this repo) §3.3, §3.7, §4.4 and §5.4.
 
 use bitflags::bitflags;
 use compact_str::CompactString;

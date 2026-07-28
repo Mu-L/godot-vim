@@ -25,7 +25,7 @@
 //! an undeclared surface. Those are registration-time checks and live in
 //! `actions::bind`, because only that layer knows what is registered.
 //!
-//! See `docs/DESIGN-rebindable-nav.md` §6.2 and §6.3.
+//! See `DESIGN-rebindable-nav.md` (design notes, kept outside this repo) §6.2 and §6.3.
 
 // P5 builds and tests the parser; P6 is the phase that reads it on the
 // dispatch path. Shipping it inert is what makes this commit revertable on

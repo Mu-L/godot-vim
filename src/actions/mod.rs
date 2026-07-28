@@ -9,7 +9,7 @@
 //! the event. Only the first is the user's business. Separating them is what
 //! makes any of it rebindable.
 //!
-//! Built in phases (see `docs/DESIGN-rebindable-nav.md`):
+//! Built in phases (see `DESIGN-rebindable-nav.md` (design notes, kept outside this repo)):
 //! - [`keys`] — one key vocabulary: the ordered probe list that replaced
 //!   three ad-hoc per-site keycode fallbacks.
 //! - [`outcome`] — what a handler answers, including the right to decline.
