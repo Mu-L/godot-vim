@@ -43,6 +43,19 @@ pub(crate) enum Outcome {
     Declined,
 }
 
+/// Display rather than Debug, per `LOGGING.md`'s "Display over Debug" rule:
+/// an outcome appears in the per-keystroke summary line, where `Handled`
+/// reads and `Outcome::Handled` is noise.
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Handled => "handled",
+            Self::FocusChanged => "focus-changed",
+            Self::Declined => "declined",
+        })
+    }
+}
+
 impl Outcome {
     /// Positive exhaustive match on purpose: a future variant becomes a
     /// compile error here instead of silently defaulting to "consumed",

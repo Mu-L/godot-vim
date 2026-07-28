@@ -1,5 +1,15 @@
 # GodotVim Logging Guidelines
 
+Two audiences, one file:
+
+- **Reading a log** (bug reports, debugging) — start at [Reading the
+  Logs](#reading-the-logs). The `grep` patterns there are the fast path
+  through a few thousand lines of trace output.
+- **Adding a log call** (contributing) — start at [Log
+  Levels](#log-levels). Roughly 94% of the ~350 call sites in `src/` follow
+  these conventions, which is what makes the `grep` patterns above work at
+  all; the guide is a live contract, not an aspiration.
+
 Every log statement must pass this test: **"If a developer reads this in a bug
 report, can they understand what happened without asking follow-up questions?"**
 

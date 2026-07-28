@@ -1539,7 +1539,7 @@ impl GodotVimCore {
         let mut cx =
             crate::actions::action::ActionCtx::new(target, params).with_fs(&mut self.fs_explorer);
         let outcome = self.actions.run(id, &mut cx);
-        log::debug!("action: '{name}' -> {outcome:?}");
+        log::debug!("action: '{name}' -> {outcome}");
     }
 
     /// Re-read `:set langmap` into the cached table used by the shell-side
