@@ -35,6 +35,7 @@ pub(super) fn process_cycle_impl(
     ctx: &mut ControllerContext,
     key: KeyEvent,
     editor: &mut Gd<CodeEdit>,
+    completion_binding: Option<&'static crate::actions::action::ActionSpec>,
 ) -> PipelineOutcome {
     ctx.transient.operations_this_cycle = 0;
 
@@ -50,7 +51,7 @@ pub(super) fn process_cycle_impl(
     }
 
     if let Some(consumed) =
-        completion::try_handle_completion(session, key, editor)
+        completion::try_handle_completion(session, editor, completion_binding)
     {
         log::debug!(
             "process_cycle: completion intercepted key={} consumed={}",
@@ -239,7 +240,13 @@ fn handle_host_pending_ui_action(
     match action {
         PendingUiAction::OpenMappingDialog
         | PendingUiAction::SourceConfigFile
-        | PendingUiAction::ShowTooltip { .. } => {
+        | PendingUiAction::ShowTooltip { .. }
+        // Must be forwarded, not handled here: running an ActionSpec needs
+        // `&mut GodotVimCore`, which this scope does not have.
+        | PendingUiAction::RunRegistryAction { .. }
+        // Same reason: the binding index and the surface forest both live on
+        // `GodotVimCore`. Swallowed here, `:panelmap` would print nothing.
+        | PendingUiAction::PanelCommand(..) => {
             ctx.transient.pending_ui_actions.push(action);
         }
         PendingUiAction::ShowUndoTree => {

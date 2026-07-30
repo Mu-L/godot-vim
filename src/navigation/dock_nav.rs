@@ -10,13 +10,13 @@ use godot::prelude::*;
 use crate::bridge::codec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NavDirection {
+pub(crate) enum NavDirection {
     Next,
     Prev,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum HierarchyAction {
+pub(crate) enum HierarchyAction {
     Expand,
     Collapse,
 }
@@ -93,7 +93,7 @@ impl TreeExt for Gd<Tree> {
 /// prevents stack overflow on unexpectedly deep nesting.
 const MAX_NAV_DEPTH: u32 = 3;
 
-pub(super) fn handle_navigation(
+pub(crate) fn handle_navigation(
     control: &Gd<Control>,
     direction: NavDirection,
     depth: u32,
@@ -124,7 +124,7 @@ pub(super) fn handle_navigation(
     }
 }
 
-pub(super) fn handle_hierarchy(control: &Gd<Control>, action: HierarchyAction) -> bool {
+pub(crate) fn handle_hierarchy(control: &Gd<Control>, action: HierarchyAction) -> bool {
     if control.is_class("Tree") {
         let Ok(tree) = control.clone().try_cast::<Tree>() else {
             return false;
@@ -295,4 +295,180 @@ fn handle_richtextlabel_nav(mut label: Gd<RichTextLabel>, direction: NavDirectio
 
     scroll.set_value(target);
     true
+}
+
+// ─── Characterization tests (P0) ─────────────────────────────────────────
+//
+// `find_navigable_target` is the one piece of intra-dock navigation that is
+// already widget-agnostic — it is generic over `NavigableItem`. That makes
+// its skip-and-bound loop testable today, without a Godot runtime, by
+// implementing the trait for a pure-Rust stand-in. Same idea as
+// `MockTextEdit` for the bridge layer.
+#[cfg(test)]
+mod characterization {
+    use super::*;
+    use std::rc::Rc;
+
+    /// A cursor over a fixed list of items, each flagged selectable or not.
+    ///
+    /// Mirrors a `Tree`'s visible-item chain. Fidelity, verified against
+    /// Godot 4.8-dev (`scene/gui/tree.cpp`):
+    ///
+    /// - `TreeItem::get_next_visible(bool p_wrap)` (`tree.cpp:1125`) delegates
+    ///   to `_get_next_in_tree`, which returns `nullptr` at the end of the
+    ///   chain unless wrapping (`tree.cpp:1112-1118`). ClassDB binds it with
+    ///   `DEFVAL(false)` (`tree.cpp:2010`) and gdext's `get_next_visible()`
+    ///   uses that default, so the chain we walk **cannot wrap** — hence the
+    ///   mock's bounded `Vec` with `None` at both ends.
+    /// - `get_next_visible` skips only items that are not visible; it never
+    ///   skips unselectable ones. `is_selectable(0)` (`tree.cpp:1325`) is an
+    ///   independent per-cell flag — hence a flat chain plus a separate
+    ///   selectable flag, rather than one filtered list.
+    /// - Godot's own keyboard walk `_go_down` (`tree.cpp:3797-3825`) runs the
+    ///   same skip-unselectable loop, so `find_navigable_target` mirrors the
+    ///   widget it stands in for.
+    #[derive(Clone, Debug)]
+    struct MockItem {
+        selectable: Rc<Vec<bool>>,
+        idx: usize,
+    }
+
+    impl MockItem {
+        fn chain(flags: &[bool], start: usize) -> Self {
+            Self {
+                selectable: Rc::new(flags.to_vec()),
+                idx: start,
+            }
+        }
+    }
+
+    impl NavigableItem for MockItem {
+        fn nav_next_visible(&mut self) -> Option<Self> {
+            let next = self.idx + 1;
+            (next < self.selectable.len()).then(|| Self {
+                selectable: Rc::clone(&self.selectable),
+                idx: next,
+            })
+        }
+
+        fn nav_prev_visible(&mut self) -> Option<Self> {
+            self.idx.checked_sub(1).map(|prev| Self {
+                selectable: Rc::clone(&self.selectable),
+                idx: prev,
+            })
+        }
+
+        fn nav_is_selectable(&self) -> bool {
+            self.selectable[self.idx]
+        }
+    }
+
+    /// Never yields an end and is never selectable.
+    ///
+    /// A real `TreeItem` chain with `wrap = false` is finite and acyclic, so
+    /// this state is not reachable through Godot today — `MAX_ATTEMPTS` is a
+    /// defensive bound, not a fix for an observed cycle. The mock exists to
+    /// prove the bound actually terminates, since the failure mode it guards
+    /// against is a frozen editor rather than a wrong answer.
+    #[derive(Clone, Debug)]
+    struct EndlessUnselectable;
+
+    impl NavigableItem for EndlessUnselectable {
+        fn nav_next_visible(&mut self) -> Option<Self> {
+            Some(Self)
+        }
+        fn nav_prev_visible(&mut self) -> Option<Self> {
+            Some(Self)
+        }
+        fn nav_is_selectable(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn next_moves_one_item_when_the_neighbour_is_selectable() {
+        let start = MockItem::chain(&[true, true, true], 0);
+        let found = find_navigable_target(start, NavDirection::Next).unwrap();
+        assert_eq!(found.idx, 1);
+    }
+
+    #[test]
+    fn prev_moves_one_item_when_the_neighbour_is_selectable() {
+        let start = MockItem::chain(&[true, true, true], 2);
+        let found = find_navigable_target(start, NavDirection::Prev).unwrap();
+        assert_eq!(found.idx, 1);
+    }
+
+    #[test]
+    fn unselectable_items_are_skipped_not_landed_on() {
+        // Index 1 and 2 are separator rows; navigation lands on 3.
+        let start = MockItem::chain(&[true, false, false, true], 0);
+        let found = find_navigable_target(start, NavDirection::Next).unwrap();
+        assert_eq!(found.idx, 3);
+    }
+
+    #[test]
+    fn unselectable_items_are_skipped_going_backwards_too() {
+        let start = MockItem::chain(&[true, false, false, true], 3);
+        let found = find_navigable_target(start, NavDirection::Prev).unwrap();
+        assert_eq!(found.idx, 0);
+    }
+
+    #[test]
+    fn end_of_list_yields_none_rather_than_wrapping() {
+        // This is the source of the tri-state `Declined` at the end of a
+        // list: no target found means the key is not consumed, so Godot's
+        // own handling proceeds. Navigation deliberately does NOT wrap.
+        let start = MockItem::chain(&[true, true], 1);
+        assert!(find_navigable_target(start, NavDirection::Next).is_none());
+    }
+
+    #[test]
+    fn start_of_list_yields_none_rather_than_wrapping() {
+        let start = MockItem::chain(&[true, true], 0);
+        assert!(find_navigable_target(start, NavDirection::Prev).is_none());
+    }
+
+    #[test]
+    fn a_run_of_unselectable_items_ending_the_list_yields_none() {
+        let start = MockItem::chain(&[true, false, false], 0);
+        assert!(find_navigable_target(start, NavDirection::Next).is_none());
+    }
+
+    #[test]
+    fn a_cyclic_chain_terminates_instead_of_hanging() {
+        // The MAX_ATTEMPTS bound. Without it this call never returns, which
+        // would freeze the editor on a malformed widget.
+        assert!(find_navigable_target(EndlessUnselectable, NavDirection::Next).is_none());
+        assert!(find_navigable_target(EndlessUnselectable, NavDirection::Prev).is_none());
+    }
+
+    #[test]
+    fn the_skip_run_is_bounded_at_1000_items() {
+        // 999 separators then a selectable row: reachable.
+        let mut flags = vec![true];
+        flags.extend(std::iter::repeat_n(false, 999));
+        flags.push(true);
+        let found = find_navigable_target(MockItem::chain(&flags, 0), NavDirection::Next);
+        assert_eq!(found.map(|f| f.idx), Some(1000));
+
+        // 1000 separators: one past the bound, so the target is missed.
+        // Pinned deliberately — it documents where the cutoff bites.
+        let mut flags = vec![true];
+        flags.extend(std::iter::repeat_n(false, 1000));
+        flags.push(true);
+        let found = find_navigable_target(MockItem::chain(&flags, 0), NavDirection::Next);
+        assert!(found.is_none(), "MAX_ATTEMPTS should have cut this off");
+    }
+
+    #[test]
+    fn richtextlabel_scroll_step_is_50px() {
+        // j/k on a RichTextLabel (the docs panel, the Output log) scrolls by
+        // this many pixels rather than moving a selection. Pinned because a
+        // capability model that gates j/k on "has a selectable list" would
+        // silently drop these panels. Note the scroll reports `Handled` only
+        // when the label HAS a vertical scrollbar; `handle_richtextlabel_nav`
+        // returns false — and so declines — when `get_v_scroll_bar()` is None.
+        assert_eq!(RICHTEXTLABEL_SCROLL_STEP, 50.0);
+    }
 }

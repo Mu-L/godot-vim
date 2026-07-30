@@ -92,6 +92,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "compact_str"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fd622ebbb56a5b2ccb651b32b911cdeb2a9b4b11776b2473bf26a26a286244e"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "rustversion",
+ "ryu",
+ "static_assertions",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -251,10 +265,10 @@ dependencies = [
 
 [[package]]
 name = "godot-vim"
-version = "1.6.1"
+version = "1.7.0"
 dependencies = [
  "bitflags",
- "compact_str",
+ "compact_str 0.7.1",
  "godot",
  "log",
  "proptest",
@@ -747,13 +761,13 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vim-core"
 version = "0.7.1"
-source = "git+https://github.com/hmdfrds/vim-core.git?tag=v0.7.1#b6e9c78dbc82ac5c0b69d06de5b240ea7dcd1762"
+source = "git+https://github.com/hmdfrds/vim-core.git?tag=v0.7.1#a0e5c387f249a9bd46026255be1834c7a6ccfabc"
 dependencies = [
  "ahash",
  "arrayvec",
  "bitflags",
  "cfg-if",
- "compact_str",
+ "compact_str 0.7.1",
  "derive_more",
  "memchr",
  "nonmax",
@@ -771,11 +785,11 @@ dependencies = [
 [[package]]
 name = "vim-regex"
 version = "0.1.0"
-source = "git+https://github.com/hmdfrds/vim-core.git?tag=v0.7.1#b6e9c78dbc82ac5c0b69d06de5b240ea7dcd1762"
+source = "git+https://github.com/hmdfrds/vim-core.git?tag=v0.7.1#a0e5c387f249a9bd46026255be1834c7a6ccfabc"
 dependencies = [
  "ahash",
  "aho-corasick",
- "compact_str",
+ "compact_str 0.7.1",
  "memchr",
  "smallvec",
 ]
@@ -783,10 +797,11 @@ dependencies = [
 [[package]]
 name = "vim-text"
 version = "0.1.0"
-source = "git+https://github.com/hmdfrds/vim-core.git?tag=v0.7.1#b6e9c78dbc82ac5c0b69d06de5b240ea7dcd1762"
+source = "git+https://github.com/hmdfrds/vim-core.git?tag=v0.7.1#a0e5c387f249a9bd46026255be1834c7a6ccfabc"
 dependencies = [
  "arrayvec",
  "bitflags",
+ "compact_str 0.8.2",
  "memchr",
 ]
 

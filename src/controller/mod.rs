@@ -1082,16 +1082,22 @@ impl VimController {
     // ── Processing entry points ────────────────────────────────────────
 
     /// Single entry point for keystroke processing from `gui_input`.
+    /// `completion_binding` is what the `editor.completion` surface resolved
+    /// this key to, resolved by the caller because the `BindingIndex` lives on
+    /// `GodotVimCore` and the controller deliberately holds no reference to it
+    /// — a controller that could read the binding plane could also read a
+    /// stale generation of it.
     pub(crate) fn process_cycle(
         &mut self,
         key: KeyEvent,
         editor: &mut Gd<CodeEdit>,
+        completion_binding: Option<&'static crate::actions::action::ActionSpec>,
     ) -> PipelineOutcome {
         let ControllerPhase::Attached { ref mut session } = self.phase else {
             log::warn!("process_cycle: not attached");
             return PipelineOutcome::Passthrough;
         };
-        process::process_cycle_impl(session, &mut self.ctx, key, editor)
+        process::process_cycle_impl(session, &mut self.ctx, key, editor, completion_binding)
     }
 
     /// Force-resolve a pending mapping after timeout, then drain expanded keys.

@@ -50,6 +50,18 @@ struct PendingTooltip {
     phase: TooltipPhase,
 }
 
+/// A `Tree`/`ItemList` whose incremental type-to-search is suppressed.
+///
+/// Godot's `Tree` type-searches on bare printable keys, so a reserved prefix
+/// key would otherwise do both jobs at once: buffer in the shell plane and
+/// start a type-search in the control. The previous value is carried rather
+/// than assumed, because the user (or the editor) may have turned search off
+/// already and restoring `true` would be a behaviour change we never made.
+struct SearchSuppression {
+    control: InstanceId,
+    previous: bool,
+}
+
 #[derive(GodotClass)]
 #[class(tool, base=Node)]
 pub struct GodotVimCore {
@@ -65,6 +77,20 @@ pub struct GodotVimCore {
     ui: crate::ui::UiCoordinator,
     /// Fires after `timeoutlen` ms to resolve partially-matched key mappings.
     mapping_timer: Option<Gd<Timer>>,
+    /// The shell plane's own timeout timer — see `init_panel_timer` for why
+    /// this is not `mapping_timer`.
+    panel_timer: Option<Gd<Timer>>,
+    /// The shell plane's pending prefix buffer.
+    ///
+    /// Empty unless the user bound a multi-key `panelmap`: the shipped keyset
+    /// reserves nothing, so this costs one `Option` compare per keystroke and
+    /// nothing else. Cleared on execute, no-match, timeout, focus-owner
+    /// change, plugin disable and config reload — deliberately **not** on echo.
+    pending: crate::actions::sequence::Pending,
+    /// The one control whose incremental type-to-search we turned off because
+    /// its surface reserves a bare prefix key. See
+    /// `input::GodotVimCore::sync_search_suppression`.
+    search_suppression: Option<SearchSuppression>,
     settings: Option<crate::settings::SettingsSnapshot>,
     /// Lazily created on first `:mappings` invocation.
     mapping_dialog: Option<Gd<crate::ui::mapping_dialog::MappingDialog>>,
@@ -77,6 +103,28 @@ pub struct GodotVimCore {
     /// Used by [`ProcessingKeyGuard`] for RAII-based keystroke processing tracking.
     processing_key: bool,
     fs_explorer: crate::navigation::FileSystemExplorer,
+    /// Parsed `:set langmap`, rebuilt whenever config is sourced.
+    ///
+    /// `None` means the option is empty, which is the overwhelmingly common
+    /// case — the probe pipeline then skips the remap entirely.
+    langmap: Option<vim_core::keymap::LangmapTable>,
+    /// Every shell-side verb the plugin knows, by id.
+    ///
+    /// Built once from `actions::specs::SHIPPED`. Later phases register
+    /// provider tables into the same registry; nothing about the dispatcher
+    /// changes when they do.
+    actions: crate::actions::action::ActionRegistry,
+    /// Per-line load errors from the user's vimrc, surfaced by `:panelmap`.
+    binding_diagnostics: Vec<crate::actions::bind::PanelDiagnostic>,
+    /// Which key, on which surface, means which verb.
+    ///
+    /// Rebuilt from the provider defaults (and, from the config phase, the
+    /// resolved vimrc) whenever config is sourced; `generation` bumps with
+    /// every rebuild, which is what invalidates the sampled focus chain.
+    bindings: crate::actions::bind::BindingIndex,
+    /// The focus chain, sampled once per distinct focus/mode/prompt state
+    /// rather than once per keystroke. See `plugin::input::ChainCache`.
+    chain_cache: Option<input::ChainCache>,
     /// Desired master-enable state (mirrors plugins/GodotVim/enabled).
     enabled: bool,
     /// Disabled->enabled EDGE detector (NOT a correctness gate): apply_enabled_state
@@ -89,13 +137,23 @@ pub struct GodotVimCore {
 impl INode for GodotVimCore {
     fn init(base: Base<Node>) -> Self {
         install_panic_hook();
+        // Registry first, then the index over it: `builtin_index` rejects a
+        // default naming an unregistered action, which is the load-time check
+        // that keeps a typo from becoming a key that consumes and does
+        // nothing.
+        let actions = crate::actions::specs::registry();
+        let bindings = crate::actions::bind::builtin_index(&actions);
         Self {
             base,
+            binding_diagnostics: Vec::new(),
             controller: None,
             attached_editor: None,
             last_editor_id: None,
             ui: crate::ui::UiCoordinator::new(),
             mapping_timer: None,
+            panel_timer: None,
+            pending: crate::actions::sequence::Pending::default(),
+            search_suppression: None,
             settings: None,
             mapping_dialog: None,
             caret_reconciler: caret_reconcile::CaretReconciler::new(),
@@ -103,6 +161,10 @@ impl INode for GodotVimCore {
             tracked_windows: Vec::new(),
             processing_key: false,
             fs_explorer: crate::navigation::FileSystemExplorer::new(),
+            langmap: None,
+            actions,
+            bindings,
+            chain_cache: None,
             enabled: true,
             wired: false,
         }
@@ -128,6 +190,7 @@ impl INode for GodotVimCore {
                 self.controller = Some(VimController::new());
                 self.init_settings();
                 self.init_mapping_timer();
+                self.init_panel_timer();
                 self.init_fs_explorer_callables();
                 self.wired = false;
                 self.apply_enabled_state();
@@ -152,7 +215,13 @@ impl INode for GodotVimCore {
         panic_guard("exit_tree:detach", || self.detach(), ());
         panic_guard("exit_tree:signals", || self.disconnect_editor_signals(), ());
         panic_guard("exit_tree:settings", || self.teardown_settings(), ());
+        // Before the timers are freed and while the controls still exist:
+        // `allow_search` lives on the focused `Tree`, which outlives the
+        // plugin, so leaving it off would break type-to-search for the rest of
+        // the editor session.
+        panic_guard("exit_tree:sequence", || self.clear_pending_sequence(), ());
         panic_guard("exit_tree:timer", || self.teardown_mapping_timer(), ());
+        panic_guard("exit_tree:panel_timer", || self.teardown_panel_timer(), ());
         panic_guard(
             "exit_tree:dialog",
             || {
@@ -236,6 +305,19 @@ impl GodotVimCore {
         if !self.enabled {
             return;
         }
+        // §5.10's focus-owner clearing site, and deliberately BEFORE the
+        // controller guard below: a pending prefix and a suppressed
+        // `allow_search` are shell-plane state, and must be released when the
+        // user tabs away whether or not a script is open. The per-keystroke
+        // check in `sync_search_suppression` cannot cover this on its own —
+        // focus can move with no keystroke at all, and the shell timer would
+        // then fire into a control the sequence was never typed at, leaving a
+        // `Tree` unable to type-search until the next key.
+        panic_guard(
+            "on_focus_changed:sequence",
+            || self.clear_pending_sequence(),
+            (),
+        );
         if self.controller.is_none() {
             return;
         }
@@ -653,6 +735,32 @@ impl GodotVimCore {
         }
     }
 
+    /// The shell plane's timeout. Deliberately **not** guarded on
+    /// `self.controller.is_some()`: the headline capability of the sequence
+    /// phase is that a dock prefix resolves with no script open, and a
+    /// controller guard here would reintroduce exactly the dependency the
+    /// separate timer exists to remove.
+    #[func]
+    fn on_panel_timeout(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let ok = panic_guard(
+            "on_panel_timeout",
+            || {
+                self.on_panel_timeout_impl();
+                true
+            },
+            false,
+        );
+        if !ok {
+            // No engine was involved, so the controller needs no recovery —
+            // but the shell plane's own state does, and `allow_search` in
+            // particular lives on a control that outlives the plugin.
+            self.clear_pending_sequence();
+        }
+    }
+
     #[func]
     fn on_caret_changed(&mut self) {
         if self.controller.is_none() {
@@ -919,6 +1027,11 @@ impl GodotVimCore {
             }
         } else {
             panic_guard("disable:detach", || self.detach(), ());
+            // §5.10 — `pending` clears on plugin disable, and the suppressed
+            // `allow_search` comes back with it. A disabled plugin that left a
+            // dock Tree unable to type-search would be an invisible,
+            // unattributable regression.
+            panic_guard("disable:sequence", || self.clear_pending_sequence(), ());
             panic_guard("disable:signals", || self.disconnect_editor_signals(), ());
             panic_guard("disable:floating", || self.teardown_floating_window_tracking(), ());
             panic_guard("disable:fs", || self.fs_explorer.cleanup(), ());
@@ -947,6 +1060,12 @@ impl GodotVimCore {
     ) {
         use crate::bridge::godot_host::PendingUiAction;
         match action {
+            PendingUiAction::RunRegistryAction { name, count } => {
+                self.run_registry_action(&name, count);
+            }
+            PendingUiAction::PanelCommand(args) => {
+                self.panel_command(&args);
+            }
             PendingUiAction::OpenMappingDialog => {
                 let resolved = self.resolve_config_path();
 
@@ -1057,6 +1176,13 @@ impl GodotVimCore {
         if let Some(timer) = self.mapping_timer.as_mut() {
             timer.stop();
         }
+        // The shell plane's own state, on the same unconditional footing: a
+        // pending prefix that survived a panic would resolve against an index
+        // the recovery may have rebuilt, and a suppressed `allow_search` that
+        // survived would leave a dock Tree unable to type-search with no
+        // plugin state left to explain it. This is the `panic_guard` recovery
+        // path the design names explicitly.
+        panic_guard("recover:sequence", || self.clear_pending_sequence(), ());
         // Always reset — trivially infallible, must happen regardless of
         // whether recovery itself panicked.
         self.caret_reconciler.reset();
@@ -1067,6 +1193,64 @@ impl GodotVimCore {
         // panic recovery context.
         self.pending_tooltip = None;
         self.base_mut().set_process(false);
+    }
+
+    /// Drop the shell plane's between-keystroke state, whole.
+    ///
+    /// One function for all four clearing sites (teardown, disable, panic
+    /// recovery, timeout failure) because the three pieces must always move
+    /// together: a buffer with no timer never resolves, and a timer with no
+    /// buffer fires into nothing.
+    pub(super) fn clear_pending_sequence(&mut self) {
+        self.pending.clear();
+        if let Some(timer) = self.panel_timer.as_mut() {
+            timer.stop();
+        }
+        self.restore_search_suppression();
+    }
+
+    /// How long the shell timer waits, in ms.
+    ///
+    /// See [`crate::actions::sequence::timeoutlen_ms`] for the priority order.
+    /// The `SettingsSnapshot` arm is not a nicety: with no controller reachable
+    /// at all the engine cannot be asked, and that is precisely the state — no
+    /// script open, docks the only thing on screen — in which a panel sequence
+    /// is the only thing the user can do.
+    fn shell_timeoutlen_ms(&self) -> i64 {
+        crate::actions::sequence::timeoutlen_ms(
+            self.controller.as_ref().map(VimController::timeoutlen),
+            self.settings.as_ref().map(|s| s.timeoutlen),
+        )
+    }
+
+    /// Arm the shell timer for one `timeoutlen`.
+    pub(super) fn arm_panel_timer(&mut self) {
+        let ms = self.shell_timeoutlen_ms();
+        let Some(timer) = self.panel_timer.as_mut() else {
+            // No timer means the buffer would never resolve. Better to drop it
+            // than to leave keys silently eaten forever.
+            log::warn!("sequence: no shell timer; dropping the pending prefix");
+            self.pending.clear();
+            return;
+        };
+        timer.set_wait_time(ms as f64 / 1000.0);
+        timer.start();
+        let buffered: String = self
+            .pending
+            .keys()
+            .iter()
+            .map(vim_core::keymap::KeyEvent::to_vim_notation)
+            .collect();
+        log::trace!(
+            "sequence: shell timer armed ({ms}ms) on {} with '{buffered}'",
+            self.pending.surface().unwrap_or("<none>")
+        );
+    }
+
+    pub(super) fn stop_panel_timer(&mut self) {
+        if let Some(timer) = self.panel_timer.as_mut() {
+            timer.stop();
+        }
     }
 
     fn cancel_pending_tooltip(&mut self) {
@@ -1174,6 +1358,11 @@ impl GodotVimCore {
     fn source_config_from_disk(&mut self, caller: &str) -> bool {
         let resolved = self.resolve_config_path();
         let Some(text) = crate::config::writer::read_file(&resolved.path) else {
+            // No file: the engine keeps whatever options it has, so the cache
+            // must be reconciled here too. Returning early without this leaves
+            // a stale table after a vimrc is deleted.
+            self.rebuild_langmap();
+            self.rebuild_bindings();
             return false;
         };
         let project_vimrc = self
@@ -1191,6 +1380,342 @@ impl GodotVimCore {
                 log::info!("{caller}: sourced config from '{}'", resolved.path);
             }
         }
+        self.rebuild_langmap();
+        self.rebuild_bindings();
         true
+    }
+
+    /// Rebuild the panel binding index, atomically.
+    ///
+    /// Everything decidable is in [`build_index`]; what is left here is the
+    /// three effects that need `&mut self` — logging the diagnostics, swapping
+    /// the index in under a fresh generation, and dropping the chain cache.
+    ///
+    /// The swap is what makes it atomic: a fresh index is built to completion
+    /// and only then installed, so one broken line can never leave a half-built
+    /// table live.
+    fn rebuild_bindings(&mut self) {
+        let generation = self.bindings.generation.wrapping_add(1);
+        let text = self.read_sandboxed_config();
+        let source = self.resolve_config_path().path;
+        let (mut index, diagnostics) = build_index(&self.actions, text.as_deref(), &source);
+        for d in &diagnostics {
+            // Warn-and-skip per line: one bad binding must not cost the user
+            // the rest of their config. The log is the *secondary* channel and
+            // always has been — the default Log Level is Off, so a diagnostic
+            // that went only here reached nobody. `:panelmap` with no argument
+            // prints the same list, which is what makes the claim below true
+            // rather than aspirational: a diagnostic nobody can read is the
+            // same as a silent dead key.
+            log::warn!("panelmap: {d}");
+        }
+        self.binding_diagnostics = diagnostics;
+
+        index.generation = generation;
+        self.bindings = index;
+        // The chain cache is keyed on the generation, so this is belt and
+        // braces — but a cache that outlives its index is the kind of bug
+        // that only shows up after a hot reload.
+        self.invalidate_focus_chain();
+        log::debug!(
+            "panelmap: rebuilt {} binding(s) at generation {generation}",
+            self.bindings.len()
+        );
+    }
+
+    /// The active vimrc's text, after the project-vimrc security policy.
+    ///
+    /// `None` when no config file exists — the zero-config case, where the
+    /// shipped defaults are the whole keyset.
+    fn read_sandboxed_config(&self) -> Option<String> {
+        let resolved = self.resolve_config_path();
+        let text = crate::config::writer::read_file(&resolved.path)?;
+        let project_vimrc = self
+            .settings
+            .as_ref()
+            .map_or(crate::settings::ProjectVimrc::Sandbox, |s| s.project_vimrc);
+        crate::config::sandbox::apply_vimrc_policy(&text, resolved.is_project_level, project_vimrc)
+    }
+
+    /// `:panelmap` and `:panelmap <lhs>` — the introspector.
+    ///
+    /// Printed with `godot_print!` rather than `log::info!` and to the Output
+    /// panel rather than the status bar, for two separate reasons: the
+    /// default `log` level is Off, so a `log::` call reaches nobody by
+    /// default; and a resolution trace is a dozen lines, which the one-line
+    /// status bar cannot show.
+    fn panel_command(&mut self, args: &str) {
+        let args = args.trim();
+        if args.is_empty() {
+            godot_print!(
+                "{}",
+                crate::actions::introspect::list_report(
+                    &self.bindings,
+                    &self.actions,
+                    &self.binding_diagnostics,
+                )
+            );
+            return;
+        }
+        // Sampled against the CURRENT focus, which is the whole point: the
+        // answer to "why is my key dead" depends on where the keystroke would
+        // land, and by the time the user has typed `:panelmap d` the command
+        // line owns focus. That is a real caveat and the report prints the
+        // chain it used so the user can see it.
+        let chain = EditorInterface::singleton()
+            .get_base_control()
+            .and_then(|c| c.get_viewport())
+            .map(|vp| {
+                crate::actions::surface::FocusChain::sample(
+                    &vp,
+                    self.attached_editor
+                        .as_ref()
+                        .filter(|e| e.is_instance_valid())
+                        .map(Gd::instance_id),
+                    self.controller.as_ref().map(VimController::mode),
+                    self.fs_explorer.prompt_instance(),
+                )
+            })
+            .unwrap_or_default();
+        let Some(path) = self.bindings.forest().classify(&chain) else {
+            godot_warn!("panelmap: no surface claimed the current focus");
+            return;
+        };
+        let controller = self.controller.as_ref();
+        let claims =
+            |k: vim_core::keymap::KeyEvent| controller.is_some_and(|c| c.could_start_mapping(k));
+        godot_print!(
+            "{}",
+            crate::actions::introspect::explain_report(
+                args,
+                &chain,
+                &path,
+                &self.bindings,
+                &self.actions,
+                &claims,
+            )
+        );
+    }
+
+    /// Run a shell-side action invoked by name rather than by keystroke.
+    ///
+    /// The `:action <id>` / `<Action>(<id>)` path. Two rules from the design
+    /// govern it, and both are why it lives here rather than in the host layer:
+    ///
+    /// 1. **Capabilities are not consulted.** There is no keystroke, no
+    ///    surface and no sampled widget to derive them from, so gating here
+    ///    would decline everything invisibly. `Caps` gates bindings only.
+    /// 2. **`host_invocable: false` fails loudly.** An action that needs a
+    ///    focused panel — `godotvim.item.next` has nothing to move — reports
+    ///    a real error rather than silently doing nothing.
+    fn run_registry_action(&mut self, name: &str, count: u32) {
+        let Some(id) = self.actions.id_of(name) else {
+            log::warn!("action: unknown action '{name}'");
+            return;
+        };
+        let Some(spec) = self.actions.get(id) else {
+            return;
+        };
+        if !spec.host_invocable {
+            log::warn!("action: '{name}' requires panel focus");
+            return;
+        }
+
+        // The focus owner, when there is one. Actions needing a specific
+        // widget re-assert it in their own body — the same predicate the
+        // binding path uses, a no-op there and the real guard here.
+        let target = EditorInterface::singleton()
+            .get_base_control()
+            .and_then(|c| c.get_viewport())
+            .and_then(|vp| vp.gui_get_focus_owner())
+            .map(|o| o.upcast::<godot::classes::Control>());
+
+        let mut params = crate::actions::action::Params::new();
+        params.set_int("count", i64::from(count));
+        // The explorer is lent here too, so `host_invocable: true` on
+        // `godotvim.fs.create` is honest: the prompt it opens is owned by
+        // `self.fs_explorer`, and without the loan the action would decline
+        // from the command line while working from a key.
+        let mut cx =
+            crate::actions::action::ActionCtx::new(target, params).with_fs(&mut self.fs_explorer);
+        let outcome = self.actions.run(id, &mut cx);
+        log::debug!("action: '{name}' -> {outcome}");
+    }
+
+    /// Re-read `:set langmap` into the cached table used by the shell-side
+    /// probe pipeline (`crate::actions::keys`).
+    ///
+    /// Called on every config-source path — startup, `:source`, the mapping
+    /// dialog's save, and the no-file case — so a deleted vimrc cannot leave
+    /// a stale table behind.
+    ///
+    /// It is deliberately NOT hooked to interactive ex-commands: a `:set
+    /// langmap=` typed at the command line updates the engine's table but not
+    /// this cache, so the two planes disagree until the next source. Hooking
+    /// every ex-command execution for one option is not obviously worth the
+    /// coupling; the gap is recorded rather than papered over.
+    ///
+    /// A malformed table is dropped with a warning rather than failing the
+    /// load — one bad option must not take the rest of the user's config
+    /// with it.
+    fn rebuild_langmap(&mut self) {
+        let spec = self
+            .controller
+            .as_ref()
+            .map(|c| c.engine().options().langmap().to_string())
+            .unwrap_or_default();
+        if spec.is_empty() {
+            self.langmap = None;
+            return;
+        }
+        match vim_core::keymap::LangmapTable::parse(&spec) {
+            Ok(table) => {
+                log::info!("langmap: loaded '{spec}'");
+                self.langmap = Some(table);
+            }
+            Err(err) => {
+                log::warn!("langmap: ignoring malformed '{spec}': {err:?}");
+                self.langmap = None;
+            }
+        }
+    }
+}
+
+/// Build a complete panel binding index from the builtins plus one vimrc.
+///
+/// The pure half of [`GodotVimCore::rebuild_bindings`], lifted out because
+/// everything it decides is decidable without a `Gd<T>` — and everything the
+/// caller keeps needs `&mut self`, so the two could not be tested together at
+/// any price.
+///
+/// `text` is the vimrc **after** the project-vimrc security policy, and `None`
+/// covers three states that must all behave identically: no config file at
+/// all, `ProjectVimrc::Disabled`, and a file the sandbox rejected outright.
+/// Applying the builtins outside that `if` is the whole reason it is a
+/// parameter rather than something read here — the naive placement means a
+/// security setting, or simply having no config, destroys the builtin
+/// Ctrl+hjkl defaults.
+///
+/// `source` is only ever a diagnostic label: it is what a rejected line is
+/// reported against, so `:panelmap` can name the file and the line number.
+fn build_index(
+    registry: &crate::actions::action::ActionRegistry,
+    text: Option<&str>,
+    source: &str,
+) -> (
+    crate::actions::bind::BindingIndex,
+    Vec<crate::actions::bind::PanelDiagnostic>,
+) {
+    let mut index = crate::actions::bind::builtin_index(registry);
+    let mut diagnostics = Vec::new();
+    // The user layer, on top of the builtins. Two layers within ONE file —
+    // `config::path::resolve` picks exactly one vimrc (EditorSettings
+    // override, else res://, else user://), never several. Layering between
+    // files is not a thing here and must not become one.
+    if let Some(text) = text {
+        crate::actions::bind::apply_text(
+            &mut index,
+            registry,
+            text,
+            &vim_core::keymap::MappingOwner::User,
+            source,
+            crate::actions::bind::Provenance::User,
+            &mut diagnostics,
+        );
+    }
+    (index, diagnostics)
+}
+
+#[cfg(test)]
+mod build_index_tests {
+    use super::build_index;
+    use crate::actions::specs;
+
+    /// The shipped keyset with no user config at all — the zero-config case.
+    fn builtin_count() -> usize {
+        let reg = specs::registry();
+        build_index(&reg, None, "user://.godot-vimrc").0.len()
+    }
+
+    #[test]
+    fn no_config_file_still_yields_the_builtin_keyset() {
+        // The regression this function's shape exists to prevent: reading the
+        // vimrc INSIDE the `if let Some(text)` and building the builtins there
+        // too means a user with no config — or with `ProjectVimrc::Disabled` —
+        // loses Ctrl+hjkl entirely.
+        assert!(
+            builtin_count() > 0,
+            "the builtin defaults must load with no vimrc"
+        );
+        let reg = specs::registry();
+        let (index, diagnostics) = build_index(&reg, None, "user://.godot-vimrc");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            index
+                .rule_for("panel", &[vim_core::keymap::KeyEvent::ctrl('h')])
+                .is_some(),
+            "panel <C-h> is a shipped default and must survive the no-file path"
+        );
+    }
+
+    #[test]
+    fn an_empty_vimrc_is_indistinguishable_from_no_vimrc() {
+        let reg = specs::registry();
+        assert_eq!(
+            build_index(&reg, Some(""), "user://.godot-vimrc").0.len(),
+            builtin_count()
+        );
+    }
+
+    #[test]
+    fn a_user_line_layers_on_top_of_the_builtins() {
+        let reg = specs::registry();
+        let (index, diagnostics) = build_index(
+            &reg,
+            Some("panelmap dock q godotvim.item.activate\n"),
+            "user://.godot-vimrc",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            index.len(),
+            builtin_count() + 1,
+            "the user rule must ADD to the builtins, not replace them"
+        );
+        assert!(index
+            .rule_for(
+                "dock",
+                &[vim_core::keymap::KeyEvent::new(
+                    vim_core::keymap::Key::Char('q'),
+                    vim_core::keymap::Modifiers::NONE,
+                )]
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn one_bad_line_costs_only_itself_and_names_its_source() {
+        // Warn-and-skip is per line, and the diagnostic has to carry the file
+        // and the line number or `:panelmap` cannot tell the user where to
+        // look — which is the same as the rejection being silent.
+        let reg = specs::registry();
+        let (index, diagnostics) = build_index(
+            &reg,
+            Some(
+                "panelmap dock q godotvim.item.activate\n\
+                 panelmap dock w godotvim.item.nextt\n",
+            ),
+            "res://.godot-vimrc",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let rendered = diagnostics[0].to_string();
+        assert!(
+            rendered.starts_with("res://.godot-vimrc:2:"),
+            "the diagnostic must name the file and the line: {rendered}"
+        );
+        assert_eq!(
+            index.len(),
+            builtin_count() + 1,
+            "the good line above the bad one must still install"
+        );
     }
 }

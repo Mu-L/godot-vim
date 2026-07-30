@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test / clippy / fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # vim-core is a private repo pulled as a git dependency, same as release.yml.
+      - name: Configure private repo access
+        shell: bash
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `-D warnings` here covers rustc only. It is deliberately NOT global:
+      # promoting clippy lints to errors would defeat the counting step below,
+      # which is what actually holds the line on pre-existing debt.
+      - name: Test
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --all-targets --locked
+
+      # Deliberately NOT `-D warnings` for the whole crate: four pre-existing
+      # lint sites predate this workflow and are tracked separately. What must
+      # not regress is the count, so the step fails only if a NEW site appears.
+      - name: Clippy (no new lint sites)
+        shell: bash
+        run: |
+          cargo clippy --all-targets --message-format=short 2>&1 \
+            | grep -E '^[^ ]+\.rs:[0-9]+:[0-9]+: warning' \
+            | sed 's/: warning.*//' | sort -u > /tmp/lints.txt || true
+          echo "lint sites:"; cat /tmp/lints.txt
+          count=$(wc -l < /tmp/lints.txt)
+          if [ "$count" -gt 4 ]; then
+            echo "::error::clippy lint sites rose to $count (baseline 4)"
+            exit 1
+          fi
+
+      # The repo carries pre-existing rustfmt drift across 20 files. Gating the
+      # whole crate would fail on day one and teach everyone to ignore CI, so
+      # this checks only the module the rebindable-nav work owns, where the
+      # invariant is real and enforceable.
+      - name: Rustfmt (actions module)
+        run: rustfmt --check --edition 2021 src/actions/*.rs

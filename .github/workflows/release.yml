@@ -209,10 +209,48 @@ jobs:
           # "Ignore asset root" (default checked) strips the wrapper and
           # correctly places addons/ at the project root.
           STAGE="godot-vim-${VERSION}"
+          ADDON="$STAGE/addons/godot_vim"
           mkdir -p "$STAGE"
           cp -r addons "$STAGE/"
-          cp LICENSE "$STAGE/"
-          cp README.md "$STAGE/"
+
+          # EVERYTHING ships INSIDE addons/godot_vim/, nothing beside it.
+          #
+          # This is not tidiness. Asset Library strips the wrapper root, so a
+          # file sitting next to addons/ lands at the USER'S project root — and
+          # LICENSE and README.md would overwrite theirs. An addon must be
+          # self-contained: drop the folder in, delete the folder out, nothing
+          # else touched.
+          cp LICENSE "$ADDON/"
+          cp README.md "$ADDON/"
+          # README's "Full reference →" links are relative, and .godot-vimrc.sample
+          # is the onboarding artifact they point at. Both travel with it, so the
+          # links resolve from wherever the addon folder ends up.
+          #
+          # docs/ is user documentation only — design notes live outside this
+          # repo entirely, so there is nothing here to exclude. Copied file by
+          # file rather than `cp -r` so a future internal doc landing in docs/
+          # cannot silently ship to every user's project tree.
+          mkdir -p "$ADDON/docs"
+          cp docs/REFERENCE.md "$ADDON/docs/"
+          cp docs/DEBUGGING.md "$ADDON/docs/"
+          cp .godot-vimrc.sample "$ADDON/"
+
+          # The repo README uses relative media/ paths so GitHub renders it.
+          # media/ is ~MBs of gifs and is deliberately NOT shipped, so rewrite
+          # those six references to tag-pinned raw URLs in the SHIPPED copy
+          # only. Pinning to the tag rather than main keeps an old release's
+          # images matching that release.
+          sed -i "s|](media/|](https://raw.githubusercontent.com/hmdfrds/godot-vim/${VERSION}/media/|g" "$ADDON/README.md"
+          sed -i "s|src=\"media/|src=\"https://raw.githubusercontent.com/hmdfrds/godot-vim/${VERSION}/media/|g" "$ADDON/README.md"
+
+          # Fail loudly rather than shipping a zip that pollutes a user project.
+          UNEXPECTED=$(find "$STAGE" -mindepth 1 -maxdepth 1 ! -name addons)
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error::files outside addons/ would land in the user's project root:"
+            echo "$UNEXPECTED"
+            exit 1
+          fi
+
           zip -r "godot-vim-${VERSION}.zip" "$STAGE"
 
       - name: Create GitHub Release

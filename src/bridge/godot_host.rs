@@ -41,6 +41,23 @@ pub(crate) enum PendingUiAction {
     SourceConfigFile,
     ShowUndoTree,
     Vimdebug(compact_str::CompactString),
+    /// Run a shell-side action by NAME.
+    ///
+    /// Name-carrying, never id-carrying. `ActionNames` wraps its own
+    /// `NameRegistry`, a different instance from the engine's, so a raw id
+    /// would resolve against the wrong table. The string also keeps `bridge`
+    /// free of any dependency on `crate::actions`.
+    RunRegistryAction {
+        name: compact_str::CompactString,
+        count: u32,
+    },
+    /// `:panelmap` / `:panelmap <lhs>` — the panel-binding introspector.
+    ///
+    /// Carries the raw argument text, never a parsed key or a surface id, for
+    /// the same reason [`PendingUiAction::RunRegistryAction`] carries a name:
+    /// `bridge` must not depend on `crate::actions`. The plane lives on
+    /// `GodotVimCore`, so the parse and the report both happen after the hop.
+    PanelCommand(compact_str::CompactString),
     PerfReport,
     PerfReset,
     ShowTooltip {
@@ -300,6 +317,26 @@ impl VimHost for GodotHost {
 /// `:source` chains can reach 3. Five allows headroom without risk.
 const MAX_HOST_REQUEST_DEPTH: u32 = 5;
 
+/// Split a trimmed ex-command into "is this `:panelmap`" and "its arguments".
+///
+/// `Some("")` is the bare command — the full listing — and `Some(rest)` is
+/// `:panelmap <lhs>`. `None` means the command is not ours and must fall
+/// through to the ordinary host dispatch, which is what still produces E492
+/// for `:panelmapfoo`. That distinction is the entire reason this is a
+/// function: a `starts_with("panelmap")` here would silently claim every
+/// command with that prefix, and the failure would be a missing E492 on a
+/// typo rather than anything a test in this file was watching for.
+///
+/// The argument is returned verbatim, including any extra inner whitespace —
+/// `panel_command` trims it, and doing it twice would be two places to keep
+/// agreeing about what an empty argument is.
+fn parse_panel_command(cmd: &str) -> Option<&str> {
+    if cmd == "panelmap" {
+        return Some("");
+    }
+    cmd.strip_prefix("panelmap ")
+}
+
 impl GodotHost {
     fn handle_request_inner(&mut self, request: &HostRequest) -> HostResult {
         if self.host_request_depth > MAX_HOST_REQUEST_DEPTH {
@@ -347,6 +384,20 @@ impl GodotHost {
                 }
                 "perf reset" => {
                     self.pending_ui_actions.push(PendingUiAction::PerfReset);
+                    return HostResult::Success {
+                        id: request.id(),
+                        message: None,
+                    };
+                }
+                // Matched before the generic fallthrough so `:panelmap` can
+                // never be shadowed by a custom-command chain. The split
+                // itself lives in `parse_panel_command`, which is where the
+                // `:panelmapfoo` case is pinned by a test.
+                cmd_str if parse_panel_command(cmd_str).is_some() => {
+                    let args = parse_panel_command(cmd_str).unwrap_or_default();
+                    self.pending_ui_actions.push(PendingUiAction::PanelCommand(
+                        compact_str::CompactString::from(args),
+                    ));
                     return HostResult::Success {
                         id: request.id(),
                         message: None,
@@ -724,6 +775,48 @@ mod mode_coverage_tests {
         let mut seen = HashSet::new();
         for kind in HANDLED_MODES {
             assert!(seen.insert(kind), "Duplicate in HANDLED_MODES: {:?}", kind);
+        }
+    }
+}
+
+#[cfg(test)]
+mod panel_command_tests {
+    use super::parse_panel_command;
+
+    #[test]
+    fn the_bare_command_asks_for_the_full_listing() {
+        assert_eq!(parse_panel_command("panelmap"), Some(""));
+    }
+
+    #[test]
+    fn an_argument_reaches_the_explainer_verbatim() {
+        assert_eq!(parse_panel_command("panelmap j"), Some("j"));
+        assert_eq!(parse_panel_command("panelmap <C-h>"), Some("<C-h>"));
+        // Inner whitespace is preserved rather than normalized here; the one
+        // trim lives in `panel_command`.
+        assert_eq!(parse_panel_command("panelmap  j"), Some(" j"));
+    }
+
+    #[test]
+    fn a_longer_word_beginning_with_panelmap_is_not_claimed() {
+        // The E492 guard. `starts_with("panelmap")` would swallow all of
+        // these, and the user would get silence instead of "not an editor
+        // command" — which reads as the plugin being broken, not as a typo.
+        for cmd in [
+            "panelmapfoo",
+            "panelmaps",
+            "panelmapping",
+            "panelmap!",
+            "panelmap=x",
+        ] {
+            assert_eq!(parse_panel_command(cmd), None, "{cmd} must reach E492");
+        }
+    }
+
+    #[test]
+    fn an_unrelated_command_is_not_claimed() {
+        for cmd in ["", "map", "mappings", "source", "panel", "unmap panelmap"] {
+            assert_eq!(parse_panel_command(cmd), None, "{cmd}");
         }
     }
 }

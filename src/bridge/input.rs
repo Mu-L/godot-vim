@@ -94,7 +94,7 @@ fn is_dead_key_char(ch: char) -> bool {
 ///
 /// The shift table is hardcoded to US-QWERTY because Godot's
 /// `get_physical_keycode()` is defined as the US-QWERTY scan code.
-fn physical_to_ascii(physical: GodotKey, shift: bool) -> Option<char> {
+pub(crate) fn physical_to_ascii(physical: GodotKey, shift: bool) -> Option<char> {
     let code = physical.ord();
     // Letters: physical A-Z → 'a'-'z' or 'A'-'Z'
     let key_a = GodotKey::A.ord();
@@ -2093,12 +2093,14 @@ mod tests {
             false,
         )
         .unwrap();
-        // This is the exact condition from try_handle_completion.
-        // If this assertion fails, update completion.rs to match.
+        // This is the exact key the `editor.completion` surface binds
+        // `godotvim.completion.trigger` to. If this assertion fails, the
+        // `<C-@>` line in `actions::providers::completion::DEFAULTS` is a
+        // silently dead binding — it would still load, and never fire.
         assert!(
             event.modifiers().contains(Modifiers::CTRL) && event.key() == Key::Char('@'),
-            "Bridge Ctrl+Space output changed! Was {:?} — update completion.rs \
-             try_handle_completion to match the new post-translation form",
+            "Bridge Ctrl+Space output changed! Was {:?} — update the <C-@> default \
+             in actions::providers::completion to the new post-translation form",
             event,
         );
     }

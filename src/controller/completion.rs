@@ -6,16 +6,35 @@
 //! trigger, filter, navigate, and confirm — all without engine changes.
 //!
 //! The interception has two phases:
-//! - **Pre-engine** ([`try_handle_completion`]): captures Ctrl+N/P, Tab,
-//!   Enter, Escape, arrow keys while the popup is visible.
+//! - **Pre-engine** ([`try_handle_completion`]): routes whatever the user has
+//!   bound on the `editor.completion` surface — by default Ctrl+@, Ctrl+N/P,
+//!   Tab, Enter, Escape and the arrow keys.
 //! - **Post-engine** ([`maybe_retrigger_completion`]): re-triggers the popup
 //!   after printable/backspace keystrokes so filtering stays in sync.
+//!
+//! # Rebindable, and still on this transport (P9)
+//!
+//! The key table used to be a `match` on literals here. It is now eight
+//! `panelmap` lines in `actions::providers::completion`, resolved by
+//! `GodotVimCore::handle_gui_input_impl` against the same `BindingIndex` the
+//! panel keys use, and handed down as an `&'static ActionSpec`.
+//!
+//! What did **not** move is the transport. These keys stay on `gui_input`, for
+//! three reasons that were each load-bearing and none of which a rebindable
+//! table changes: `_input` is registered per viewport and never fires for a
+//! floated script editor; `_input` runs outside the IME guard above this call,
+//! so a CJK preedit would lose `<CR>`; and `_input`'s consumption model cannot
+//! express `Some(false)` — "handled by us, engine skipped, event deliberately
+//! NOT consumed" — which is what Up/Down need. [`CompletionPort`] carries that
+//! third state; see [`verdict`].
 
 use godot::classes::CodeEdit;
 use godot::prelude::*;
 use vim_core::execution::{VimEngine, VimSession};
 use vim_core::keymap::{Key, KeyEvent, Modifiers};
 
+use crate::actions::action::{ActionCtx, ActionSpec, CompletionOps, Params};
+use crate::actions::outcome::Outcome;
 use crate::bridge;
 use crate::bridge::codec::usize_to_i32;
 use crate::bridge::godot_host::GodotHost;
@@ -25,103 +44,126 @@ fn is_completion_active(editor: &Gd<CodeEdit>) -> bool {
     editor.get_code_completion_selected_index() >= 0
 }
 
+/// The one real [`CompletionOps`], holding the two things no test can build.
+///
+/// Everything a completion verb decides is decided against this trait; the
+/// verbs themselves live in `actions::providers::completion` and are tested
+/// against a plain-data fake. That split is the only reason the `Some(true)` /
+/// `Some(false)` / `None` trichotomy has a headless characterization suite at
+/// all — `Gd<CodeEdit>` and `VimSession<GodotHost>` cannot be constructed under
+/// `cargo test` in a `cdylib`.
+struct CompletionPort<'a> {
+    session: &'a mut VimSession<GodotHost>,
+    editor: &'a mut Gd<CodeEdit>,
+    /// Set by [`CompletionOps::hand_to_editor`]. Read by [`verdict`].
+    handed_off: bool,
+}
+
+impl CompletionOps for CompletionPort<'_> {
+    fn popup_visible(&self) -> bool {
+        is_completion_active(self.editor)
+    }
+
+    fn completion_enabled(&self) -> bool {
+        self.editor.is_code_completion_enabled()
+    }
+
+    fn option_count(&self) -> i32 {
+        usize_to_i32(self.editor.get_code_completion_options().len())
+    }
+
+    fn selected_index(&self) -> i32 {
+        self.editor.get_code_completion_selected_index()
+    }
+
+    fn request(&mut self, force: bool) {
+        self.editor.request_code_completion_ex().force(force).done();
+    }
+
+    fn select(&mut self, index: i32) {
+        self.editor.set_code_completion_selected_index(index);
+    }
+
+    fn confirm(&mut self) {
+        confirm_and_reconcile_completion(self.session, self.editor);
+    }
+
+    fn cancel(&mut self) {
+        self.editor.cancel_code_completion();
+    }
+
+    fn hand_to_editor(&mut self) {
+        self.handed_off = true;
+    }
+}
+
+/// Fold an action's [`Outcome`] and the port's routing flag into the
+/// transport's tri-state.
+///
+/// - `Some(true)` — consumed here; `set_input_as_handled()` fires.
+/// - `Some(false)` — engine skipped, event deliberately **not** consumed, so
+///   `CodeEdit::_gui_input` moves its own popup selection.
+/// - `None` — not ours; the vim engine processes the key normally.
+///
+/// The third case falls straight out of [`Outcome::Declined`], which is why no
+/// fourth `Outcome` variant was needed: a verb that cannot act (no popup up)
+/// declines, and declining on this transport already means "the engine gets
+/// it". `godotvim.completion.dismiss` uses exactly that to cancel the popup
+/// *and* let `<Esc>` leave insert mode in one keypress.
+const fn verdict(outcome: Outcome, handed_off: bool) -> Option<bool> {
+    if handed_off {
+        return Some(false);
+    }
+    if outcome.is_consumed() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// Pre-engine interception for completion and trigger keys.
+///
+/// `binding` is whatever the `editor.completion` surface resolved this key to,
+/// or `None` when the user has nothing bound — in which case there is nothing
+/// to intercept and the engine gets the key untouched.
 ///
 /// Returns `Some(consumed)` if the key was handled here (skip engine).
 /// Returns `None` if the engine should process the key normally.
 pub(crate) fn try_handle_completion(
     session: &mut VimSession<GodotHost>,
-    key: KeyEvent,
     editor: &mut Gd<CodeEdit>,
+    binding: Option<&'static ActionSpec>,
 ) -> Option<bool> {
+    let spec = binding?;
+
+    // The mode gate stays on the transport rather than moving into the verbs,
+    // and stays exactly where it was: `in_insert` guarded every arm of the old
+    // table. It is not a capability and not a surface predicate — `Caps` is
+    // sampled from a focus chain this surface never classifies — so the one
+    // place that can honestly ask is the one place holding the session.
     let mode = session.engine().mode();
-    let in_insert = mode.is_insert() || mode.is_replace();
-
-    // Ctrl+Space → Ctrl+@ after bridge translation: force-trigger completion.
-    if in_insert && key.modifiers().contains(Modifiers::CTRL) && key.key() == Key::Char('@') {
-        if !editor.is_code_completion_enabled() {
-            return None;
-        }
-        editor.request_code_completion_ex().force(true).done();
-        return Some(true);
-    }
-
-    // Ctrl+N / Ctrl+P: trigger popup when not yet visible.
-    // Godot's request_code_completion is synchronous — popup state
-    // and selected index are available immediately after the call.
-    if in_insert && key.modifiers().contains(Modifiers::CTRL) {
-        match key.key() {
-            Key::Char('n') if !is_completion_active(editor) => {
-                if !editor.is_code_completion_enabled() {
-                    return None;
-                }
-                // Godot auto-selects index 0 — matches Vim's Ctrl+N (forward).
-                editor.request_code_completion_ex().force(true).done();
-                return Some(true);
-            }
-            Key::Char('p') if !is_completion_active(editor) => {
-                if !editor.is_code_completion_enabled() {
-                    return None;
-                }
-                editor.request_code_completion_ex().force(true).done();
-                // Vim's Ctrl+P selects the *last* item (backward search).
-                if is_completion_active(editor) {
-                    let count = usize_to_i32(editor.get_code_completion_options().len());
-                    if count > 0 {
-                        editor.set_code_completion_selected_index(count - 1);
-                    }
-                }
-                return Some(true);
-            }
-            _ => {}
-        }
-    }
-
-    // Remaining interceptions only apply with a visible popup in insert/replace.
-    if !in_insert || !is_completion_active(editor) {
+    if !mode.is_insert() && !mode.is_replace() {
         return None;
     }
 
-    match key.key() {
-        // Up/Down: return `Some(false)` = "handled by us, but don't mark consumed"
-        // so Godot's CodeEdit processes the arrow key to navigate the list.
-        Key::Up | Key::Down => Some(false),
-
-        // Tab / Enter: confirm and reconcile the text delta with the engine
-        // so dot-repeat and macro recording capture the completed text.
-        Key::Tab | Key::Enter => {
-            confirm_and_reconcile_completion(session, editor);
-            Some(true)
-        }
-
-        // Escape: dismiss popup, then fall through to engine (which exits insert mode).
-        Key::Escape => {
-            editor.cancel_code_completion();
-            None
-        }
-
-        Key::Char('n') if key.modifiers().contains(Modifiers::CTRL) => {
-            let current = editor.get_code_completion_selected_index();
-            let count = usize_to_i32(editor.get_code_completion_options().len());
-            if count > 0 {
-                let next = if current + 1 >= count { 0 } else { current + 1 };
-                editor.set_code_completion_selected_index(next);
-            }
-            Some(true)
-        }
-
-        Key::Char('p') if key.modifiers().contains(Modifiers::CTRL) => {
-            let current = editor.get_code_completion_selected_index();
-            let count = usize_to_i32(editor.get_code_completion_options().len());
-            if count > 0 {
-                let prev = if current <= 0 { count - 1 } else { current - 1 };
-                editor.set_code_completion_selected_index(prev);
-            }
-            Some(true)
-        }
-
-        _ => None,
-    }
+    let mut port = CompletionPort {
+        session,
+        editor,
+        handed_off: false,
+    };
+    let outcome = {
+        // The action borrows the port; the verdict reads it back. Scoped so no
+        // borrow of `port` outlives the call, mirroring `run_candidate`'s
+        // copy-out-the-spec discipline in `plugin::input`.
+        let mut cx = ActionCtx::new(None, Params::new()).with_completion(&mut port);
+        (spec.run)(&mut cx)
+    };
+    let handed_off = port.handed_off;
+    log::trace!(
+        "completion: {} -> {outcome:?} handed_off={handed_off}",
+        spec.id
+    );
+    verdict(outcome, handed_off)
 }
 
 /// After the engine processes an insert-mode key, re-trigger or dismiss
@@ -217,4 +259,40 @@ fn confirm_and_reconcile_completion(
     // silently skip it. The engine created an undo node during
     // reconciliation; we must create a matching UndoStore snapshot.
     super::sync_undo_nodes_after_external_edit(session, &before_text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The transport-side half of the P9 characterization suite. The verb-side
+    // half lives in `actions::providers::completion`, driven by a fake popup;
+    // this pins the fold that turns an `Outcome` plus one flag back into the
+    // `Option<bool>` `process_cycle` has always spoken.
+
+    #[test]
+    fn a_handled_verb_consumes_the_key() {
+        assert_eq!(verdict(Outcome::Handled, false), Some(true));
+        assert_eq!(verdict(Outcome::FocusChanged, false), Some(true));
+    }
+
+    #[test]
+    fn a_declined_verb_hands_the_key_to_the_vim_engine() {
+        // Not "nothing happened". `godotvim.completion.dismiss` cancels the
+        // popup and THEN declines, so `<Esc>` closes the popup and leaves
+        // insert mode on one press. Collapsing this to `Some(false)` would
+        // trap the user in insert mode; collapsing it to `Some(true)` would
+        // stop `<CR>` inserting a newline whenever nothing was bound.
+        assert_eq!(verdict(Outcome::Declined, false), None);
+    }
+
+    #[test]
+    fn handing_off_beats_the_outcome_in_both_directions() {
+        // `Some(false)` is the state `Outcome` cannot express: engine skipped,
+        // event NOT consumed, control gets the key. The flag therefore has to
+        // win over whatever the verb returned, and asserting BOTH rows is what
+        // makes that a decision rather than an accident of ordering.
+        assert_eq!(verdict(Outcome::Handled, true), Some(false));
+        assert_eq!(verdict(Outcome::Declined, true), Some(false));
+    }
 }

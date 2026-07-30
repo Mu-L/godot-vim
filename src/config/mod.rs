@@ -17,6 +17,7 @@
 //! runs with the sandboxing policy from [`SecurityPolicy`].
 
 pub(crate) mod mapping_service;
+pub(crate) mod panelmap;
 pub(crate) mod parser;
 pub(crate) mod path;
 pub(crate) mod presets;

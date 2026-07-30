@@ -59,6 +59,7 @@
 use godot::prelude::*;
 
 // Pipeline modules (ordered by keystroke data flow: input -> engine -> effects -> host -> ui).
+mod actions;
 mod bridge;
 mod controller;
 mod effects;

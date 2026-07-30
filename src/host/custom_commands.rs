@@ -339,6 +339,15 @@ fn handle_save_command(
 
 /// Returns the complete list of custom Godot commands available for
 /// `:ListActions` filtering and tab-completion.
+///
+/// **Not** limited to the commands this file dispatches. The entries below the
+/// divider are intercepted earlier, in
+/// `bridge::godot_host::GodotHost::handle_request`, before the chain in
+/// [`handle_custom_ex_command`] is ever consulted — they never reach this
+/// module, and being absent from this list is what made them undiscoverable:
+/// no tab-completion, no `:actionlist` row, and therefore no user typing the
+/// name. `:panelmap` in particular is the design's whole answer to "why is my
+/// key dead", and a user cannot ask a question whose name they cannot find.
 pub(super) const fn list_all_commands() -> &'static [&'static str] {
     &[
         "run",
@@ -367,6 +376,19 @@ pub(super) const fn list_all_commands() -> &'static [&'static str] {
         "Inspector",
         "Output",
         "Script",
+        // ── Intercepted in `bridge::godot_host`, not here ────────────
+        //
+        // `panelmap` is matched there as the exact word, and separately as
+        // `"panelmap "` with a trailing space so `:panelmapfoo` still yields
+        // E492. Listing the bare word is what makes it tab-complete; the
+        // completion candidate is the word alone, so nothing about that
+        // prefix match changes.
+        "panelmap",
+        "mappings",
+        "perf",
+        "vimdebug",
+        "source",
+        "undotree",
     ]
 }
 
@@ -401,4 +423,50 @@ pub(super) fn handle_custom_ex_command(
     }
     log::debug!("custom_ex_command: unrecognized {}", cmd);
     host_failure(id, format!("E492: Not an editor command: {cmd}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list_all_commands;
+
+    /// Every command the plugin implements must be *findable*.
+    ///
+    /// The list feeds `:actionlist` and cmdline tab-completion, and it is the
+    /// only place a user discovers a command's name. `:panelmap` is the
+    /// design's whole answer to "why is my key dead" and was wired end to end
+    /// — parser, index, introspector, transport — while being absent from
+    /// here, so it never tab-completed and nothing ever printed its name.
+    #[test]
+    fn every_intercepted_command_is_discoverable() {
+        // These five are matched in `bridge::godot_host` before the chain in
+        // this file is consulted, so nothing here dispatches them and it is
+        // easy to forget they exist.
+        for cmd in ["panelmap", "mappings", "perf", "vimdebug", "source"] {
+            assert!(
+                list_all_commands().contains(&cmd),
+                "`:{cmd}` is implemented but cannot be tab-completed or listed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_list_has_no_duplicates_and_no_argument_forms() {
+        // A bare word only: `bridge::godot_host` matches `"panelmap"` exactly
+        // and `"panelmap "` (with the space) separately, so `:panelmapfoo`
+        // stays an ordinary E492. Listing `"panelmap "` here would offer a
+        // completion candidate with a trailing space and blur that boundary.
+        let all = list_all_commands();
+        for cmd in all {
+            assert_eq!(cmd.trim(), *cmd, "`{cmd}` carries whitespace");
+        }
+        let mut sorted: Vec<&str> = all.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(
+            before,
+            sorted.len(),
+            "duplicate entries in the command list"
+        );
+    }
 }

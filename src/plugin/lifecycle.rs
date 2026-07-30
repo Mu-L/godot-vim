@@ -71,6 +71,37 @@ impl GodotVimCore {
         }
     }
 
+    // ── Shell (panel) sequence timer ──────────────────────────────────
+
+    /// Create the shell plane's own one-shot Timer for pending-prefix
+    /// resolution.
+    ///
+    /// **A second timer, never `mapping_timer`**, and the reason is not
+    /// tidiness. `on_mapping_timeout_impl` opens with
+    /// `let Some(editor) = &self.attached_editor else { return; }` — it
+    /// early-returns with no editor attached, which is the *common* case for
+    /// dock browsing, so a shared timer would silently never resolve a dock
+    /// prefix. And when an editor *is* attached it would flush the **engine's**
+    /// typeahead into the open file while focus is on a dock, which is a text
+    /// mutation the user did not ask for.
+    pub(super) fn init_panel_timer(&mut self) {
+        let mut timer = Timer::new_alloc();
+        timer.set_one_shot(true);
+        timer.set_wait_time(1.0); // placeholder; overridden each start
+        let callable = self.base().callable("on_panel_timeout");
+        connect_immediate(&mut timer, SIG_TIMEOUT, &callable);
+        self.base_mut().add_child(&timer.clone().upcast::<Node>());
+        self.panel_timer = Some(timer);
+    }
+
+    /// Symmetric teardown for `init_panel_timer`.
+    pub(super) fn teardown_panel_timer(&mut self) {
+        if let Some(mut timer) = self.panel_timer.take() {
+            timer.stop();
+            timer.queue_free();
+        }
+    }
+
     // ── Editor signals ────────────────────────────────────────────────
 
     /// Connect editor-level signals for tab switching and focus tracking.
