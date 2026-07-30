@@ -27,7 +27,7 @@
 ## Installation
 
 ### Godot Asset Store (Recommended)
-1. Open your Godot project → **AssetLib** tab
+1. Open your Godot project → **Asset Store** tab
 2. Search **"[GodotVim](https://store.godotengine.org/asset/hmdfrds/godotvim/)"** → **Download**
 3. In the install dialog, click **Install**
 4. **Project → Project Settings** → **Plugins** → Enable **GodotVim**
