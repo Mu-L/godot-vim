@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://godotengine.org/asset-library/asset/4666">
-    <img src="https://img.shields.io/badge/Godot%20Asset%20Lib-4.5%2B-478cbf?logo=godot-engine&logoColor=white" alt="Godot Asset Library">
+  <a href="https://store.godotengine.org/asset/hmdfrds/godotvim/">
+    <img src="https://img.shields.io/badge/Godot%20Asset%20Store-4.5%2B-478cbf?logo=godot-engine&logoColor=white" alt="Godot Asset Store">
   </a>
   <a href="https://github.com/hmdfrds/godot-vim/actions/workflows/release.yml">
     <img src="https://github.com/hmdfrds/godot-vim/actions/workflows/release.yml/badge.svg" alt="Release">
@@ -26,9 +26,9 @@
 
 ## Installation
 
-### Godot Asset Library (Recommended)
+### Godot Asset Store (Recommended)
 1. Open your Godot project → **AssetLib** tab
-2. Search **"[GodotVim](https://godotengine.org/asset-library/asset/4666)"** → **Download**
+2. Search **"[GodotVim](https://store.godotengine.org/asset/hmdfrds/godotvim/)"** → **Download**
 3. In the install dialog, click **Install**
 4. **Project → Project Settings** → **Plugins** → Enable **GodotVim**
 5. **Restart the Editor** (required for full initialization)
@@ -167,7 +167,7 @@ Record with `qa`, replay with `@a`. Named registers `"a`-`"z`, system clipboard 
 | Problem | Solution |
 |---------|----------|
 | Plugin not appearing | Ensure `addons/godot_vim/` contains `plugin.cfg`, `.gdextension`, and the compiled library. Enable in Project Settings > Plugins. |
-| `addons/` folder missing after Asset Library install | "Ignore asset root" was unchecked. Re-install from AssetLib with the box **checked**, or manually copy `addons/godot_vim/` from the release zip. |
+| `addons/` folder missing after Asset Store install | "Ignore asset root" was unchecked. Re-install from the Asset Store with the box **checked**, or manually copy `addons/godot_vim/` from the release zip. |
 | Key not working | Check `passthrough_keys` setting — the key may be bypassing Vim. Check `:mappings` for conflicts. |
 | A dock or panel key does nothing | Run `:panelmap {key}` with that panel focused — the Output panel shows which surface claimed the focus, which rule won, and which gate stopped it. `:panelmap` with no argument lists every binding plus any `.godot-vimrc` line that was rejected. |
 | A `panelmap` line seems to be ignored | `:panelmap` prints rejected lines and the reason. If yours is not listed at all, the verb is misspelled — `panelmp` is not claimed as a panel line. Set **Log Level** to `Debug` to see rejections as the file loads. |
