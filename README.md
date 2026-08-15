@@ -25,26 +25,15 @@
 
 ---
 
-GodotVim runs a real Vim engine inside Godot's script editor. Operators compose
-with motions and text objects, `.` repeats, macros record and replay. The same
-keystrokes also drive the scene tree, the FileSystem dock, the debugger and the
-completion popup, and every one of those keys outside the text buffer is
-rebindable from a config file.
 
 ## Requirements
 
-| | |
-|---|---|
-| Godot | 4.5 or newer |
-| Editor | Godot's own script editor. It has no effect in Rider, VS Code or any other external editor. |
-| Prebuilt binaries | Linux x86_64, Windows x86_64, macOS universal (Intel and Apple Silicon) |
-| Needs a source build | Linux arm64, and any Linux with glibc older than 2.34 (Ubuntu 20.04, Debian 11, RHEL 8) |
-| Not supported | Windows on ARM |
-
-On Godot 4.5 there is one degradation: `d` and `r` in the FileSystem dock
-delegate to an `EditorSettings` API that Godot added in 4.6, so on 4.5 those two
-keys do nothing and the plugin prints a warning at startup. Everything else,
-`gd` and `K` included, works on 4.5.
+Godot 4.5 or newer, and Godot's own script editor. The plugin has no effect in
+Rider, VS Code or any other external editor. Prebuilt binaries cover Linux and
+Windows x86_64 and macOS universal; Linux arm64, and any Linux with glibc older
+than 2.34 (Ubuntu 20.04, Debian 11, RHEL 8), need a
+[source build](docs/BUILDING.md). On 4.5, `d` and `r` in the FileSystem dock
+do nothing, because they use an API Godot added in 4.6.
 
 ## Installation
 
@@ -210,9 +199,6 @@ GodotVim is a native extension, so it ships restrictive:
 
 All three are settings. [Security](docs/REFERENCE.md#security)
 
-<!-- ref-todo: multi-cursor -->
-<!-- ref-todo: surround -->
-<!-- ref-todo: ctrl-w-windows -->
 
 ## Configuration
 
@@ -261,18 +247,18 @@ Twenty presets ship disabled, among them `jk` for Escape and `<Space>w` for
 
 ## Building from source
 
-Every dependency is a public repository, so this needs no credentials. On
-Linux, macOS or Windows with a stable Rust toolchain:
+With a stable Rust toolchain on Linux, macOS or Windows:
 
 ```bash
 git clone --depth 1 https://github.com/hmdfrds/godot-vim
 cd godot-vim
-cargo build --release --locked
+./scripts/assemble-addon.sh
 ```
 
-The library lands in `target/release/`. Copying it into a Godot project, what
-to expect from the build, and the per-platform notes are in
-[docs/BUILDING.md](docs/BUILDING.md).
+That builds the library and writes a ready-to-copy `dist/addons/godot_vim/`.
+It is the same script the release workflow runs, so what you get is what a
+release contains. What to expect from the build, and the per-platform notes,
+are in [docs/BUILDING.md](docs/BUILDING.md).
 
 ## Troubleshooting
 
@@ -284,7 +270,7 @@ Settings live under **Editor Settings > Plugins > GodotVim**.
 | No keys work at all | **Enabled** must be `true`. It is a per-user editor setting, so it applies to every project you open with this installation, and **Project Settings > Plugins** is what turns the plugin off for one project only. **Cursor > Enabled** is a different setting and only affects the cursor overlay. |
 | One key does nothing | Check **Input > Passthrough Keys**. A key listed there is handed straight to Godot on purpose. |
 | A key works on QWERTY but not for you | Layout matters. In `panelmap` lines the `<physical>` flag matches the US-QWERTY key position; without it the binding follows the character your layout produces. Several past defects reproduced only on Colemak, Dvorak or AZERTY. |
-| A dock or panel key does nothing | Run `:panelmap {key}`. The Output panel prints the focus chain it sampled, the surface stack, which rule won and which gate stopped it. It samples the focus you have while typing, which is the command line, and prints that chain so you can read it against the panel you care about. |
+| A dock or panel key does nothing | Run `:panelmap` with no argument from the editor. It lists every live binding by surface (`dock`, `dock.filesystem`, `panel`, and so on) plus every config line that was rejected and why. Find the surface your dock is and check the key is bound there. You cannot type `:` while a dock has focus, so `:panelmap {key}` reports the editor's focus, not the dock's. |
 | A `panelmap` line looks ignored | `:panelmap` with no argument lists every live binding plus every config line that was rejected and why. If yours is not listed at all the verb is misspelled: `panelmp` is never claimed as a panel line. Set **Log Level** to `Warn` to watch rejections as the file loads. |
 | `.godot-vimrc` is not loading | Only one file is read. If **Mapping > Config File Path** is set it wins, and your `res://.godot-vimrc` is never seen. If **Security > Project Vimrc** is `Disabled`, a project file is skipped entirely, which Log Level `Info` reports. After a hand edit, run `:source`. |
 | Lines in a committed config are silently disabled | Under the default `Sandbox` policy a `res://.godot-vimrc` keeps only known-safe lines, and the recursive `map`, `nmap`, `vmap`, `imap`, `omap` and `cmap` forms are stripped whatever they map to. Use the `noremap` forms, or move the file to `user://.godot-vimrc`. |
