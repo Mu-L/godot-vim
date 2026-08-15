@@ -14,12 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Configure private repo access
-        shell: bash
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
-
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           targets: x86_64-unknown-linux-gnu
@@ -45,12 +39,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Configure private repo access
-        shell: bash
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
@@ -78,12 +66,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Configure private repo access
-        shell: bash
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
@@ -130,23 +112,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Configure private repo access
-        shell: bash
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
-
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Assemble addon
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          mkdir -p addons/godot_vim/bin
-          cp artifacts/libgodot_vim.so addons/godot_vim/bin/
-          cp artifacts/godot_vim.dll addons/godot_vim/bin/
-          cp artifacts/libgodot_vim.dylib addons/godot_vim/bin/
+          # One script owns the addon layout; a person building from source
+          # runs the same one (docs/BUILDING.md), so CI and a laptop cannot
+          # drift. It also refuses to produce a tree with anything beside
+          # addons/, which is what would pollute a user's project root.
+          ./scripts/assemble-addon.sh \
+            --lib artifacts/libgodot_vim.so \
+            --lib artifacts/godot_vim.dll \
+            --lib artifacts/libgodot_vim.dylib \
+            --version "$VERSION" \
+            --out .
+          # Later steps (VirusTotal, attestation, SBOM) read the binaries from
+          # addons/godot_vim/bin/, so mirror the assembled tree there too.
+          rm -rf addons/godot_vim/bin
+          cp -r "godot-vim-$VERSION/addons/godot_vim/bin" addons/godot_vim/bin
 
       - name: VirusTotal Scan
         id: vt
@@ -204,54 +192,7 @@ jobs:
       - name: Create addon zip
         env:
           VERSION: ${{ inputs.version }}
-        run: |
-          # Wrap addons in a version-named folder so Godot Asset Library's
-          # "Ignore asset root" (default checked) strips the wrapper and
-          # correctly places addons/ at the project root.
-          STAGE="godot-vim-${VERSION}"
-          ADDON="$STAGE/addons/godot_vim"
-          mkdir -p "$STAGE"
-          cp -r addons "$STAGE/"
-
-          # EVERYTHING ships INSIDE addons/godot_vim/, nothing beside it.
-          #
-          # This is not tidiness. Asset Library strips the wrapper root, so a
-          # file sitting next to addons/ lands at the USER'S project root — and
-          # LICENSE and README.md would overwrite theirs. An addon must be
-          # self-contained: drop the folder in, delete the folder out, nothing
-          # else touched.
-          cp LICENSE "$ADDON/"
-          cp README.md "$ADDON/"
-          # README's "Full reference →" links are relative, and .godot-vimrc.sample
-          # is the onboarding artifact they point at. Both travel with it, so the
-          # links resolve from wherever the addon folder ends up.
-          #
-          # docs/ is user documentation only — design notes live outside this
-          # repo entirely, so there is nothing here to exclude. Copied file by
-          # file rather than `cp -r` so a future internal doc landing in docs/
-          # cannot silently ship to every user's project tree.
-          mkdir -p "$ADDON/docs"
-          cp docs/REFERENCE.md "$ADDON/docs/"
-          cp docs/DEBUGGING.md "$ADDON/docs/"
-          cp .godot-vimrc.sample "$ADDON/"
-
-          # The repo README uses relative media/ paths so GitHub renders it.
-          # media/ is ~MBs of gifs and is deliberately NOT shipped, so rewrite
-          # those six references to tag-pinned raw URLs in the SHIPPED copy
-          # only. Pinning to the tag rather than main keeps an old release's
-          # images matching that release.
-          sed -i "s|](media/|](https://raw.githubusercontent.com/hmdfrds/godot-vim/${VERSION}/media/|g" "$ADDON/README.md"
-          sed -i "s|src=\"media/|src=\"https://raw.githubusercontent.com/hmdfrds/godot-vim/${VERSION}/media/|g" "$ADDON/README.md"
-
-          # Fail loudly rather than shipping a zip that pollutes a user project.
-          UNEXPECTED=$(find "$STAGE" -mindepth 1 -maxdepth 1 ! -name addons)
-          if [ -n "$UNEXPECTED" ]; then
-            echo "::error::files outside addons/ would land in the user's project root:"
-            echo "$UNEXPECTED"
-            exit 1
-          fi
-
-          zip -r "godot-vim-${VERSION}.zip" "$STAGE"
+        run: zip -r "godot-vim-${VERSION}.zip" "godot-vim-${VERSION}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2

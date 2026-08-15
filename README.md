@@ -9,11 +9,12 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Godot-4.5%2B-478cbf?logo=godot-engine&logoColor=white" alt="Requires Godot 4.5 or newer">
   <a href="https://store.godotengine.org/asset/hmdfrds/godotvim/">
-    <img src="https://img.shields.io/badge/Godot%20Asset%20Store-4.5%2B-478cbf?logo=godot-engine&logoColor=white" alt="Godot Asset Store">
+    <img src="https://img.shields.io/badge/Godot%20Asset%20Store-GodotVim-478cbf?logo=godot-engine&logoColor=white" alt="Godot Asset Store listing">
   </a>
-  <a href="https://github.com/hmdfrds/godot-vim/actions/workflows/release.yml">
-    <img src="https://github.com/hmdfrds/godot-vim/actions/workflows/release.yml/badge.svg" alt="Release">
+  <a href="https://github.com/hmdfrds/godot-vim/actions/workflows/ci.yml">
+    <img src="https://github.com/hmdfrds/godot-vim/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
   <img src="https://img.shields.io/github/license/hmdfrds/godot-vim" alt="License">
 </p>
@@ -24,117 +25,185 @@
 
 ---
 
+
+## Requirements
+
+Godot 4.5 or newer, and Godot's own script editor. The plugin has no effect in
+Rider, VS Code or any other external editor. Prebuilt binaries cover Linux and
+Windows x86_64 and macOS universal; Linux arm64, and any Linux with glibc older
+than 2.34 (Ubuntu 20.04, Debian 11, RHEL 8), need a
+[source build](docs/BUILDING.md). On 4.5, `d` and `r` in the FileSystem dock
+do nothing, because they use an API Godot added in 4.6.
+
 ## Installation
 
-### Godot Asset Store (Recommended)
-1. Open your Godot project → **Asset Store** tab
-2. Search **"[GodotVim](https://store.godotengine.org/asset/hmdfrds/godotvim/)"** → **Download**
-3. In the install dialog, click **Install**
-4. **Project → Project Settings** → **Plugins** → Enable **GodotVim**
-5. **Restart the Editor** (required for full initialization)
+### From the Godot asset library
 
-### Manual (from Releases page)
-1. Download `godot-vim-vX.Y.Z.zip` from the [Releases page](https://github.com/hmdfrds/godot-vim/releases/latest)
-2. Extract the archive — you'll get a `godot-vim-vX.Y.Z/` folder containing `addons/`, `LICENSE`, and `README.md`
-3. Copy the **`addons/godot_vim/`** folder (from inside the extracted folder) into your Godot project's root, so the final path is `<your-project>/addons/godot_vim/`
-4. **Project → Project Settings** → **Plugins** → Enable **GodotVim**
-5. **Restart the Editor** (required for full initialization)
+1. In your project, open the asset library tab and search for **GodotVim**. The
+   listing is at
+   [store.godotengine.org/asset/hmdfrds/godotvim](https://store.godotengine.org/asset/hmdfrds/godotvim/).
+2. **Download**, then **Install** with **Ignore asset root** left checked.
+   Unchecking it puts the files in the wrong place.
+3. **Project > Project Settings > Plugins**, enable **GodotVim**.
+4. Restart the editor.
 
-### Upgrading from v0.x
+### From a release zip
 
-This is a complete rewrite — settings, config format, and internals are all new.
+1. Download `godot-vim-vX.Y.Z.zip` from the
+   [releases page](https://github.com/hmdfrds/godot-vim/releases/latest).
+2. Extract it. The folder inside contains `addons/` and nothing else. `LICENSE`,
+   `README.md`, `docs/` and `.godot-vimrc.sample` all live inside
+   `addons/godot_vim/`, so installing the addon cannot overwrite anything in
+   your project root.
+3. Copy `addons/godot_vim/` into your project, giving
+   `<your-project>/addons/godot_vim/`.
+4. **Project > Project Settings > Plugins**, enable **GodotVim**.
+5. Restart the editor.
 
-1. **Remove the old `addons/godot_vim/` folder** from your Godot project before installing
-2. **Clear old EditorSettings** (optional): old GodotVim keys in `editor_settings-4.tres` are harmless — the new version ignores them — but you can delete lines starting with `plugins/GodotVim` in that file for a clean slate. The file is located at:
-   - **Windows:** `%APPDATA%\Godot\editor_settings-4.tres`
-   - **Linux:** `~/.config/godot/editor_settings-4.tres`
-   - **macOS:** `~/Library/Application Support/Godot/editor_settings-4.tres`
-3. **Recreate key mappings**: v0.x stored mappings in EditorSettings; v1.0 uses a `.godot-vimrc` config file instead (see [Configuration](#configuration))
+Every release also publishes a `.sha256` beside each binary, a CycloneDX SBOM, a
+VirusTotal scan result and a GitHub build provenance attestation.
 
-### Upgrading from v1.6.x
+## Quick start
 
-Nothing to do — with no `.godot-vimrc`, the keyset is unchanged. The shell-side keys (panel focus, dock navigation, FileSystem and debugger operations, the completion popup) are now a **rebindable table** rather than hardcoded match arms; the shipped defaults are exactly what they were. See [Panel Key Bindings →](docs/REFERENCE.md#panel-key-bindings-panelmap).
-
-Four differences you may notice, all deliberate:
-
-- **`Ctrl+Enter` no longer confirms a completion.** The old popup handling matched `Enter`, `Tab`, `Escape`, `Up` and `Down` while *ignoring modifiers*, so every modified variant was swallowed too. `<CR>` now means `<CR>`, and modified variants reach the Vim engine — which is both more correct and reversible: `panelmap <shift> editor.completion <Up> godotvim.completion.navigate` restores the Shift+Up half.
-- **Holding `Ctrl+j` no longer repeats.** The four panel chords carry `<norepeat>`, so auto-repeat is consumed without re-firing. Previously a held chord queued roughly twenty deferred focus changes a second. The keystroke is still consumed, so nothing leaks to Godot.
-- **`Ctrl+h/j/k/l` now escapes the FileSystem create/rename prompt**, and the stale-prompt cleanup runs for those chords too. Previously the prompt was left pointing at a tree it would later steal focus back to.
-- **`:action godotvim.fs.create` and friends actually run.** They were declining stubs; they now do what the corresponding key does.
-
-New in this release: `:panelmap` lists every shell-side binding in the exact syntax you would paste into a vimrc, plus any config line that was rejected and why. `:panelmap {keys}` explains how one key resolves where focus is right now.
-
-## Quick Start
-
-Open any script.
+Open any script. The caret turns into a block and a mode indicator appears at the
+bottom right of the editor. That indicator is how you know the plugin is running.
 
 | Keys | What happens |
-|------|-------------|
-| `i` | Enter Insert mode (type normally) |
+|------|--------------|
+| `i` | Enter Insert mode |
 | `Escape` | Return to Normal mode |
 | `dd` | Delete the current line |
-| `ci"` | Change text inside quotes |
+| `ci"` | Change the text inside quotes |
 | `/pattern` | Search forward |
 | `:w` | Save the file |
 | `:run` | Run the project (F5) |
-| `Ctrl+h/j/k/l` | Navigate between Godot panels |
+| `Ctrl+h/j/k/l` | Move focus between Godot panels |
+
+Nothing needs configuring; the plugin works with no config file at all. When you
+do want one, `:mkvimrc` writes `res://.godot-vimrc` with all 20 built-in presets
+listed and commented out, and `:mappings` opens a dialog that edits the same file
+for you.
 
 ## Features
 
-### Full Composable Vim Grammar
-
-`d2w`, `ci"`, `gUiw`, `>ap` — operators compose with motions and text objects exactly like real Vim. Counts multiply, registers route output. Dot repeat (`.`) replays any edit faithfully, including complex multi-key sequences.
+### The full Vim grammar
 
 ```
 [count] [register] operator [count] motion/textobject
 ```
 
-Motions, operators, text objects — including advanced text objects like `ib` (any bracket), `iq` (any quote), `ii` (indent), `im` (symbol), and `ie` (entire buffer). Visual block mode supports `I`/`A` for multi-line insert/append. Undo tree with time-based navigation. [Full list →](docs/REFERENCE.md#motions)
+`d2w`, `ci"`, `gUiw`, `>ap`. Operators compose with motions and text objects the
+way they do in Vim. Counts multiply, registers route the output, and `.` repeats
+the last edit, including multi-key operator sequences.
+
+Text objects include `iw`/`aw`, `ip`/`ap`, the quote and bracket pairs, and the
+aggregate objects `ib` (tightest enclosing bracket, `<>` included), `iq` (any
+quote), `ii` (indent level), `im` (symbol) and `ie` (entire buffer). Visual block
+supports `I` and `A`. Surround is built in: `ys{motion}{char}`, `ds{char}`,
+`cs{old}{new}`. For multiple cursors, `gb` adds one at the next match of the word
+under the cursor, `gB` at the previous, `gs` skips one, and carets you added with
+the mouse are imported before each keystroke, so Godot's multi-caret editing and
+Vim's stay in sync. The status bar shows the count, for example
+`NORMAL (3 cursors)`.
+
+[Motions](docs/REFERENCE.md#motions) ·
+[Operators](docs/REFERENCE.md#operators) ·
+[Text objects](docs/REFERENCE.md#text-objects) ·
+[Registers and macros](docs/REFERENCE.md#registers-and-macros)
 
 ### Built for Godot
 
-Not just Vim in an editor — Vim that speaks Godot:
+- **`:run`** and **`:runcurrent`** launch scenes, **`:stop`** stops them
+- **`:GodotBreakpoint`** toggles a breakpoint, **`:next`** and **`:stepin`** step
+- **`Ctrl+h/j/k/l`** moves focus between the script editor, scene tree, inspector and FileSystem dock. From inside a dock, **`Escape`** returns focus to the editor.
+- **`h/j/k/l`** navigate a focused dock, **`/`** jumps to its search box
+- **FileSystem dock**: `a` create file or directory, `d` delete, `r` rename, `y` yank path, `R` refresh
+- **Debugger dock**: `J` and `K` walk stack frames and breakpoints, `G` jumps to the deepest frame, `y` yanks the row
+- **`gd`** goes to a definition, **`K`** opens Godot's documentation tooltip for the symbol under the cursor
+- **`Ctrl-N`**, **`Ctrl-P`** and **`Ctrl-Space`** drive the completion popup
+- **`Ctrl-O`** and **`Ctrl-I`** follow the jump list across tabs, not just inside one file
+- **`Ctrl-W h/j/k/l`** and **`Ctrl-W w`** move and cycle focus from the script editor
+- **`:zen`** toggles distraction-free mode
 
-- **`:run`** / **`:runcurrent`** — launch scenes without leaving the keyboard
-- **`:GodotBreakpoint`** — toggle breakpoints, step through with `:next` / `:stepin`
-- **`Ctrl+h/j/k/l`** — spatial panel navigation (script editor, scene tree, inspector, filesystem)
-- **`j/k/h/l` in docks** — browse the scene tree, filesystem, and output with Vim keys; `/` to search
-- **File explorer** — `a` create file/dir, `d` delete, `r` rename, `y` yank path, `R` refresh (nvim-tree style)
-- **Debugger** — `J`/`K` walk stack frames and breakpoints, `G` jumps to the deepest frame, `y` yanks the row
-- **Every one of those keys is rebindable** — `panelmap` / `panelunmap` lines in your `.godot-vimrc`, `:panelmap` to list and explain them
-- **`gd`** — go-to-definition; **`K`** — hover docs
-- **Code completion** — `Ctrl-N`/`Ctrl-P`/`Ctrl-Space` trigger and navigate completions
-- **Cross-buffer jump list** — `Ctrl-O`/`Ctrl-I` switch tabs when the jump is in another buffer
-- **`:zen`** — distraction-free mode
+All 30 of the panel, dock, FileSystem, debugger, searchbox and completion
+bindings ship as config lines rather than hardcoded match arms, so `panelunmap`
+and `panelmap` in your `.godot-vimrc` replace any of them. `:panelmap` prints
+every live binding in the exact syntax you would paste back into a vimrc.
 
-[All Godot commands →](docs/REFERENCE.md#custom-commands)
+[All Godot commands](docs/REFERENCE.md#custom-commands) ·
+[Panel key bindings](docs/REFERENCE.md#panel-key-bindings-panelmap)
 
 <p align="center">
-  <img src="media/dock_filesystem.gif" alt="Panel Navigation" width="800" />
-  <br><em>Navigate between docks with Ctrl+h/j/k/l — browse files, scenes, and inspector without the mouse</em>
+  <img src="media/dock_filesystem.gif" alt="Panel navigation" width="800" />
+  <br><em>Ctrl+h/j/k/l between docks, then Vim keys inside them</em>
 </p>
 
 <p align="center">
-  <img src="media/docs.gif" alt="Go-to-definition and Hover Docs" width="800" />
-  <br><em>K for hover docs, gd for go-to-definition</em>
+  <img src="media/docs.gif" alt="Go-to-definition and hover docs" width="800" />
+  <br><em>K for the documentation tooltip, gd for go-to-definition</em>
 </p>
 
-### Search and Replace
+### Search, replace and history
 
-Incremental search highlighting as you type. `:s/old/new/g` highlights every match region in yellow as you type the pattern — see exactly what will be affected before you press Enter.
+Search is incremental, and `:s/old/new/g` highlights every match region in yellow
+while you are still typing the pattern, so you see what will change before
+pressing Enter. Set **Inccommand** to `off` if you would rather not have the
+preview. `:g`, `:v`, `:norm`, `:sort`, `:retab` and `:center` are all available.
+
+Undo is a tree, not a line: `:undolist` lists the branches, `:undotree` draws
+one, `g-` and `g+` walk it, and `:earlier` and `:later` take a count, a time
+(`10s`, `5m`, `1h`) or a save point (`1f`). Folds respond to `zo`, `zc`, `za`,
+`zM` and `zR`. Marks are local and global, and `:marks`, `:jumps`, `:changes`,
+`:reg` and `:messages` show the current state.
+
+[Ex commands](docs/REFERENCE.md#standard-ex-commands) ·
+[Undo tree](docs/REFERENCE.md#undo-tree) ·
+[Folds](docs/REFERENCE.md#fold-commands)
 
 <p align="center">
-  <img src="media/incremental_search_replace.gif" alt="Incremental Search and Replace" width="800" />
+  <img src="media/incremental_search_replace.gif" alt="Incremental search and replace" width="800" />
   <br><em>Live match highlighting as you type the substitution pattern</em>
 </p>
 
-### Custom Cursor
+### Cursor, status bar and gutter
 
-A GLSL difference-blend shader renders the cursor above Godot's native caret. Block, beam, and underline shapes with smooth animation, per-mode colors, and adjustable blink speed. [Cursor settings →](docs/REFERENCE.md#cursor)
+A GLSL difference-blend shader draws the cursor over Godot's native caret, so it
+stays readable on any theme. Four shapes: block in Normal and Visual, beam in
+Insert, underline in Replace, and a half block while a delete, change, yank or
+case operator is pending. Each mode has its own colour, and a pending operator
+rotates the cursor's hue, so a waiting `d`, `c`, `y`, `>` and `gU` each look
+different. Blink and line highlighting come from Godot's own settings under
+`text_editor/appearance/caret/`, not from GodotVim.
 
-### Configuration
+The status bar is a floating overlay at the bottom right: mode, command line,
+messages, a recording indicator, the pending command (`d2` while it waits for a
+motion) and pending mapping keys. The line-number gutter has four modes and
+defaults to Hybrid. Yanked text flashes for 150 ms by default.
 
-Create a `.godot-vimrc` at your project root or user directory:
+[Cursor](docs/REFERENCE.md#custom-cursor) ·
+[Status bar](docs/REFERENCE.md#status-bar) ·
+[Line numbers](docs/REFERENCE.md#line-numbers)
+
+### Locked down by default
+
+GodotVim is a native extension, so it ships restrictive:
+
+- Shell execution is **Disabled**. `:!` is blocked until you turn it on.
+- File access is **ProjectOnly**. `:w`, `:r` and `:e` stay inside `res://` and `user://`.
+- A `.godot-vimrc` committed to the project is **Sandboxed**. Only known-safe
+  constructs pass: comments, most `set` options, `let mapleader`, the `noremap`
+  forms, `panelunmap`, and `panelmap` lines targeting a registered `godotvim.*`
+  action. Everything else, including the recursive `map` forms and raw
+  ex-commands, is commented out with a reason rather than deleted, so nothing
+  changes silently. A `user://.godot-vimrc` is trusted in full.
+
+All three are settings. [Security](docs/REFERENCE.md#security)
+
+
+## Configuration
+
+Run `:mkvimrc` to write a starter `res://.godot-vimrc`, or copy
+[`.godot-vimrc.sample`](.godot-vimrc.sample) to your project root and edit it:
 
 ```vim
 let mapleader = " "
@@ -150,38 +219,79 @@ panelunmap dock j
 panelmap <physical> dock n godotvim.item.next
 ```
 
+**After editing the file by hand, run `:source`.** There is no file watcher.
+Saving in your editor does not reload the config. The `:mappings` dialog is the
+only thing that applies changes on its own.
 
-Hot-reloads on save. 20 built-in presets togglable via the `:mappings` dialog. [Config syntax →](docs/REFERENCE.md#godot-vimrc-syntax) · [Panel bindings →](docs/REFERENCE.md#panel-key-bindings-panelmap) · [All presets →](docs/REFERENCE.md#preset-mappings)
+Exactly one config file is read, and the first one found wins:
+
+1. **Editor Settings > Plugins > GodotVim > Mapping > Config File Path**, if you set it
+2. `res://.godot-vimrc`, committed with the project
+3. `user://.godot-vimrc`, per user, shared by every project
+
+They do not layer. If `res://.godot-vimrc` exists, `user://.godot-vimrc` is never
+read.
+
+Twenty presets ship disabled, among them `jk` for Escape and `<Space>w` for
+`:save`. Toggle them from `:mappings`, or uncomment them in the file.
+
+[Config syntax](docs/REFERENCE.md#godot-vimrc-syntax) ·
+[Panel bindings](docs/REFERENCE.md#panel-key-bindings-panelmap) ·
+[Presets](docs/REFERENCE.md#preset-mappings) ·
+[All settings](docs/REFERENCE.md#settings)
 
 <p align="center">
-  <img src="media/mappings.gif" alt="Mappings Dialog" width="800" />
-  <br><em>Toggle built-in presets and manage custom mappings with :mappings</em>
+  <img src="media/mappings.gif" alt="Mappings dialog" width="800" />
+  <br><em>Toggling presets and editing mappings with :mappings</em>
 </p>
 
-### Macros, Registers, and Marks
+## Building from source
 
-Record with `qa`, replay with `@a`. Named registers `"a`-`"z`, system clipboard via `"+`. Local and global marks, jump list with `Ctrl-O`/`Ctrl-I`. [Full details →](docs/REFERENCE.md#registers-and-macros)
+With a stable Rust toolchain on Linux, macOS or Windows:
+
+```bash
+git clone --depth 1 https://github.com/hmdfrds/godot-vim
+cd godot-vim
+./scripts/assemble-addon.sh
+```
+
+That builds the library and writes a ready-to-copy `dist/addons/godot_vim/`.
+It is the same script the release workflow runs, so what you get is what a
+release contains. What to expect from the build, and the per-platform notes,
+are in [docs/BUILDING.md](docs/BUILDING.md).
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| Plugin not appearing | Ensure `addons/godot_vim/` contains `plugin.cfg`, `.gdextension`, and the compiled library. Enable in Project Settings > Plugins. |
-| `addons/` folder missing after Asset Store install | "Ignore asset root" was unchecked. Re-install from the Asset Store with the box **checked**, or manually copy `addons/godot_vim/` from the release zip. |
-| Key not working | Check `passthrough_keys` setting — the key may be bypassing Vim. Check `:mappings` for conflicts. |
-| A dock or panel key does nothing | Run `:panelmap {key}` with that panel focused — the Output panel shows which surface claimed the focus, which rule won, and which gate stopped it. `:panelmap` with no argument lists every binding plus any `.godot-vimrc` line that was rejected. |
-| A `panelmap` line seems to be ignored | `:panelmap` prints rejected lines and the reason. If yours is not listed at all, the verb is misspelled — `panelmp` is not claimed as a panel line. Set **Log Level** to `Debug` to see rejections as the file loads. |
-| `.godot-vimrc` not loading | Verify the file is at `res://.godot-vimrc` or `user://.godot-vimrc`. Run `:source` to force reload. |
-| Clipboard not working | Enable `editor/clipboard_enabled` in EditorSettings. Both `y`/`p` and `"+y`/`"+p` sync with the system clipboard when enabled. |
-| Cursor not rendering | The custom cursor uses a GLSL shader. Set `cursor/enabled = false` to fall back to native caret. |
-| macOS: held keys don't repeat | macOS's "Press and Hold" accent picker can interfere with key repeat. Run `defaults write com.godotengine.godot ApplePressAndHoldEnabled -bool false` in Terminal and restart Godot. GodotVim includes a built-in fallback, but disabling Press and Hold gives the most reliable experience. |
-| Want to disable GodotVim entirely | Set **Editor Settings > Plugins > GodotVim > Enabled = false**. This is a **global, per-user** editor setting (stored in `editor_settings-*.tres`, not committed to `project.godot`) — it affects every project opened with this editor installation and persists across reinstalls. The plugin becomes inert but is not unloaded: no keybindings, overlays, input handling, or `.godot-vimrc` sourcing occur, but the settings listener, a one-shot mapping timer, filesystem Callables, the process-global panic hook, and the always-loaded native extension remain connected. To disable for one project only, use **Project Settings > Plugins** instead. |
-| GodotVim seems inactive / no keybindings | Check **Editor Settings > Plugins > GodotVim > Enabled** — it must be `true`. This setting persists per-user across reinstalls. Note: **Cursor > Enabled** (a separate sub-setting) only toggles the custom cursor overlay and does not affect the Vim engine. |
-| Vim is active in shader or addon editors | Intentional — GodotVim applies to all of Godot's built-in script editors. Set **Editor Settings > Plugins > GodotVim > Enabled = false** to disable it globally. |
+Settings live under **Editor Settings > Plugins > GodotVim**.
 
-**For bug reports:** Set **Log Level** to `Debug` in Editor Settings > GodotVim, reproduce the issue, then copy the Output panel into GitHub issue. The debug log shows every keystroke and what command was executed.
+| Problem | What to check |
+|---------|---------------|
+| The plugin is not in the plugin list | `addons/godot_vim/` must hold `plugin.cfg`, `godot_vim.gdextension`, and `bin/` with the library for your platform. Release zips include it; a git clone does not. If `addons/` is missing entirely after an asset library install, **Ignore asset root** was unchecked. |
+| No keys work at all | **Enabled** must be `true`. It is a per-user editor setting, so it applies to every project you open with this installation, and **Project Settings > Plugins** is what turns the plugin off for one project only. **Cursor > Enabled** is a different setting and only affects the cursor overlay. |
+| One key does nothing | Check **Input > Passthrough Keys**. A key listed there is handed straight to Godot on purpose. |
+| A key works on QWERTY but not for you | Layout matters. In `panelmap` lines the `<physical>` flag matches the US-QWERTY key position; without it the binding follows the character your layout produces. Several past defects reproduced only on Colemak, Dvorak or AZERTY. |
+| A dock or panel key does nothing | Run `:panelmap` with no argument from the editor. It lists every live binding by surface (`dock`, `dock.filesystem`, `panel`, and so on) plus every config line that was rejected and why. Find the surface your dock is and check the key is bound there. You cannot type `:` while a dock has focus, so `:panelmap {key}` reports the editor's focus, not the dock's. |
+| A `panelmap` line looks ignored | `:panelmap` with no argument lists every live binding plus every config line that was rejected and why. If yours is not listed at all the verb is misspelled: `panelmp` is never claimed as a panel line. Set **Log Level** to `Warn` to watch rejections as the file loads. |
+| `.godot-vimrc` is not loading | Only one file is read. If **Mapping > Config File Path** is set it wins, and your `res://.godot-vimrc` is never seen. If **Security > Project Vimrc** is `Disabled`, a project file is skipped entirely, which Log Level `Info` reports. After a hand edit, run `:source`. |
+| Lines in a committed config are silently disabled | Under the default `Sandbox` policy a `res://.godot-vimrc` keeps only known-safe lines, and the recursive `map`, `nmap`, `vmap`, `imap`, `omap` and `cmap` forms are stripped whatever they map to. Use the `noremap` forms, or move the file to `user://.godot-vimrc`. |
+| Clipboard does not sync | Turn on **Editor > Clipboard Enabled**; it is off by default. With it on, plain `y` and `p` use the system clipboard too. `"+y` and `"+p` reach it either way. |
+| The cursor does not render | The overlay uses a GLSL shader. Set **Cursor > Enabled** to `false` to fall back to Godot's native caret. |
+| macOS: held keys do not repeat | macOS's Press and Hold accent picker interferes. Run `defaults write org.godotengine.godot ApplePressAndHoldEnabled -bool false` in Terminal and restart Godot. GodotVim falls back to the physical key when macOS sends no character, but turning Press and Hold off is more reliable. |
+| Vim is active in the shader editor | Intentional. GodotVim attaches to every `CodeEdit` in the editor. |
 
-For a large log, [docs/DEBUGGING.md](docs/DEBUGGING.md) explains the per-keystroke summary line and carries ready-made `grep` patterns — mode transitions, text mutations, a specific key sequence, editor lifecycle — which is usually faster than reading it top to bottom.
+**Filing a bug.** Set **Log Level** to `Debug`, reproduce the problem, and paste
+the Output panel into the issue. Include your Godot version, your OS and your
+keyboard layout. [docs/DEBUGGING.md](docs/DEBUGGING.md) explains the
+one-line-per-keystroke log format and carries ready-made `grep` patterns, which
+is usually faster than reading a long log top to bottom.
+
+## Docs
+
+- [docs/REFERENCE.md](docs/REFERENCE.md), every motion, command, setting and `panelmap` rule
+- [docs/DEBUGGING.md](docs/DEBUGGING.md), reading a log and what to attach to a bug report
+- [docs/BUILDING.md](docs/BUILDING.md), compiling the plugin yourself
+- [`.godot-vimrc.sample`](.godot-vimrc.sample), an annotated starter config that ships with the addon
+- [docs/UPGRADING.md](https://github.com/hmdfrds/godot-vim/blob/main/docs/UPGRADING.md), coming from v0.x or v1.6.x
 
 ## Architecture
 
@@ -192,9 +302,9 @@ For a large log, [docs/DEBUGGING.md](docs/DEBUGGING.md) explains the per-keystro
 +----------------+     +----------+     +----------+
 ```
 
-**vim-core** is a standalone Vim engine — pure Rust, zero Godot dependencies. It processes keystrokes and returns `Effect` values that the host applies. The same engine could power any editor.
-
-[All settings](docs/REFERENCE.md#settings) · [All commands](docs/REFERENCE.md#custom-commands) · [Full reference](docs/REFERENCE.md)
+[vim-core](https://github.com/hmdfrds/vim-core) is a standalone Vim engine: pure
+Rust, no Godot dependency. It turns keystrokes into `Effect` values, and this
+repository applies them to Godot. `Cargo.toml` pins it by tag.
 
 ## License
 

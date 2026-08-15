@@ -20,13 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # vim-core is a private repo pulled as a git dependency, same as release.yml.
-      - name: Configure private repo access
-        shell: bash
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -57,9 +50,5 @@ jobs:
             exit 1
           fi
 
-      # The repo carries pre-existing rustfmt drift across 20 files. Gating the
-      # whole crate would fail on day one and teach everyone to ignore CI, so
-      # this checks only the module the rebindable-nav work owns, where the
-      # invariant is real and enforceable.
-      - name: Rustfmt (actions module)
-        run: rustfmt --check --edition 2021 src/actions/*.rs
+      - name: Rustfmt
+        run: cargo fmt --all --check
