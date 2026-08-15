@@ -47,6 +47,11 @@ pub(crate) struct CursorGeometry {
     /// Character cell width -- the VimCursor uses this for block/underline
     /// sizing, while beam mode ignores it in favor of a fixed pixel width.
     pub(crate) width: f32,
+    /// The (line, col) this geometry was computed from: the visual-mode
+    /// override when present, the native caret otherwise. The same `logical`
+    /// with a different `pos` means the viewport moved under a stationary
+    /// caret (scroll, fold, resize), not that the caret moved.
+    pub(crate) logical: (i32, i32),
 }
 
 /// Compute pixel-space cursor geometry for the overlay.
@@ -87,6 +92,7 @@ pub(crate) fn compute_cursor_geometry(
             pos: Vector2::new(editor.get_caret_draw_pos().x, 0.0),
             height: line_height,
             width: fallback_char_width,
+            logical: (line, col),
         });
     }
 
@@ -134,6 +140,7 @@ pub(crate) fn compute_cursor_geometry(
         pos: Vector2::new(target_x, target_y),
         height,
         width,
+        logical: (line, col),
     })
 }
 
@@ -175,15 +182,15 @@ fn compute_override_x_and_width(
         return (draw_pos.x, w);
     }
 
-    let result = ctx.shaped_cache
+    let result = ctx
+        .shaped_cache
         .get_or_shape(editor, ctx.font, ctx.font_size, line)
         .map(|(rid, ts)| {
             let x = if caret_line == line {
                 // Same line: shaped delta from native caret col to target col,
                 // anchored to draw_pos.x which already accounts for gutter/scroll.
                 let target_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
-                let caret_x =
-                    caret_x_from_dict(&ts.shaped_text_get_carets(rid, caret_col as i64));
+                let caret_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, caret_col as i64));
                 match (target_x, caret_x) {
                     (Some(tx), Some(cx)) => {
                         let result = draw_pos.x + (tx - cx);
@@ -221,8 +228,7 @@ fn compute_override_x_and_width(
 
             // Width: shaped delta between col and col+1.
             let width = if codec::i32_to_usize(col) < line_len {
-                let col_next =
-                    caret_x_from_dict(&ts.shaped_text_get_carets(rid, (col + 1) as i64));
+                let col_next = caret_x_from_dict(&ts.shaped_text_get_carets(rid, (col + 1) as i64));
                 let col_cur = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
                 match (col_next, col_cur) {
                     (Some(nx), Some(cx)) => {
@@ -390,7 +396,15 @@ fn compute_char_width_ts(
         return fallback;
     }
 
-    if let Some(delta) = shaped_text_caret_delta(ctx.shaped_cache, ctx.editor, ctx.font, ctx.font_size, line, col + 1, col) {
+    if let Some(delta) = shaped_text_caret_delta(
+        ctx.shaped_cache,
+        ctx.editor,
+        ctx.font,
+        ctx.font_size,
+        line,
+        col + 1,
+        col,
+    ) {
         let w = delta.abs();
         if is_sane_coord(w) && w >= MIN_CURSOR_WIDTH {
             return w;
@@ -580,12 +594,54 @@ struct CursorAnimation {
     /// False until the first `set_target` call. Prevents lerping from (0,0)
     /// to the real position on initial attach.
     positioned: bool,
+    /// The (line, col) of the last geometry. A new target with the same
+    /// logical position means the text moved under a stationary caret
+    /// (scroll, fold, resize). That motion belongs to the text, not to the
+    /// cursor, and is applied as a rigid translate rather than animated.
+    last_logical: Option<(i32, i32)>,
     /// Dedup guard: skip `set_self_modulate` when alpha hasn't changed.
     last_alpha: f32,
     /// Cached from parent Control in `set_target`. Used in `_process` to
     /// hide the cursor when it extends below the visible editor rect --
     /// necessary because the screen_texture shader bypasses `clip_children`.
     cached_editor_height: f32,
+}
+
+/// How `set_target` should treat an incoming geometry. Pure, so it is
+/// testable without a Godot runtime.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Retarget {
+    /// The caret moved: lerp toward the new position, re-light the cursor.
+    Animate,
+    /// Only the viewport moved: translate both endpoints by the delta and
+    /// leave blink phase alone.
+    Translate,
+}
+
+impl CursorAnimation {
+    /// Decide how to apply `target` for `logical`, and record `logical`.
+    ///
+    /// `positioned` is part of the predicate deliberately: on first attach
+    /// `last_logical` is `None` and the geometry comes from the native caret
+    /// rather than the visual head, so the first call must always animate
+    /// (where the `!positioned` snap then lands it exactly).
+    fn retarget(&mut self, target: Vector2, logical: (i32, i32)) -> Retarget {
+        let viewport_only = self.positioned && self.last_logical == Some(logical);
+        self.last_logical = Some(logical);
+        if viewport_only {
+            // Translate both endpoints by one delta, read before target_pos
+            // is overwritten. An in-flight lerp keeps its remaining offset and
+            // continues in the scrolled frame; an idle cursor lands exactly.
+            // Deltas compose additively, so a held scroll never drifts.
+            let delta = target - self.target_pos;
+            self.current_pos += delta;
+            self.target_pos = target;
+            Retarget::Translate
+        } else {
+            self.target_pos = target;
+            Retarget::Animate
+        }
+    }
 }
 
 impl Default for CursorAnimation {
@@ -599,6 +655,7 @@ impl Default for CursorAnimation {
             blink_speed: 0.0,
             blink_time: 0.0,
             positioned: false,
+            last_logical: None,
             last_alpha: -1.0,
             cached_editor_height: 0.0,
         }
@@ -794,8 +851,34 @@ impl IControl for VimCursor {
 
 #[godot_api]
 impl VimCursor {
-    pub fn set_target(&mut self, target: Vector2, font_height: f32, char_width: f32) {
-        self.animation.target_pos = target;
+    /// Move the overlay to `geom`.
+    ///
+    /// Two kinds of motion arrive here and only one should animate. A caret
+    /// move (keystroke) lerps toward the new position. A viewport move
+    /// (scroll, fold, resize) leaves the caret on the same (line, col) while
+    /// its pixel position shifts; that is translated rigidly in the same
+    /// frame, so the cursor never trails the text it sits on.
+    ///
+    /// The branch lives here rather than at the call sites because scroll
+    /// effects (`zz`, `zt`, `Ctrl-e`, scrolloff) mutate the viewport
+    /// synchronously during dispatch, before the keystroke call site runs,
+    /// while the scroll and draw signals are connected DEFERRED and fire
+    /// after `_process`. So the keystroke site is the first to see post-scroll
+    /// geometry, and a call-site split would still animate it. Deciding on
+    /// `logical` here makes the number of call sites irrelevant.
+    pub fn set_target(&mut self, geom: &CursorGeometry) {
+        let target = geom.pos;
+        let font_height = geom.height;
+        let char_width = geom.width;
+
+        // Written synchronously here rather than in _process, because the
+        // deferred draw signal that drives most viewport moves flushes after
+        // _process; deferring the translate would show one frame of smear.
+        let retarget = self.animation.retarget(target, geom.logical);
+        if retarget == Retarget::Translate {
+            let p = self.animation.current_pos;
+            self.base_mut().set_position(p);
+        }
 
         // Cache editor height once per target update rather than every _process
         // frame (avoids get_parent + try_cast + get_rect at 60Hz).
@@ -819,8 +902,11 @@ impl VimCursor {
             self.animation.positioned = true;
         }
 
-        self.animation.blink_time = 0.0;
-        self.update_alpha(1.0);
+        if retarget == Retarget::Animate {
+            // A scroll is not a keystroke: do not re-light a blinking cursor.
+            self.animation.blink_time = 0.0;
+            self.update_alpha(1.0);
+        }
         self.base_mut().set_process(true);
 
         if dims_changed {
@@ -891,9 +977,7 @@ impl VimCursor {
             Mode::Visual(_) => self.color_map.visual,
             Mode::Select(_) => self.color_map.visual,
             Mode::Replace | Mode::VirtualReplace => self.color_map.replace,
-            Mode::OperatorPending(ref op) => {
-                apply_operator_hue_shift(self.color_map.operator, op)
-            }
+            Mode::OperatorPending(ref op) => apply_operator_hue_shift(self.color_map.operator, op),
             Mode::CommandLine => self.color_map.command,
             _ => {
                 log::warn!(
@@ -979,7 +1063,11 @@ mod tests {
     fn alpha_preserved() {
         let base = Color::from_rgba(1.0, 0.0, 0.0, 0.7);
         let result = apply_operator_hue_shift(base, &Operator::Yank);
-        assert!(approx_eq(result.a, 0.7), "alpha was {}, expected 0.7", result.a);
+        assert!(
+            approx_eq(result.a, 0.7),
+            "alpha was {}, expected 0.7",
+            result.a
+        );
     }
 
     #[test]
@@ -1137,5 +1225,127 @@ mod operator_coverage_tests {
                 kind
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod retarget_tests {
+    use super::*;
+
+    fn anim(
+        positioned: bool,
+        current: Vector2,
+        target: Vector2,
+        last: Option<(i32, i32)>,
+    ) -> CursorAnimation {
+        CursorAnimation {
+            positioned,
+            current_pos: current,
+            target_pos: target,
+            last_logical: last,
+            ..CursorAnimation::default()
+        }
+    }
+
+    #[test]
+    fn first_call_after_attach_always_animates() {
+        // last_logical is None on attach and the geometry comes from the
+        // native caret rather than the visual head; the first call must take
+        // the animate branch so the !positioned snap can land it.
+        let mut a = anim(false, Vector2::ZERO, Vector2::ZERO, None);
+        assert_eq!(
+            a.retarget(Vector2::new(100.0, 40.0), (2, 5)),
+            Retarget::Animate
+        );
+        assert_eq!(a.last_logical, Some((2, 5)));
+    }
+
+    #[test]
+    fn caret_move_animates_and_leaves_current_alone() {
+        let mut a = anim(
+            true,
+            Vector2::new(10.0, 10.0),
+            Vector2::new(10.0, 10.0),
+            Some((0, 0)),
+        );
+        assert_eq!(
+            a.retarget(Vector2::new(10.0, 30.0), (1, 0)),
+            Retarget::Animate
+        );
+        // The lerp in _process moves current_pos; retarget must not.
+        assert_eq!(a.current_pos, Vector2::new(10.0, 10.0));
+        assert_eq!(a.target_pos, Vector2::new(10.0, 30.0));
+    }
+
+    #[test]
+    fn same_logical_new_pos_translates_rigidly() {
+        // Idle cursor (current == target). A scroll shifts the pixel position
+        // of the same (line, col); both endpoints move by the delta and the
+        // cursor lands exactly, no residual for _process to lerp.
+        let mut a = anim(
+            true,
+            Vector2::new(10.0, 100.0),
+            Vector2::new(10.0, 100.0),
+            Some((5, 0)),
+        );
+        assert_eq!(
+            a.retarget(Vector2::new(10.0, 60.0), (5, 0)),
+            Retarget::Translate
+        );
+        assert_eq!(a.current_pos, Vector2::new(10.0, 60.0));
+        assert_eq!(a.target_pos, Vector2::new(10.0, 60.0));
+    }
+
+    #[test]
+    fn translate_preserves_an_in_flight_lerp_offset() {
+        // Mid-lerp: current is 30px short of target. A scroll of -40 must
+        // carry the remaining offset into the scrolled frame, not collapse it.
+        let mut a = anim(
+            true,
+            Vector2::new(0.0, 70.0),
+            Vector2::new(0.0, 100.0),
+            Some((5, 0)),
+        );
+        assert_eq!(
+            a.retarget(Vector2::new(0.0, 60.0), (5, 0)),
+            Retarget::Translate
+        );
+        assert_eq!(a.target_pos, Vector2::new(0.0, 60.0));
+        assert_eq!(a.current_pos, Vector2::new(0.0, 30.0));
+        assert_eq!(a.target_pos - a.current_pos, Vector2::new(0.0, 30.0));
+    }
+
+    #[test]
+    fn held_scroll_composes_without_drift() {
+        let mut a = anim(
+            true,
+            Vector2::new(0.0, 100.0),
+            Vector2::new(0.0, 100.0),
+            Some((5, 0)),
+        );
+        for step in 1..=10 {
+            let y = 100.0 - 4.0 * step as f32;
+            assert_eq!(
+                a.retarget(Vector2::new(0.0, y), (5, 0)),
+                Retarget::Translate
+            );
+        }
+        assert_eq!(a.current_pos, Vector2::new(0.0, 60.0));
+        assert_eq!(a.target_pos, Vector2::new(0.0, 60.0));
+    }
+
+    #[test]
+    fn caret_move_after_scroll_animates_again() {
+        let mut a = anim(
+            true,
+            Vector2::new(0.0, 60.0),
+            Vector2::new(0.0, 60.0),
+            Some((5, 0)),
+        );
+        assert_eq!(
+            a.retarget(Vector2::new(0.0, 80.0), (6, 0)),
+            Retarget::Animate
+        );
+        assert_eq!(a.last_logical, Some((6, 0)));
     }
 }

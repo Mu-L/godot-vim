@@ -272,11 +272,7 @@ impl UndoStore {
         //
         // If no directional match exists, fall back to the nearest by absolute
         // distance — any checkpoint is better than None.
-        let checkpoints_with_cp = || {
-            self.snapshots
-                .values()
-                .filter(|s| s.checkpoint.is_some())
-        };
+        let checkpoints_with_cp = || self.snapshots.values().filter(|s| s.checkpoint.is_some());
 
         let directional = match direction {
             Direction::Undo => checkpoints_with_cp()
@@ -292,8 +288,7 @@ impl UndoStore {
         }
 
         // Fallback: nearest by absolute distance.
-        let nearest = checkpoints_with_cp()
-            .min_by_key(|s| s.sequence.abs_diff(target_seq));
+        let nearest = checkpoints_with_cp().min_by_key(|s| s.sequence.abs_diff(target_seq));
 
         nearest.and_then(|s| s.checkpoint.clone())
     }

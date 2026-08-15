@@ -43,16 +43,12 @@ pub(super) fn process_cycle_impl(
     // cleared on the next. Mirrors vim-core's clear_transient().
     session.host_mut().state_mut().globals_mut().clear_message();
 
-    if ctx.transient.vimdebug.is_step_mode()
-        && ctx.transient.pending_step_effects.is_some()
-    {
+    if ctx.transient.vimdebug.is_step_mode() && ctx.transient.pending_step_effects.is_some() {
         process_step_key(session, ctx, key, editor);
         return PipelineOutcome::VimdebugStep;
     }
 
-    if let Some(consumed) =
-        completion::try_handle_completion(session, editor, completion_binding)
-    {
+    if let Some(consumed) = completion::try_handle_completion(session, editor, completion_binding) {
         log::debug!(
             "process_cycle: completion intercepted key={} consumed={}",
             key,
@@ -121,8 +117,7 @@ pub(super) fn process_cycle_impl(
     let result = session.process_key(key);
     let consumed = result.consumed;
 
-    ctx.transient.operations_this_cycle =
-        ctx.transient.operations_this_cycle.saturating_add(1);
+    ctx.transient.operations_this_cycle = ctx.transient.operations_this_cycle.saturating_add(1);
 
     // ── Gap 1 & 5: Sync multi-cursor positions to Godot ────────────
     sync_multi_cursors_to_godot(session);
@@ -187,9 +182,7 @@ pub(super) fn process_cycle_impl(
         engine_process_us: perf::Microseconds(0),
         effects_dispatch_us: perf::Microseconds(0),
         ui_update_us: perf::Microseconds(0),
-        total_us: perf::Microseconds(
-            u64::try_from(total_elapsed.as_micros()).unwrap_or(u64::MAX),
-        ),
+        total_us: perf::Microseconds(u64::try_from(total_elapsed.as_micros()).unwrap_or(u64::MAX)),
     });
 
     // ── Per-keystroke DEBUG summary ──────────────────────────────────
@@ -336,8 +329,7 @@ pub(super) fn resolve_mapping_timeout_impl(
     // drain_and_process_one calls build_context -> process -> deliver_effects
     // for each pending key, so effects are applied by GodotHost.
     while session.drain_and_process_one() {
-        ctx.transient.operations_this_cycle =
-            ctx.transient.operations_this_cycle.saturating_add(1);
+        ctx.transient.operations_this_cycle = ctx.transient.operations_this_cycle.saturating_add(1);
     }
 
     // Gaps 1 & 5: Sync multi-cursor positions after drain.
@@ -395,13 +387,7 @@ fn process_step_key(
                 if let Some(ref effects) = ctx.transient.pending_step_effects {
                     if idx < effects.len() {
                         let effect = effects[idx].clone();
-                        apply_step_effect_to_host(
-                            session,
-                            effect,
-                            editor,
-                            editor_id,
-                            scrolloff,
-                        );
+                        apply_step_effect_to_host(session, effect, editor, editor_id, scrolloff);
                     }
                 }
             }
@@ -420,21 +406,14 @@ fn process_step_key(
                 .pending_step_effects
                 .take()
                 .unwrap_or_default();
-            let remaining_set: std::collections::HashSet<usize> =
-                remaining.into_iter().collect();
+            let remaining_set: std::collections::HashSet<usize> = remaining.into_iter().collect();
             let to_apply: Vec<vim_core::effects::Effect> = all_effects
                 .drain(..)
                 .enumerate()
                 .filter_map(|(i, e)| remaining_set.contains(&i).then_some(e))
                 .collect();
             for effect in to_apply {
-                apply_step_effect_to_host(
-                    session,
-                    effect,
-                    editor,
-                    editor_id,
-                    scrolloff,
-                );
+                apply_step_effect_to_host(session, effect, editor, editor_id, scrolloff);
             }
             ctx.transient.vimdebug.step_quit();
         }
@@ -828,31 +807,25 @@ pub(crate) fn sync_multi_cursors_to_godot(
                         .map(|r| {
                             let anchor_offset = r.anchor().get();
                             let head_offset = r.head().get();
-                            let anchor_lc =
-                                line_index.byte_to_line_col(text, anchor_offset);
+                            let anchor_lc = line_index.byte_to_line_col(text, anchor_offset);
                             let head_lc = line_index.byte_to_line_col(text, head_offset);
-                            let (al, ac) =
-                                (anchor_lc.line as usize, anchor_lc.col as usize);
-                            let (hl, hc) =
-                                (head_lc.line as usize, head_lc.col as usize);
+                            let (al, ac) = (anchor_lc.line as usize, anchor_lc.col as usize);
+                            let (hl, hc) = (head_lc.line as usize, head_lc.col as usize);
 
                             match vt {
                                 VisualType::Char => {
                                     if head_offset >= anchor_offset {
-                                        let line_len =
-                                            line_index.line_char_count(text, hl);
+                                        let line_len = line_index.line_char_count(text, hl);
                                         (al, ac, hl, (hc + 1).min(line_len))
                                     } else {
-                                        let line_len =
-                                            line_index.line_char_count(text, al);
+                                        let line_len = line_index.line_char_count(text, al);
                                         (al, (ac + 1).min(line_len), hl, hc)
                                     }
                                 }
                                 VisualType::Line => {
                                     let top = al.min(hl);
                                     let bot = al.max(hl);
-                                    let bot_len =
-                                        line_index.line_char_count(text, bot);
+                                    let bot_len = line_index.line_char_count(text, bot);
                                     if hl >= al {
                                         (top, 0, bot, bot_len)
                                     } else {
@@ -862,8 +835,7 @@ pub(crate) fn sync_multi_cursors_to_godot(
                                 VisualType::Block => {
                                     let min_col = ac.min(hc);
                                     let max_col = ac.max(hc);
-                                    let line_len =
-                                        line_index.line_char_count(text, hl);
+                                    let line_len = line_index.line_char_count(text, hl);
                                     if hc <= ac {
                                         (hl, (max_col + 1).min(line_len), hl, min_col)
                                     } else {
@@ -872,12 +844,10 @@ pub(crate) fn sync_multi_cursors_to_godot(
                                 }
                                 _ => {
                                     if head_offset >= anchor_offset {
-                                        let line_len =
-                                            line_index.line_char_count(text, hl);
+                                        let line_len = line_index.line_char_count(text, hl);
                                         (al, ac, hl, (hc + 1).min(line_len))
                                     } else {
-                                        let line_len =
-                                            line_index.line_char_count(text, al);
+                                        let line_len = line_index.line_char_count(text, al);
                                         (al, (ac + 1).min(line_len), hl, hc)
                                     }
                                 }
@@ -908,10 +878,7 @@ pub(crate) fn sync_multi_cursors_to_godot(
 
     if !positions.is_empty() {
         let primary_line = positions[0].0 as i32;
-        port.set_caret_line_unfold(
-            primary_line,
-            crate::bridge::port::ViewportAdjust::Adjust,
-        );
+        port.set_caret_line_unfold(primary_line, crate::bridge::port::ViewportAdjust::Adjust);
         port.adjust_viewport_to_caret();
         crate::effects::cursor::enforce_scrolloff(&mut port, primary_line, scrolloff);
     }
@@ -980,7 +947,10 @@ mod visual_type_coverage_tests {
     #[test]
     fn visual_type_dispatch_covers_all_variants() {
         let handled: HashSet<_> = HANDLED_VISUAL_TYPES.iter().copied().collect();
-        let all: HashSet<_> = vim_core::primitives::VisualType::ALL.iter().copied().collect();
+        let all: HashSet<_> = vim_core::primitives::VisualType::ALL
+            .iter()
+            .copied()
+            .collect();
         let missing: Vec<_> = all.difference(&handled).collect();
         assert!(
             missing.is_empty(),
@@ -1003,9 +973,8 @@ mod visual_type_coverage_tests {
 }
 
 #[cfg(test)]
-const HANDLED_DEFERRED_ACTIONS: &[vim_core::execution::host_api::DeferredActionKind] = &[
-    vim_core::execution::host_api::DeferredActionKind::WindowNav,
-];
+const HANDLED_DEFERRED_ACTIONS: &[vim_core::execution::host_api::DeferredActionKind] =
+    &[vim_core::execution::host_api::DeferredActionKind::WindowNav];
 
 #[cfg(test)]
 mod deferred_action_coverage_tests {

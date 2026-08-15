@@ -47,7 +47,8 @@ pub(crate) fn install_panic_hook() {
             if godot::sys::is_initialized()
                 && GUARD_DEPTH.with(|d| d.get()) > 0
                 && DEDUP_HOOK.with(|d| {
-                    d.borrow_mut().should_report(&format!("{location}:{msg}"), now_ms())
+                    d.borrow_mut()
+                        .should_report(&format!("{location}:{msg}"), now_ms())
                 })
             {
                 godot_error!("GodotVim panic{location}: {msg}");
@@ -68,7 +69,10 @@ struct DedupState {
 const DEDUP_WINDOW_MS: u64 = 1_000;
 impl DedupState {
     fn new() -> Self {
-        Self { last_sig: None, last_ms: 0 }
+        Self {
+            last_sig: None,
+            last_ms: 0,
+        }
     }
     fn should_report(&mut self, sig: &str, now_ms: u64) -> bool {
         let dup = self.last_sig.as_deref() == Some(sig)
@@ -133,10 +137,10 @@ mod tests {
     #[test]
     fn dedup_suppresses_identical_within_window() {
         let mut state = DedupState::new();
-        assert!(state.should_report("sig-A", 0));          // first: report
-        assert!(!state.should_report("sig-A", 100));       // dup within window: suppress
-        assert!(state.should_report("sig-B", 150));        // different sig: report
-        assert!(state.should_report("sig-A", 10_000));     // window elapsed: report again
+        assert!(state.should_report("sig-A", 0)); // first: report
+        assert!(!state.should_report("sig-A", 100)); // dup within window: suppress
+        assert!(state.should_report("sig-B", 150)); // different sig: report
+        assert!(state.should_report("sig-A", 10_000)); // window elapsed: report again
     }
 
     // Models the REAL wiring: hook and guard are SEPARATE DedupState streams that

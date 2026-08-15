@@ -43,7 +43,11 @@ pub(crate) fn handle_set_cursor(
 ///
 /// Only scrolls the minimum amount needed — if the cursor is already within
 /// the margin, the viewport stays put.
-pub(crate) fn enforce_scrolloff(editor: &mut impl TextEditorPort, cursor_line: i32, scrolloff: i32) {
+pub(crate) fn enforce_scrolloff(
+    editor: &mut impl TextEditorPort,
+    cursor_line: i32,
+    scrolloff: i32,
+) {
     if scrolloff <= 0 {
         return;
     }

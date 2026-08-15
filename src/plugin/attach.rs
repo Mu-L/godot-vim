@@ -235,8 +235,7 @@ impl GodotVimCore {
                     safe_disconnect(&mut editor, signal_name, &draw_callable);
                 }
 
-                let tree_exited_callable =
-                    self.base().callable("on_attached_editor_tree_exited");
+                let tree_exited_callable = self.base().callable("on_attached_editor_tree_exited");
                 safe_disconnect(&mut editor, SIG_TREE_EXITED, &tree_exited_callable);
 
                 // ── Teardown operations (signal-safe: no callbacks can enqueue) ─

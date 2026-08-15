@@ -246,9 +246,7 @@ pub(crate) fn sync_selections_to_editor(
 
     let caret_count = editor.get_caret_count() as usize;
 
-    for (caret_idx, &(from_line, from_col, to_line, to_col)) in
-        selections.iter().enumerate()
-    {
+    for (caret_idx, &(from_line, from_col, to_line, to_col)) in selections.iter().enumerate() {
         if caret_idx >= caret_count {
             break;
         }

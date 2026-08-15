@@ -195,9 +195,13 @@ impl UiCoordinator {
         let mut cursor = VimCursor::new_alloc();
         editor.add_child(&cursor.clone().upcast::<Node>());
         // Snap immediately -- without this the cursor lerps from (0,0).
+        // This geometry is computed with no visual override (no snapshot exists
+        // yet), a different provenance from the keystroke and scroll sites.
+        // That is safe only because `positioned` is still false here, which
+        // forces set_target's animate branch regardless of `logical`.
         if let Some(geom) = compute_cursor_geometry(&mut self.shaped_cache, editor, None) {
             let mut vim_cursor = cursor.bind_mut();
-            vim_cursor.set_target(geom.pos, geom.height, geom.width);
+            vim_cursor.set_target(&geom);
             vim_cursor.force_snap();
         }
         self.cursor = Some(cursor);
@@ -366,7 +370,7 @@ impl UiCoordinator {
             // visual_head: in visual mode, Godot's caret is at the exclusive
             // selection end, but Vim's cursor should render at the head.
             if let Some(geom) = cursor_geom {
-                vim_cursor.set_target(geom.pos, geom.height, geom.width);
+                vim_cursor.set_target(&geom);
                 drop(vim_cursor);
                 cursor.set_visible(self.cursor_enabled);
             } else {
@@ -447,9 +451,13 @@ impl UiCoordinator {
         if let Some(ref yank) = snap.highlight_yank {
             if yank.duration_ms > 0 {
                 with_valid_overlay!(self.highlight_yank, |overlay| {
-                    overlay
-                        .bind_mut()
-                        .show_yank(yank.start, yank.end, yank.duration_ms, yank.shape, editor);
+                    overlay.bind_mut().show_yank(
+                        yank.start,
+                        yank.end,
+                        yank.duration_ms,
+                        yank.shape,
+                        editor,
+                    );
                 });
             }
         }
@@ -491,12 +499,14 @@ impl UiCoordinator {
     pub(crate) fn update_cursor_position(&mut self, editor: &Gd<CodeEdit>) {
         // Bind geometry before the overlay borrow so the borrow checker can
         // see self.shaped_cache and self.cursor as separate field borrows.
-        let geom = compute_cursor_geometry(&mut self.shaped_cache, editor, self.cache.cached_visual_head);
+        let geom = compute_cursor_geometry(
+            &mut self.shaped_cache,
+            editor,
+            self.cache.cached_visual_head,
+        );
         if let Some(cursor) = valid_mut(&mut self.cursor) {
             if let Some(geom) = geom {
-                cursor
-                    .bind_mut()
-                    .set_target(geom.pos, geom.height, geom.width);
+                cursor.bind_mut().set_target(&geom);
                 cursor.set_visible(self.cursor_enabled);
             } else {
                 cursor.set_visible(false);

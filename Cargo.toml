@@ -1,6 +1,6 @@
 [package]
 name = "godot-vim"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 description = "Vim emulation plugin for the Godot game engine"
 license = "MIT"
@@ -20,7 +20,11 @@ vim-core = { git = "https://github.com/hmdfrds/vim-core.git", tag = "v0.7.1" }
 bitflags = "2"
 unicode-segmentation = "1.10"
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_trace"] }
-compact_str = "0.8"
+# Must match the compact_str that vim-core exports in its public API (0.7).
+# vim-text internally uses 0.8, so cargo tree shows both; that one never
+# crosses the boundary. Bumping this to 0.8 makes every CompactString in
+# vim-core's API a type mismatch (28 errors). Dependabot: leave this alone.
+compact_str = "0.7"
 
 [dev-dependencies]
 proptest = "1.4"

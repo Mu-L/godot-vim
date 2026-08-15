@@ -74,13 +74,14 @@ pub(crate) fn register_all(settings: &mut EditorSettings) {
 
     // ── Cursor behavior ─────────────────────────────────────────────────────
     register_bool(settings, keys::CURSOR_ENABLED, defaults::CURSOR_ENABLED);
-    register_float_range(
+    register_float_range_hinted(
         settings,
         keys::CURSOR_LERP_SPEED,
         defaults::CURSOR_LERP_SPEED,
-        1.0,
-        100.0,
+        defaults::CURSOR_LERP_SPEED_MIN,
+        defaults::CURSOR_LERP_SPEED_MAX,
         0.1,
+        ",or_greater,exp",
     );
     register_float_range(
         settings,
@@ -208,11 +209,28 @@ fn register_float_range(
     max: f64,
     step: f64,
 ) {
+    register_float_range_hinted(settings, key, default, min, max, step, "");
+}
+
+/// `flags` appends Godot RANGE modifiers, e.g. `",or_greater,exp"`.
+///
+/// `exp` requires `min > 0`: the slider's exp_ratio mapping is uniform in
+/// log2(value), and a min of 0 collapses the whole lower half of the bar onto
+/// one value.
+fn register_float_range_hinted(
+    settings: &mut EditorSettings,
+    key: &str,
+    default: f64,
+    min: f64,
+    max: f64,
+    step: f64,
+    flags: &str,
+) {
     if !settings.has_setting(key) {
         settings.set_setting(key, &default.to_variant());
     }
     settings.set_initial_value(key, &default.to_variant(), false);
-    let hint_string = format!("{min},{max},{step}");
+    let hint_string = format!("{min},{max},{step}{flags}");
     add_property_info(
         settings,
         key,
