@@ -707,8 +707,11 @@ impl GodotVimCore {
             controller.ui_snapshot(ed.instance_id())
         };
 
-        let applied = EngineOutcome::with_snapshot(snap, outcome)
-            .apply_ui_update(&mut self.ui, &mut ed, &mut self.caret_reconciler);
+        let applied = EngineOutcome::with_snapshot(snap, outcome).apply_ui_update(
+            &mut self.ui,
+            &mut ed,
+            &mut self.caret_reconciler,
+        );
 
         log::trace!(
             "gui_input: key={} outcome={}",
@@ -784,8 +787,11 @@ impl GodotVimCore {
             } else {
                 crate::controller::PipelineOutcome::Passthrough
             };
-            EngineOutcome::with_snapshot(snap, pipeline)
-                .apply_ui_update(&mut self.ui, &mut ed, &mut self.caret_reconciler);
+            EngineOutcome::with_snapshot(snap, pipeline).apply_ui_update(
+                &mut self.ui,
+                &mut ed,
+                &mut self.caret_reconciler,
+            );
         }
 
         if let Some(controller) = &mut self.controller {

@@ -447,9 +447,13 @@ impl UiCoordinator {
         if let Some(ref yank) = snap.highlight_yank {
             if yank.duration_ms > 0 {
                 with_valid_overlay!(self.highlight_yank, |overlay| {
-                    overlay
-                        .bind_mut()
-                        .show_yank(yank.start, yank.end, yank.duration_ms, yank.shape, editor);
+                    overlay.bind_mut().show_yank(
+                        yank.start,
+                        yank.end,
+                        yank.duration_ms,
+                        yank.shape,
+                        editor,
+                    );
                 });
             }
         }
@@ -491,7 +495,11 @@ impl UiCoordinator {
     pub(crate) fn update_cursor_position(&mut self, editor: &Gd<CodeEdit>) {
         // Bind geometry before the overlay borrow so the borrow checker can
         // see self.shaped_cache and self.cursor as separate field borrows.
-        let geom = compute_cursor_geometry(&mut self.shaped_cache, editor, self.cache.cached_visual_head);
+        let geom = compute_cursor_geometry(
+            &mut self.shaped_cache,
+            editor,
+            self.cache.cached_visual_head,
+        );
         if let Some(cursor) = valid_mut(&mut self.cursor) {
             if let Some(geom) = geom {
                 cursor

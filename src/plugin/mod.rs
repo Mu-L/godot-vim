@@ -803,7 +803,9 @@ impl GodotVimCore {
                 }
                 let controller = self.controller.as_mut().unwrap();
                 if controller.reconcile_text_set(editor) {
-                    log::info!("on_text_set: buffer replaced externally, undo cleared, marks remapped");
+                    log::info!(
+                        "on_text_set: buffer replaced externally, undo cleared, marks remapped"
+                    );
                 }
                 true
             },
@@ -838,10 +840,8 @@ impl GodotVimCore {
                 let controller = self.controller.as_mut().unwrap();
                 if controller.reconcile_external_edit(editor) {
                     log::debug!("on_text_changed: reconciled external text change");
-                    self.caret_reconciler.expect_vim_move(
-                        editor.get_caret_line(),
-                        editor.get_caret_column(),
-                    );
+                    self.caret_reconciler
+                        .expect_vim_move(editor.get_caret_line(), editor.get_caret_column());
                 }
                 true
             },
@@ -1009,9 +1009,19 @@ impl GodotVimCore {
     fn apply_enabled_state(&mut self) {
         if self.enabled {
             let was_inert = !self.wired;
-            panic_guard("enable:input", || { self.base_mut().set_process_input(true); }, ());
+            panic_guard(
+                "enable:input",
+                || {
+                    self.base_mut().set_process_input(true);
+                },
+                (),
+            );
             panic_guard("enable:signals", || self.connect_editor_signals(), ());
-            panic_guard("enable:floating", || self.init_floating_window_tracking(), ());
+            panic_guard(
+                "enable:floating",
+                || self.init_floating_window_tracking(),
+                (),
+            );
             self.wired = true;
             if was_inert {
                 // disabled→enabled edge: single startup-equivalent config load + re-discovery
@@ -1023,7 +1033,8 @@ impl GodotVimCore {
                 self.source_config_from_disk("enable");
                 self.last_editor_id = None;
                 self.base_mut().call_deferred("rediscover_and_attach", &[]);
-                self.base_mut().call_deferred("on_floating_window_focused", &[]);
+                self.base_mut()
+                    .call_deferred("on_floating_window_focused", &[]);
             }
         } else {
             panic_guard("disable:detach", || self.detach(), ());
@@ -1033,17 +1044,31 @@ impl GodotVimCore {
             // unattributable regression.
             panic_guard("disable:sequence", || self.clear_pending_sequence(), ());
             panic_guard("disable:signals", || self.disconnect_editor_signals(), ());
-            panic_guard("disable:floating", || self.teardown_floating_window_tracking(), ());
+            panic_guard(
+                "disable:floating",
+                || self.teardown_floating_window_tracking(),
+                (),
+            );
             panic_guard("disable:fs", || self.fs_explorer.cleanup(), ());
-            panic_guard("disable:dialog", || {
-                if let Some(mut d) = self.mapping_dialog.take() {
-                    if d.is_instance_valid() {
-                        d.queue_free();
+            panic_guard(
+                "disable:dialog",
+                || {
+                    if let Some(mut d) = self.mapping_dialog.take() {
+                        if d.is_instance_valid() {
+                            d.queue_free();
+                        }
                     }
-                }
-            }, ());
+                },
+                (),
+            );
             self.last_editor_id = None;
-            panic_guard("disable:input", || { self.base_mut().set_process_input(false); }, ());
+            panic_guard(
+                "disable:input",
+                || {
+                    self.base_mut().set_process_input(false);
+                },
+                (),
+            );
             self.wired = false; // unconditional: safe because there is no latch to trap on
         }
     }

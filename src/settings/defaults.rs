@@ -70,6 +70,14 @@ pub(crate) fn cursor_command() -> Color {
 
 pub(crate) const CURSOR_ENABLED: bool = true;
 pub(crate) const CURSOR_LERP_SPEED: f64 = 25.0;
+/// Slider floor, and the reader's lower bound: `1 - exp(-k*dt)` needs k > 0.
+/// k == 0 freezes the overlay short of the 0.5px snap gate forever; k < 0
+/// diverges.
+pub(crate) const CURSOR_LERP_SPEED_MIN: f64 = 1.0;
+/// Slider ceiling. ln(2*2000)/500 = 16.6 ms to close the largest jump that
+/// can occur inside a viewport, one 60 Hz frame. `or_greater` keeps larger
+/// values typable; they are not perceptibly different.
+pub(crate) const CURSOR_LERP_SPEED_MAX: f64 = 500.0;
 pub(crate) const CURSOR_UNDERLINE_HEIGHT: f64 = 4.0;
 
 // ─────────────────────────────────────────────────────────────────────────────

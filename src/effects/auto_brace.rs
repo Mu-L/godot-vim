@@ -51,9 +51,7 @@ pub(crate) fn compute_auto_brace_insert(
     let mut char_buf = [0u8; 4];
     let ch_str = ch.encode_utf8(&mut char_buf);
 
-    let line_text = doc
-        .line_index
-        .line_text_at(doc.text, i32_to_usize(line));
+    let line_text = doc.line_index.line_text_at(doc.text, i32_to_usize(line));
     let char_col = i32_to_usize(lc.col);
     let line_char_len = line_text.chars().count();
 

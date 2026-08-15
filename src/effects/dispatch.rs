@@ -424,12 +424,10 @@ pub(crate) fn dispatch(
                         let byte_offset = offset.get();
                         text.to_mut().insert_str(byte_offset, &content);
                         line_index.apply_insert(byte_offset, &content);
-                        commit_strategy = commit_strategy.add_mutation(
-                            CommitStrategy::Insert {
-                                offset: byte_offset,
-                                content: content.to_string(),
-                            },
-                        );
+                        commit_strategy = commit_strategy.add_mutation(CommitStrategy::Insert {
+                            offset: byte_offset,
+                            content: content.to_string(),
+                        });
                         text_mutated = true;
                         continue;
                     };
@@ -447,12 +445,11 @@ pub(crate) fn dispatch(
                             let byte_offset = offset.get();
                             text.to_mut().insert_str(byte_offset, &content);
                             line_index.apply_insert(byte_offset, &content);
-                            commit_strategy = commit_strategy.add_mutation(
-                                CommitStrategy::Insert {
+                            commit_strategy =
+                                commit_strategy.add_mutation(CommitStrategy::Insert {
                                     offset: byte_offset,
                                     content: content.to_string(),
-                                },
-                            );
+                                });
                             text_mutated = true;
                         }
                         auto_brace::AutoBraceAction::InsertWithClose { close } => {
@@ -501,8 +498,12 @@ pub(crate) fn dispatch(
                 let end = range.end().get();
                 let has_auto_brace = auto_brace_eligible && auto_brace_snapshot.enabled;
                 if has_auto_brace {
-                    let extra =
-                        auto_brace::compute_auto_brace_delete_extra(&doc, start, end, &auto_brace_snapshot);
+                    let extra = auto_brace::compute_auto_brace_delete_extra(
+                        &doc,
+                        start,
+                        end,
+                        &auto_brace_snapshot,
+                    );
                     if extra > 0 {
                         // Delete the open brace range AND the adjacent close brace.
                         let extended_end = end + extra;
@@ -512,10 +513,8 @@ pub(crate) fn dispatch(
                     } else {
                         text.to_mut().drain(start..end);
                         line_index.apply_delete(start, end);
-                        commit_strategy = commit_strategy.add_mutation(CommitStrategy::Delete {
-                            start,
-                            end,
-                        });
+                        commit_strategy =
+                            commit_strategy.add_mutation(CommitStrategy::Delete { start, end });
                     }
                 } else {
                     text.to_mut().drain(start..end);
@@ -835,14 +834,7 @@ pub(crate) fn dispatch(
                 }
             }
             other => {
-                dispatch_pass2_effect(
-                    other,
-                    editor,
-                    state,
-                    &env,
-                    &mut compound_actions,
-                    clipboard,
-                );
+                dispatch_pass2_effect(other, editor, state, &env, &mut compound_actions, clipboard);
             }
         }
     }
@@ -996,7 +988,10 @@ pub(crate) fn dispatch_pass2_effect(
         }
 
         // ── Message ─────────────────────────────────────────────────────
-        Effect::ShowInfo { .. } | Effect::ShowError { .. } | Effect::ShowWarning { .. } | Effect::ClearMessage => {
+        Effect::ShowInfo { .. }
+        | Effect::ShowError { .. }
+        | Effect::ShowWarning { .. }
+        | Effect::ClearMessage => {
             dispatch_message_effect(effect, state);
         }
 
@@ -1039,12 +1034,23 @@ pub(crate) fn dispatch_pass2_effect(
 
         // ── Engine-internal: state updated by effect_processor, no shell work ──
         // ── Highlight ranges (yank flash) ──────────────────────────────────
-        Effect::SetHighlightRange { ref owner, ref range, shape, .. } => {
+        Effect::SetHighlightRange {
+            ref owner,
+            ref range,
+            shape,
+            ..
+        } => {
             if owner.as_str() == vim_core::effects::HIGHLIGHT_OWNER_YANK
                 && env.highlight_yank_duration_ms > 0
             {
-                let start = env.doc.line_index.byte_to_line_col(env.doc.text, range.start().get());
-                let end = env.doc.line_index.byte_to_line_col(env.doc.text, range.end().get());
+                let start = env
+                    .doc
+                    .line_index
+                    .byte_to_line_col(env.doc.text, range.start().get());
+                let end = env
+                    .doc
+                    .line_index
+                    .byte_to_line_col(env.doc.text, range.end().get());
                 state.set_highlight_yank(crate::types::HighlightYank::new(
                     start,
                     end,

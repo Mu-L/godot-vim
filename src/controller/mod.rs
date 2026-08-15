@@ -91,8 +91,13 @@ impl TransientShellState {
 
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ControllerPhase {
-    Attached { session: VimSession<GodotHost> },
-    Detached { engine: VimEngine, state: ShellState },
+    Attached {
+        session: VimSession<GodotHost>,
+    },
+    Detached {
+        engine: VimEngine,
+        state: ShellState,
+    },
 }
 
 pub(crate) struct ControllerContext {
@@ -313,56 +318,81 @@ impl VimController {
         let cursor_count = self.cursor_count();
 
         // Now borrow host state mutably for shell-state fields.
-        let (message, hlsearch_enabled, cursor_style, visual_head, block_visual, substitute_preview, highlight_yank) =
-            if let ControllerPhase::Attached { ref mut session } = self.phase {
-                let state = session.host_mut().state_mut();
-                let message = state.globals().message_status().clone();
-                let hlsearch_enabled = state.globals().hlsearch_enabled();
-                let cursor_style = state.cursor_style();
-                let visual_head = state
-                    .buffer_ref(editor_id)
-                    .and_then(|b| b.visual().map(|v| v.head_pos));
-                let block_visual = if matches!(
-                    mode,
-                    vim_core::primitives::Mode::Visual(vim_core::primitives::VisualType::Block)
-                ) {
-                    state.buffer_ref(editor_id).and_then(|b| {
-                        b.visual().map(|v| crate::types::BlockVisualGeometry {
-                            anchor_line: v.anchor_pos.line,
-                            anchor_col: v.anchor_pos.col,
-                            head_line: v.head_pos.line,
-                            head_col: v.head_pos.col,
-                        })
+        let (
+            message,
+            hlsearch_enabled,
+            cursor_style,
+            visual_head,
+            block_visual,
+            substitute_preview,
+            highlight_yank,
+        ) = if let ControllerPhase::Attached { ref mut session } = self.phase {
+            let state = session.host_mut().state_mut();
+            let message = state.globals().message_status().clone();
+            let hlsearch_enabled = state.globals().hlsearch_enabled();
+            let cursor_style = state.cursor_style();
+            let visual_head = state
+                .buffer_ref(editor_id)
+                .and_then(|b| b.visual().map(|v| v.head_pos));
+            let block_visual = if matches!(
+                mode,
+                vim_core::primitives::Mode::Visual(vim_core::primitives::VisualType::Block)
+            ) {
+                state.buffer_ref(editor_id).and_then(|b| {
+                    b.visual().map(|v| crate::types::BlockVisualGeometry {
+                        anchor_line: v.anchor_pos.line,
+                        anchor_col: v.anchor_pos.col,
+                        head_line: v.head_pos.line,
+                        head_col: v.head_pos.col,
                     })
-                } else {
-                    None
-                };
-                let substitute_preview = state.take_substitute_preview();
-                let highlight_yank = state.take_highlight_yank();
-                (message, hlsearch_enabled, cursor_style, visual_head, block_visual, substitute_preview, highlight_yank)
+                })
             } else {
-                use crate::types::StatusMessage;
-                use vim_core::primitives::CursorStyle;
-                (StatusMessage::default(), false, CursorStyle::for_mode(mode), None, None, None, None)
+                None
             };
+            let substitute_preview = state.take_substitute_preview();
+            let highlight_yank = state.take_highlight_yank();
+            (
+                message,
+                hlsearch_enabled,
+                cursor_style,
+                visual_head,
+                block_visual,
+                substitute_preview,
+                highlight_yank,
+            )
+        } else {
+            use crate::types::StatusMessage;
+            use vim_core::primitives::CursorStyle;
+            (
+                StatusMessage::default(),
+                false,
+                CursorStyle::for_mode(mode),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
 
         let vimdebug = match (
             self.ctx.transient.vimdebug.provenance().cloned(),
             self.ctx.transient.vimdebug.effects_summary().cloned(),
         ) {
-            (Some(provenance), Some(effects)) => match self.ctx.transient.vimdebug.step_status_line() {
-                Some(step_status) => crate::types::VimdebugSnapshot::Step {
-                    provenance,
-                    effects,
-                    range: self.ctx.transient.vimdebug.range(),
-                    step_status,
-                },
-                None => crate::types::VimdebugSnapshot::Watch {
-                    provenance,
-                    effects,
-                    range: self.ctx.transient.vimdebug.range(),
-                },
-            },
+            (Some(provenance), Some(effects)) => {
+                match self.ctx.transient.vimdebug.step_status_line() {
+                    Some(step_status) => crate::types::VimdebugSnapshot::Step {
+                        provenance,
+                        effects,
+                        range: self.ctx.transient.vimdebug.range(),
+                        step_status,
+                    },
+                    None => crate::types::VimdebugSnapshot::Watch {
+                        provenance,
+                        effects,
+                        range: self.ctx.transient.vimdebug.range(),
+                    },
+                }
+            }
             _ => crate::types::VimdebugSnapshot::Inactive,
         };
 
@@ -731,29 +761,21 @@ impl VimController {
                 vim_core::effects::Effect::ShowInfo { info } => {
                     let msg = format!("{}", info);
                     if let Some(state) = self.host_state_mut() {
-                        crate::effects::messages::handle_show_message(
-                            state.globals_mut(),
-                            &msg,
-                        );
+                        crate::effects::messages::handle_show_message(state.globals_mut(), &msg);
                     } else {
                         log::info!("reload_config (detached): {}", msg);
                     }
                 }
                 vim_core::effects::Effect::ShowError { error, .. } => {
                     if let Some(state) = self.host_state_mut() {
-                        crate::effects::messages::handle_show_error(
-                            state.globals_mut(),
-                            &error,
-                        );
+                        crate::effects::messages::handle_show_error(state.globals_mut(), &error);
                     } else {
                         log::warn!("reload_config (detached): {}", error);
                     }
                 }
                 vim_core::effects::Effect::ClearHighlights => {
                     if let Some(state) = self.host_state_mut() {
-                        crate::effects::search::handle_clear_highlights(
-                            state.globals_mut(),
-                        );
+                        crate::effects::search::handle_clear_highlights(state.globals_mut());
                     }
                 }
                 other => {
@@ -921,11 +943,7 @@ impl VimController {
 
             // Clamp column to the length of the new line.
             let new_line_len = {
-                let line_byte_start = new_index.line_col_to_byte(
-                    &new_text,
-                    clamped_line_i32,
-                    0,
-                );
+                let line_byte_start = new_index.line_col_to_byte(&new_text, clamped_line_i32, 0);
                 // Find end of line (next newline or end of text).
                 let rest = &new_text[line_byte_start..];
                 let line_byte_len = rest.find('\n').unwrap_or(rest.len());
@@ -1161,7 +1179,6 @@ impl VimController {
 
         result.consumed
     }
-
 }
 
 #[cfg(test)]
@@ -1185,8 +1202,8 @@ mod tests {
         #[allow(unused, unreachable_code)]
         fn check(c: VimController) {
             let VimController {
-                phase,  // engine+host lifecycle (see phase inventory below)
-                ctx,    // config + transient (see ctx inventory below)
+                phase, // engine+host lifecycle (see phase inventory below)
+                ctx,   // config + transient (see ctx inventory below)
             } = c;
 
             match phase {

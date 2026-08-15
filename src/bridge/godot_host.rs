@@ -287,7 +287,6 @@ impl VimHost for GodotHost {
             editor.get_caret_line(),
             editor.get_caret_column(),
         );
-
     }
 
     fn record_internal_undo_node(
@@ -591,9 +590,9 @@ impl GodotHost {
                 .buffer(editor_id)
                 .undo_store_mut()
                 .take_pending_text();
-            self.state.globals_mut().set_error(
-                "Internal: orphaned undo group recovered -- undo may be inconsistent",
-            );
+            self.state
+                .globals_mut()
+                .set_error("Internal: orphaned undo group recovered -- undo may be inconsistent");
         }
     }
 
@@ -671,8 +670,16 @@ impl GodotHost {
     /// that constructs a `CodeEditPort` (which carries `&mut Vec<PendingUiAction>`).
     pub(crate) fn editor_and_state_mut(
         &mut self,
-    ) -> (&mut Gd<CodeEdit>, &mut ShellState, &mut Vec<PendingUiAction>) {
-        (&mut self.editor, &mut self.state, &mut self.pending_ui_actions)
+    ) -> (
+        &mut Gd<CodeEdit>,
+        &mut ShellState,
+        &mut Vec<PendingUiAction>,
+    ) {
+        (
+            &mut self.editor,
+            &mut self.state,
+            &mut self.pending_ui_actions,
+        )
     }
 }
 
@@ -761,7 +768,10 @@ mod mode_coverage_tests {
     #[test]
     fn mode_dispatch_covers_all_variants() {
         let handled: HashSet<_> = HANDLED_MODES.iter().copied().collect();
-        let all: HashSet<_> = vim_core::primitives::ModeKind::ALL.iter().copied().collect();
+        let all: HashSet<_> = vim_core::primitives::ModeKind::ALL
+            .iter()
+            .copied()
+            .collect();
         let missing: Vec<_> = all.difference(&handled).collect();
         assert!(
             missing.is_empty(),

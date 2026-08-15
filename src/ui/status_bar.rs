@@ -236,7 +236,12 @@ impl VimStatusBar {
             write!(self.display_buffer, "recording @{reg} {mode_display}").ok();
             self.theme.text_fg
         } else if !snap.pending_command.is_empty() {
-            write!(self.display_buffer, "{mode_display}  {}", snap.pending_command).ok();
+            write!(
+                self.display_buffer,
+                "{mode_display}  {}",
+                snap.pending_command
+            )
+            .ok();
             self.theme.text_fg
         } else if !snap.pending_keys.is_empty() {
             write!(self.display_buffer, "{mode_display}  {}", snap.pending_keys).ok();

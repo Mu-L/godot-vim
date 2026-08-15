@@ -110,8 +110,13 @@ impl DebugRangeOverlay {
     ) {
         self.highlights.clear();
 
-        let rects =
-            super::geometry::compute_highlight_rects(editor, &start, &end, MAX_HIGHLIGHT_RECTS, vim_core::primitives::SelectionShape::Char);
+        let rects = super::geometry::compute_highlight_rects(
+            editor,
+            &start,
+            &end,
+            MAX_HIGHLIGHT_RECTS,
+            vim_core::primitives::SelectionShape::Char,
+        );
         self.highlights
             .extend(rects.into_iter().map(|rect| RangeHighlight { rect }));
 

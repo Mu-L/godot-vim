@@ -417,12 +417,13 @@ impl NavigationCapable for CodeEditPort<'_> {
             }
         };
 
-        self.1.push(super::godot_host::PendingUiAction::ShowTooltip {
-            symbol: symbol.to_string(),
-            line,
-            col,
-            warp_pos,
-        });
+        self.1
+            .push(super::godot_host::PendingUiAction::ShowTooltip {
+                symbol: symbol.to_string(),
+                line,
+                col,
+                warp_pos,
+            });
 
         log::debug!(
             "show_documentation_tooltip: stored pending tooltip for '{symbol}' \

@@ -71,20 +71,14 @@ mod tests {
     #[test]
     fn no_expectation_returns_external() {
         let mut r = CaretReconciler::new();
-        assert!(matches!(
-            r.check_and_consume(5, 10),
-            CaretOrigin::External
-        ));
+        assert!(matches!(r.check_and_consume(5, 10), CaretOrigin::External));
     }
 
     #[test]
     fn matching_position_returns_vim_driven() {
         let mut r = CaretReconciler::new();
         r.expect_vim_move(5, 10);
-        assert!(matches!(
-            r.check_and_consume(5, 10),
-            CaretOrigin::VimDriven
-        ));
+        assert!(matches!(r.check_and_consume(5, 10), CaretOrigin::VimDriven));
     }
 
     #[test]
@@ -92,10 +86,7 @@ mod tests {
         let mut r = CaretReconciler::new();
         r.expect_vim_move(5, 10);
         // Different line
-        assert!(matches!(
-            r.check_and_consume(6, 10),
-            CaretOrigin::External
-        ));
+        assert!(matches!(r.check_and_consume(6, 10), CaretOrigin::External));
     }
 
     #[test]
@@ -103,10 +94,7 @@ mod tests {
         let mut r = CaretReconciler::new();
         r.expect_vim_move(5, 10);
         // Same line, different col
-        assert!(matches!(
-            r.check_and_consume(5, 11),
-            CaretOrigin::External
-        ));
+        assert!(matches!(r.check_and_consume(5, 11), CaretOrigin::External));
     }
 
     #[test]
@@ -114,11 +102,8 @@ mod tests {
         let mut r = CaretReconciler::new();
         r.expect_vim_move(1, 0);
         r.expect_vim_move(5, 10); // overwrites
-        // Old position no longer matches
-        assert!(matches!(
-            r.check_and_consume(1, 0),
-            CaretOrigin::External
-        ));
+                                  // Old position no longer matches
+        assert!(matches!(r.check_and_consume(1, 0), CaretOrigin::External));
     }
 
     #[test]
@@ -126,7 +111,7 @@ mod tests {
         let mut r = CaretReconciler::new();
         r.expect_vim_move(1, 0);
         r.expect_vim_move(5, 10); // overwrites
-        // Must re-set since previous check consumed
+                                  // Must re-set since previous check consumed
         let mut r2 = CaretReconciler::new();
         r2.expect_vim_move(5, 10);
         assert!(matches!(
@@ -142,10 +127,7 @@ mod tests {
         // First check consumes regardless of match
         let _ = r.check_and_consume(5, 10);
         // Second check has no expectation -- external
-        assert!(matches!(
-            r.check_and_consume(5, 10),
-            CaretOrigin::External
-        ));
+        assert!(matches!(r.check_and_consume(5, 10), CaretOrigin::External));
     }
 
     #[test]
@@ -155,10 +137,7 @@ mod tests {
         // Mismatch consumes the expectation
         let _ = r.check_and_consume(0, 0);
         // Subsequent check has no expectation
-        assert!(matches!(
-            r.check_and_consume(5, 10),
-            CaretOrigin::External
-        ));
+        assert!(matches!(r.check_and_consume(5, 10), CaretOrigin::External));
     }
 
     #[test]
@@ -166,9 +145,6 @@ mod tests {
         let mut r = CaretReconciler::new();
         r.expect_vim_move(5, 10);
         r.reset();
-        assert!(matches!(
-            r.check_and_consume(5, 10),
-            CaretOrigin::External
-        ));
+        assert!(matches!(r.check_and_consume(5, 10), CaretOrigin::External));
     }
 }

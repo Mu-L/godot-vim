@@ -117,10 +117,7 @@ pub(crate) fn reconcile_external_text_change(
         // Processing effects here would double-apply them.
         let _response = engine.apply_external_edit_with_recording(edit, deleted_text);
     } else {
-        log::debug!(
-            "reconcile: multi-site batch ({} regions)",
-            regions.len(),
-        );
+        log::debug!("reconcile: multi-site batch ({} regions)", regions.len(),);
 
         let edits: Vec<ExternalEdit> = regions
             .iter()
@@ -174,10 +171,7 @@ pub(crate) fn decompose_multi_site_diff<'a>(
     let base_offset = diff.deleted_range.0;
 
     // Step 3: fast path — small diff or one side empty → single region.
-    if old_middle.len() + new_middle.len() < 200
-        || old_middle.is_empty()
-        || new_middle.is_empty()
-    {
+    if old_middle.len() + new_middle.len() < 200 || old_middle.is_empty() || new_middle.is_empty() {
         return vec![EditRegion {
             offset: base_offset,
             old_len: old_middle.len(),

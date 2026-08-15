@@ -361,7 +361,7 @@ All settings are in **Editor > Editor Settings > Plugins > GodotVim**.
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | Enabled | `bool` | `true` | Custom cursor overlay (disable for native caret). **NOT the master toggle — see General → Enabled.** |
-| Lerp Speed | `float` | `25.0` | Smooth movement speed (higher = snappier). |
+| Lerp Speed | `float` | `25.0` | Cursor glide speed, on a log-scaled slider from 1 to 500. Higher is snappier; 500 settles within one 60 Hz frame. Values above 500 can be typed in but are not perceptibly faster. |
 | Underline Height | `float` | `4.0` | Replace-mode underline height in pixels. |
 | Normal Color | `Color` | `#FFFFFF` | Cursor color in Normal mode. |
 | Insert Color | `Color` | `#55FF7F` | Cursor color in Insert mode. |
@@ -369,6 +369,18 @@ All settings are in **Editor > Editor Settings > Plugins > GodotVim**.
 | Replace Color | `Color` | `#FF333399` | Cursor color in Replace mode. |
 | Operator Mode Color | `Color` | `#FFB855` | Cursor color in Operator-pending mode. |
 | Command Mode Color | `Color` | `#FFFFFF` | Cursor color in Command-line mode. |
+
+Glide time to settle, in ms (`ln(2 * distance) / speed`):
+
+| speed | one line (20 px) | half screen (500 px) | full screen (2000 px) |
+|-------|-----|-----|-----|
+| 1 | 3689 | 6908 | 8294 |
+| 25 (default) | 148 | 276 | 332 |
+| 100 | 37 | 69 | 83 |
+| 500 | 7 | 14 | 17 |
+
+The animation is exponential decay, so it is frame-rate independent in wall
+clock: 500 takes the same 17 ms at 60, 144 and 240 Hz.
 
 > **Note:** Line highlighting, cursor blink, and beam width are controlled by Godot's native settings under `text_editor/appearance/caret/`.
 

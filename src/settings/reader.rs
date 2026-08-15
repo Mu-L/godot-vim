@@ -57,11 +57,11 @@ pub(crate) fn read_all(settings: &EditorSettings) -> SettingsSnapshot {
             operator: read_color(settings, keys::CURSOR_OPERATOR, defaults::cursor_operator()),
             command: read_color(settings, keys::CURSOR_COMMAND, defaults::cursor_command()),
             enabled: read_bool(settings, keys::CURSOR_ENABLED, defaults::CURSOR_ENABLED),
-            lerp_speed: read_float(
+            lerp_speed: sanitize_lerp_speed(read_float(
                 settings,
                 keys::CURSOR_LERP_SPEED,
                 defaults::CURSOR_LERP_SPEED,
-            ),
+            )),
             underline_height: read_float(
                 settings,
                 keys::CURSOR_UNDERLINE_HEIGHT,
@@ -147,6 +147,24 @@ fn read_setting<T: FromGodot>(
             default
         }
     }
+}
+
+/// `1 - exp(-k*dt)` needs a finite k >= 1. k == 0 makes the weight 0, so
+/// `current_pos` never advances and `dist.length_squared() > 0.25` stays true
+/// forever: the overlay freezes with blink suppressed. k < 0 makes the weight
+/// negative and the cursor accelerates away from the target. The Inspector
+/// cannot produce either; a hand-edited editor_settings-*.tres can.
+fn sanitize_lerp_speed(v: f64) -> f64 {
+    if v.is_finite() && v >= defaults::CURSOR_LERP_SPEED_MIN {
+        return v;
+    }
+    log::warn!(
+        "Setting '{}' has out-of-range value {}, using default {}",
+        keys::CURSOR_LERP_SPEED,
+        v,
+        defaults::CURSOR_LERP_SPEED,
+    );
+    defaults::CURSOR_LERP_SPEED
 }
 
 fn read_bool(settings: &EditorSettings, key: &str, default: bool) -> bool {
@@ -340,4 +358,40 @@ fn read_project_vimrc(settings: &EditorSettings) -> ProjectVimrc {
             _ => None,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lerp_speed_in_range_passes_through() {
+        assert_eq!(sanitize_lerp_speed(25.0), 25.0);
+        assert_eq!(sanitize_lerp_speed(1.0), 1.0);
+        assert_eq!(sanitize_lerp_speed(500.0), 500.0);
+        // `or_greater` lets a user type past the slider ceiling.
+        assert_eq!(sanitize_lerp_speed(5000.0), 5000.0);
+    }
+
+    #[test]
+    fn lerp_speed_below_floor_falls_back() {
+        // k == 0 would freeze the overlay short of the snap gate forever.
+        assert_eq!(sanitize_lerp_speed(0.0), defaults::CURSOR_LERP_SPEED);
+        assert_eq!(sanitize_lerp_speed(0.5), defaults::CURSOR_LERP_SPEED);
+        // k < 0 makes the lerp weight negative and the cursor diverge.
+        assert_eq!(sanitize_lerp_speed(-5.0), defaults::CURSOR_LERP_SPEED);
+    }
+
+    #[test]
+    fn lerp_speed_non_finite_falls_back() {
+        assert_eq!(sanitize_lerp_speed(f64::NAN), defaults::CURSOR_LERP_SPEED);
+        assert_eq!(
+            sanitize_lerp_speed(f64::INFINITY),
+            defaults::CURSOR_LERP_SPEED
+        );
+        assert_eq!(
+            sanitize_lerp_speed(f64::NEG_INFINITY),
+            defaults::CURSOR_LERP_SPEED
+        );
+    }
 }

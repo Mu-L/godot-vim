@@ -175,15 +175,15 @@ fn compute_override_x_and_width(
         return (draw_pos.x, w);
     }
 
-    let result = ctx.shaped_cache
+    let result = ctx
+        .shaped_cache
         .get_or_shape(editor, ctx.font, ctx.font_size, line)
         .map(|(rid, ts)| {
             let x = if caret_line == line {
                 // Same line: shaped delta from native caret col to target col,
                 // anchored to draw_pos.x which already accounts for gutter/scroll.
                 let target_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
-                let caret_x =
-                    caret_x_from_dict(&ts.shaped_text_get_carets(rid, caret_col as i64));
+                let caret_x = caret_x_from_dict(&ts.shaped_text_get_carets(rid, caret_col as i64));
                 match (target_x, caret_x) {
                     (Some(tx), Some(cx)) => {
                         let result = draw_pos.x + (tx - cx);
@@ -221,8 +221,7 @@ fn compute_override_x_and_width(
 
             // Width: shaped delta between col and col+1.
             let width = if codec::i32_to_usize(col) < line_len {
-                let col_next =
-                    caret_x_from_dict(&ts.shaped_text_get_carets(rid, (col + 1) as i64));
+                let col_next = caret_x_from_dict(&ts.shaped_text_get_carets(rid, (col + 1) as i64));
                 let col_cur = caret_x_from_dict(&ts.shaped_text_get_carets(rid, col as i64));
                 match (col_next, col_cur) {
                     (Some(nx), Some(cx)) => {
@@ -390,7 +389,15 @@ fn compute_char_width_ts(
         return fallback;
     }
 
-    if let Some(delta) = shaped_text_caret_delta(ctx.shaped_cache, ctx.editor, ctx.font, ctx.font_size, line, col + 1, col) {
+    if let Some(delta) = shaped_text_caret_delta(
+        ctx.shaped_cache,
+        ctx.editor,
+        ctx.font,
+        ctx.font_size,
+        line,
+        col + 1,
+        col,
+    ) {
         let w = delta.abs();
         if is_sane_coord(w) && w >= MIN_CURSOR_WIDTH {
             return w;
@@ -891,9 +898,7 @@ impl VimCursor {
             Mode::Visual(_) => self.color_map.visual,
             Mode::Select(_) => self.color_map.visual,
             Mode::Replace | Mode::VirtualReplace => self.color_map.replace,
-            Mode::OperatorPending(ref op) => {
-                apply_operator_hue_shift(self.color_map.operator, op)
-            }
+            Mode::OperatorPending(ref op) => apply_operator_hue_shift(self.color_map.operator, op),
             Mode::CommandLine => self.color_map.command,
             _ => {
                 log::warn!(
@@ -979,7 +984,11 @@ mod tests {
     fn alpha_preserved() {
         let base = Color::from_rgba(1.0, 0.0, 0.0, 0.7);
         let result = apply_operator_hue_shift(base, &Operator::Yank);
-        assert!(approx_eq(result.a, 0.7), "alpha was {}, expected 0.7", result.a);
+        assert!(
+            approx_eq(result.a, 0.7),
+            "alpha was {}, expected 0.7",
+            result.a
+        );
     }
 
     #[test]
