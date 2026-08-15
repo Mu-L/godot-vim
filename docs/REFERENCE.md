@@ -39,15 +39,15 @@ Complete reference for settings, commands, modes, motions, operators, text objec
 | Insert | `i`, `a`, `o`, `O`, `c`, `s` | Beam (green) |
 | Visual | `v` (char), `V` (line), `Ctrl-V` (block) | Block (orange) |
 | Replace | `R` | Underline (red) |
-| Command-line | `:`, `/`, `?` | — |
+| Command-line | `:`, `/`, `?` | Block (blinking) |
 | Select | `gh` | Block (orange) |
-| Operator-pending | `d`, `c`, `y`, `>`, etc. | Block (orange) |
+| Operator-pending | `d`, `c`, `y`, `>`, etc. | Half block for `d`, `c`, `y` and the case operators, block otherwise; the hue rotates per operator |
 
 ---
 
 ## Motions
 
-The full composable Vim grammar — operators compose with motions and text objects, counts multiply, registers route output:
+The full composable Vim grammar. Operators compose with motions and text objects, counts multiply, registers route output:
 
 ```
 [count] [register] operator [count] motion/textobject
@@ -108,7 +108,7 @@ The full composable Vim grammar — operators compose with motions and text obje
 | `i[` | `a[` | brackets |
 | `ie` | `ae` | entire buffer |
 | `ii` | `ai` | indent level |
-| `ib` | `ab` | any bracket (nearest `()`, `[]`, `{}`) |
+| `ib` | `ab` | any bracket, tightest enclosing `()`, `[]`, `{}`, `<>`; nearest pair as fallback |
 | `iq` | `aq` | any quote (nearest `"`, `'`, `` ` ``) |
 | `im` | `am` | symbol / identifier |
 
@@ -132,10 +132,10 @@ The full composable Vim grammar — operators compose with motions and text obje
 
 ## Search and Replace
 
-- **Incremental search** — results highlight in real-time as you type `/pattern` or `?pattern`.
-- **Live substitute match highlighting** — `:s/old/new/g` highlights match regions in yellow as you type the pattern, showing exactly what will be affected before Enter (`inccommand` setting). Note: highlights the match locations, not the replacement text.
-- **Regex support** — Vim-compatible regex with all four magic modes.
-- **Search commands** — `*`, `#`, `gn`, `gN`, `n`, `N`, `hlsearch`, `:noh`.
+- **Incremental search**: results highlight in real-time as you type `/pattern` or `?pattern`.
+- **Live substitute match highlighting**: `:s/old/new/g` highlights match regions in yellow as you type the pattern, showing exactly what will be affected before Enter (`inccommand` setting). Note: highlights the match locations, not the replacement text.
+- **Regex support**: Vim-compatible regex with all four magic modes.
+- **Search commands**: `*`, `#`, `gn`, `gN`, `n`, `N`, `hlsearch`, `:noh`.
 
 ---
 
@@ -173,7 +173,12 @@ All standard insert-mode keybindings:
 | `Ctrl-P` | Previous completion item |
 | `Ctrl-Space` | Trigger completion menu |
 
-Auto-pair insertion for `()`, `[]`, `{}`, `""`, `''`, `` `` `` is handled by Godot's CodeEdit; GodotVim preserves this behavior in Insert mode.
+Auto-pair insertion for `()`, `[]`, `{}`, `""`, `''`, `` `` `` is GodotVim's own
+reimplementation of Godot's `CodeEdit` behaviour, not a delegation to it
+(`src/effects/auto_brace.rs`): `handle_unicode_input` is not callable from gdext.
+The pair list comes from `get_auto_brace_completion_pairs()` on the attached
+`CodeEdit` rather than from a hardcoded table, so it follows what Godot's editor
+is configured with.
 
 ---
 
@@ -249,6 +254,11 @@ In addition to the [Godot-specific commands](#custom-commands), the following st
 
 | Command | Description |
 |---------|-------------|
+| `:w` / `:write` | Save the current file. `:w {path}` writes elsewhere, subject to File Access Scope. |
+| `:q` / `:quit` | Close the current tab. Refuses on unsaved changes; `:q!` discards them. |
+| `:wq` / `:x` | Save the current file, then close the tab. |
+| `:e {path}` / `:edit` | Open a file. `:e!` on the file already open reloads it from disk, discarding changes. |
+| `:qa` / `:qall` | Close the current tab. It runs the same handler as `:q` and does not close every tab. |
 | `:bn` / `:bnext` | Next buffer |
 | `:bp` / `:bprev` | Previous buffer |
 | `:b {number}` | Switch to buffer by number |
@@ -269,6 +279,8 @@ In addition to the [Godot-specific commands](#custom-commands), the following st
 | `:echo {expr}` | Echo expression |
 | `:!{cmd}` | Execute shell command (when enabled) |
 | `:actionlist [filter]` | List available Godot editor actions |
+| `:mkvimrc` | Write a starter `res://.godot-vimrc`: header, `let mapleader`, `set timeoutlen`, and all 20 presets commented out. Refuses if the file exists; `:mkvimrc!` overwrites. |
+| `:source` | Re-read the active `.godot-vimrc` from disk. There is no file watcher, so this is how a hand edit takes effect. |
 
 ---
 
@@ -280,6 +292,8 @@ Undo, redo, and time-based navigation.
 |---------------|--------|
 | `u` | Undo |
 | `Ctrl-R` | Redo |
+| `g-` | Move to the previous state in the undo tree; `{count}g-` for N steps |
+| `g+` | Move to the next state in the undo tree; `{count}g+` for N steps |
 | `:earlier {N}` | Go back N changes |
 | `:earlier {N}s` / `{N}m` / `{N}h` | Go back by time (seconds, minutes, hours) |
 | `:earlier {N}f` | Go back N file saves |
@@ -287,6 +301,7 @@ Undo, redo, and time-based navigation.
 | `:later {N}s` / `{N}m` / `{N}h` | Go forward by time |
 | `:later {N}f` | Go forward N file saves |
 | `:undolist` | Display undo history |
+| `:undotree` | Draw the undo tree |
 
 ---
 
@@ -319,12 +334,12 @@ The following Vim options are supported via `:set`, `:setlocal`, and `.godot-vim
 | `scrolloff` / `so` | `int` | `5` | Minimum lines above/below cursor |
 | `textwidth` / `tw` | `int` | `80` | Maximum line width for formatting |
 | `timeoutlen` / `tm` | `int` | `1000` | Mapping timeout in milliseconds |
-| `number` / `nu` | `bool` | `true` | Show line numbers |
-| `relativenumber` / `rnu` | `bool` | `true` | Show relative line numbers |
+| `number` / `nu` | `bool` | `false` | Show line numbers. Engine-only: nothing in GodotVim reads it, and the gutter is driven by the **Line Numbers** setting. |
+| `relativenumber` / `rnu` | `bool` | `false` | Show relative line numbers. Engine-only: nothing in GodotVim reads it, and the gutter is driven by the **Line Numbers** setting. |
 | `inccommand` / `icm` | `string` | `nosplit` | Highlight substitute match regions as you type |
 | `clipboard` | `string` | `""` | Clipboard integration |
 | `iskeyword` / `isk` | `string` | (default) | Characters considered part of a word |
-| `whichwrap` / `ww` | `string` | `""` | Keys that wrap across lines |
+| `whichwrap` / `ww` | `string` | `b,s` | Keys that wrap across lines |
 | `virtualedit` / `ve` | `string` | `""` | Allow cursor beyond end of line |
 | `selection` / `sel` | `string` | `inclusive` | Visual selection behavior |
 
@@ -338,37 +353,37 @@ All settings are in **Editor > Editor Settings > Plugins > GodotVim**.
 
 ### General
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| Enabled | `bool` | `true` | **Master switch** — global, per-user editor setting (stored in `editor_settings-*.tres`, not `project.godot`). When `false` the plugin is inert: no keybindings, overlays, input handling, input signal handlers, filesystem-prompt interception, or `.godot-vimrc` sourcing occur. What remains connected while inert: the settings listener (so re-enable is observed), an idle one-shot mapping timer whose connection persists but never fires while input is off, filesystem Callables (plain data), the process-global panic hook, and the always-loaded native extension. To disable only one project, turn off the plugin in that project's **Project Settings → Plugins** (writes `project.godot`). |
-| Log Level | `enum` | `Off` | `Off`, `Error`, `Warn`, `Info`, `Debug`, `Trace`. |
+| Setting | Key | Type | Default | Description |
+|---------|-----|------|---------|-------------|
+| Enabled | `plugins/GodotVim/enabled` | `bool` | `true` | **Master switch**: global, per-user editor setting (stored in `editor_settings-*.tres`, not `project.godot`). When `false` the plugin is inert: no keybindings, overlays, input handling, input signal handlers, filesystem-prompt interception, or `.godot-vimrc` sourcing occur. What remains connected while inert: the settings listener (so re-enable is observed), two idle one-shot timers (the mapping timer and the panel timer) whose connections persist but never fire while input is off, filesystem Callables (plain data), the process-global panic hook, and the always-loaded native extension. To disable only one project, turn off the plugin in that project's **Project Settings → Plugins** (writes `project.godot`). |
+| Log Level | `plugins/GodotVim/log_level` | `enum` | `Off` | `Off`, `Error`, `Warn`, `Info`, `Debug`, `Trace`. |
 
 ### Editor Behavior
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| Scroll Off | `int` | `5` | Minimum lines above/below cursor (0-20). |
-| Text Width | `int` | `80` | Max line width for `gq` formatting. |
-| Clipboard | `bool` | `false` | Sync Vim registers with system clipboard. |
-| Ignore Case | `bool` | `false` | Case-insensitive search. |
-| Smart Case | `bool` | `false` | Uppercase in pattern overrides Ignore Case. |
-| Line Numbers | `enum` | `Hybrid` | `None`, `Absolute`, `Relative`, `Hybrid`. |
-| Inccommand | `enum` | `nosplit` | Live `:s` preview. `nosplit` = enabled, `off` = disabled. |
-| ~~Highlight Yank~~ | ~~`int`~~ | ~~`150`~~ | ~~Yank highlight duration in ms (0 = disabled).~~ |
+| Setting | Key | Type | Default | Description |
+|---------|-----|------|---------|-------------|
+| Scroll Off | `plugins/GodotVim/editor/scrolloff` | `int` | `5` | Minimum lines above/below cursor (0-20). |
+| Text Width | `plugins/GodotVim/editor/textwidth` | `int` | `80` | Max line width for `gq` formatting. |
+| Clipboard | `plugins/GodotVim/editor/clipboard_enabled` | `bool` | `false` | Sync Vim registers with system clipboard. |
+| Ignore Case | `plugins/GodotVim/editor/ignorecase` | `bool` | `false` | Case-insensitive search. |
+| Smart Case | `plugins/GodotVim/editor/smartcase` | `bool` | `false` | Uppercase in pattern overrides Ignore Case. |
+| Line Numbers | `plugins/GodotVim/editor/line_number_mode` | `enum` | `Hybrid` | `None`, `Absolute`, `Relative`, `Hybrid`. |
+| Inccommand | `plugins/GodotVim/editor/inccommand` | `enum` | `nosplit` | Live `:s` preview. `nosplit` = enabled, `off` = disabled. |
+| Highlight Yank | `plugins/GodotVim/editor/highlight_yank_duration` | `int` | `150` | Yank highlight duration in ms, 0 to 5000 (0 = disabled). |
 
 ### Cursor
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| Enabled | `bool` | `true` | Custom cursor overlay (disable for native caret). **NOT the master toggle — see General → Enabled.** |
-| Lerp Speed | `float` | `25.0` | Cursor glide speed, on a log-scaled slider from 1 to 500. Higher is snappier; 500 settles within one 60 Hz frame. Values above 500 can be typed in but are not perceptibly faster. |
-| Underline Height | `float` | `4.0` | Replace-mode underline height in pixels. |
-| Normal Color | `Color` | `#FFFFFF` | Cursor color in Normal mode. |
-| Insert Color | `Color` | `#55FF7F` | Cursor color in Insert mode. |
-| Visual Color | `Color` | `#FFB855` | Cursor color in Visual mode. |
-| Replace Color | `Color` | `#FF333399` | Cursor color in Replace mode. |
-| Operator Mode Color | `Color` | `#FFB855` | Cursor color in Operator-pending mode. |
-| Command Mode Color | `Color` | `#FFFFFF` | Cursor color in Command-line mode. |
+| Setting | Key | Type | Default | Description |
+|---------|-----|------|---------|-------------|
+| Enabled | `plugins/GodotVim/cursor/enabled` | `bool` | `true` | Custom cursor overlay (disable for native caret). **NOT the master toggle, see General → Enabled.** |
+| Lerp Speed | `plugins/GodotVim/cursor/lerp_speed` | `float` | `25.0` | Cursor glide speed, on a log-scaled slider from 1 to 500. Higher is snappier; 500 settles within one 60 Hz frame. Values above 500 can be typed in but are not perceptibly faster. |
+| Underline Height | `plugins/GodotVim/cursor/underline_height` | `float` | `4.0` | Replace-mode underline height in pixels. |
+| Normal Color | `plugins/GodotVim/cursor/normal_mode_color` | `Color` | `#FFFFFF` | Cursor color in Normal mode. |
+| Insert Color | `plugins/GodotVim/cursor/insert_mode_color` | `Color` | `#55FF7F` | Cursor color in Insert mode. |
+| Visual Color | `plugins/GodotVim/cursor/visual_mode_color` | `Color` | `#FFB855` | Cursor color in Visual mode. |
+| Replace Color | `plugins/GodotVim/cursor/replace_mode_color` | `Color` | `#FF333399` | Cursor color in Replace mode. |
+| Operator Mode Color | `plugins/GodotVim/cursor/operator_mode_color` | `Color` | `#FFB855` | Cursor color in Operator-pending mode. |
+| Command Mode Color | `plugins/GodotVim/cursor/command_mode_color` | `Color` | `#FFFFFF` | Cursor color in Command-line mode. |
 
 Glide time to settle, in ms (`ln(2 * distance) / speed`):
 
@@ -388,19 +403,42 @@ frame, so it never trails the text it sits on.
 
 ### Key Mapping
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| Timeout Length | `int` | `1000` | Timeout for ambiguous mappings in ms. |
-| Config File Path | `string` | `""` | Path to `.godot-vimrc`. Empty = auto-resolve. |
-| Passthrough Keys | `string` | `""` | Comma-separated keys bypassing Vim (e.g. `<C-v>,<C-a>`). |
+| Setting | Key | Type | Default | Description |
+|---------|-----|------|---------|-------------|
+| Timeout Length | `plugins/GodotVim/mapping/timeoutlen` | `int` | `1000` | Timeout for ambiguous mappings in ms. |
+| Config File Path | `plugins/GodotVim/mapping/config_file_path` | `string` | `""` | Path to `.godot-vimrc`. Empty = auto-resolve. |
 
-### Security
+### Input
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| Shell Execution | `enum` | `Disabled` | Allow `:!` commands. |
-| File Access Scope | `enum` | `Project Only` | Restrict file ops to `res://` and `user://`. |
-| Project Vimrc | `enum` | `Sandbox` | `Disabled`, `Sandbox`, `Trusted`. |
+| Setting | Key | Type | Default | Description |
+|---------|-----|------|---------|-------------|
+| Passthrough Keys | `plugins/GodotVim/input/passthrough_keys` | `string` | `""` | Comma-separated keys bypassing Vim (e.g. `<C-v>,<C-a>`). |
+
+Godot builds the settings tree from the key path, so this one renders under
+**Input**, not under **Key Mapping** where its two former neighbours sit.
+
+### Security Settings
+
+| Setting | Key | Type | Default | Description |
+|---------|-----|------|---------|-------------|
+| Shell Execution | `plugins/GodotVim/security/shell_execution` | `enum` | `Disabled` | Allow `:!` commands. |
+| File Access Scope | `plugins/GodotVim/security/file_access_scope` | `enum` | `Project Only` | Restrict file ops to `res://` and `user://`. |
+| Project Vimrc | `plugins/GodotVim/security/project_vimrc` | `enum` | `Sandbox` | `Disabled`, `Sandbox`, `Trusted`. |
+
+### Status Bar Colors
+
+All configurable in **Editor > Editor Settings > Plugins > GodotVim > Status Bar**:
+
+| Setting | Key | Type | Default | Description |
+|---------|-----|------|---------|-------------|
+| Normal BG | `plugins/GodotVim/status_bar/normal_bg` | `Color` | `rgb(0.5, 0.6, 0.8)` | Background in Normal mode. |
+| Insert BG | `plugins/GodotVim/status_bar/insert_bg` | `Color` | `rgb(0.6, 0.8, 0.5)` | Background in Insert mode. |
+| Visual BG | `plugins/GodotVim/status_bar/visual_bg` | `Color` | `rgb(0.8, 0.5, 0.5)` | Background in Visual mode. |
+| Replace BG | `plugins/GodotVim/status_bar/replace_bg` | `Color` | `rgb(0.9, 0.6, 0.3)` | Background in Replace mode. |
+| Command BG | `plugins/GodotVim/status_bar/command_bg` | `Color` | `rgb(0.157, 0.173, 0.204)` | Background in Command-line mode. |
+| Recording BG | `plugins/GodotVim/status_bar/recording_bg` | `Color` | `rgb(0.9, 0.2, 0.2)` | Background while recording a macro. |
+| Text FG | `plugins/GodotVim/status_bar/text_fg` | `Color` | `#FFFFFF` | Foreground text color. |
+| Error FG | `plugins/GodotVim/status_bar/error_fg` | `Color` | `rgb(1.0, 0.3, 0.3)` | Foreground color for error messages. |
 
 ---
 
@@ -419,7 +457,7 @@ Godot-specific ex-commands, in addition to standard Vim commands.
 | `:GodotContinue` | `:cont` | Debugger continue |
 | `:GodotNext` | `:next` | Step over |
 | `:GodotStepIn` | `:stepin` | Step into |
-| `:GodotStepOut` | `:stepout` | Step out |
+| `:GodotStepOut` | `:stepout` | Godot's debugger exposes no step-out, so this continues instead and says so in the status bar |
 | `:GodotPause` | `:pause` | Pause execution |
 | `:FileSystem` | | Focus FileSystem dock |
 | `:Inspector` | | Focus Inspector dock |
@@ -434,6 +472,11 @@ Godot-specific ex-commands, in addition to standard Vim commands.
 | `:panelmap {keys}` | | Explain how `{keys}` resolves where focus is now |
 | `:perf` | | Show keystroke performance stats |
 | `:vimdebug` | | Toggle debug annotations |
+| `gd` | | Go to the definition of the symbol under the cursor |
+| `K` | | Show Godot's documentation tooltip for the symbol under the cursor |
+
+`gd` and `K` are Normal-mode keys rather than ex-commands. They are listed here
+because they are Godot integrations rather than Vim engine features.
 
 ---
 
@@ -453,7 +496,7 @@ Godot-specific ex-commands, in addition to standard Vim commands.
 | `<Space>dc` | Continue | off |
 | `<Space>dn` | Step over | off |
 | `<Space>di` | Step in | off |
-| `<Space>do` | Step out | off |
+| `<Space>do` | Continue (Godot exposes no step-out) | off |
 | `<Space>r` | Run main scene | off |
 | `<Space>R` | Run current scene | off |
 | `<Space>S` | Stop scene | off |
@@ -482,8 +525,13 @@ Place a `.godot-vimrc` file at your project root (`res://.godot-vimrc`) or user 
 | `omap` / `onoremap` | Operator-pending mode mapping |
 | `cmap` / `cnoremap` | Command-line mode mapping |
 | `map` / `noremap` | Normal + Visual + Operator-pending |
-| `panelmap` | Bind a key outside the script editor — docks, panels, FileSystem, debugger, completion popup ([details](#panel-key-bindings-panelmap)) |
+| `panelmap` | Bind a key outside the script editor: docks, panels, FileSystem, debugger, completion popup ([details](#panel-key-bindings-panelmap)) |
 | `panelunmap` | Remove a panel binding |
+
+The recursive forms (`map`, `nmap`, `vmap`, `imap`, `omap`, `cmap`) are stripped
+from a committed `res://.godot-vimrc` under the default `Sandbox` policy whatever
+they map to. Use the `noremap` forms there, or move the file to
+`user://.godot-vimrc`. See [Security](#security).
 
 ### Key Notation
 
@@ -503,7 +551,7 @@ Place a `.godot-vimrc` file at your project root (`res://.godot-vimrc`) or user 
 Invoke any Godot editor shortcut by name using `<Action>` in mappings or `:action` from the command line:
 
 ```vim
-" In .godot-vimrc — map Leader+s to save
+" In .godot-vimrc: map Leader+s to save
 nnoremap <Leader>s <Action>(editor/save_scene)
 
 " From command line
@@ -533,7 +581,7 @@ nnoremap <Space>r :run<CR>
 
 Everything GodotVim does **outside** the script editor is a table of bindings you can read, change and remove: moving focus between panels (`Ctrl-h/j/k/l`), navigating docks with `h/j/k/l`, the FileSystem file operations (`a`/`d`/`r`/`y`/`R`), the debugger keys (`J`/`K`/`G`/`y`), and the autocomplete popup (`Ctrl-N`/`Ctrl-P`/`Tab`/`Enter`/`Esc`).
 
-Those 30 bindings are not hardcoded — they are `panelmap` lines the plugin writes for itself and hands to the same parser that reads your `.godot-vimrc`. Anything the defaults can express, you can express.
+Those 30 bindings are not hardcoded. They are `panelmap` lines the plugin writes for itself and hands to the same parser that reads your `.godot-vimrc`. Anything the defaults can express, you can express.
 
 ```
 panelmap   [<flag> ...] <surface> <lhs> <target> [key=value ...]
@@ -544,34 +592,34 @@ Zero config is still the default. If you never write a `panelmap` line, the ship
 
 ### Where the lines go
 
-`panelmap` and `panelunmap` are ordinary `.godot-vimrc` lines — they live in the same file as your `nnoremap` mappings, in any order.
+`panelmap` and `panelunmap` are ordinary `.godot-vimrc` lines. They live in the same file as your `nnoremap` mappings, in any order.
 
 Exactly **one** config file is read, and the first hit wins:
 
 1. **Editor Settings → Plugins → GodotVim → Key Mapping → Config File Path**, if you set it
-2. `res://.godot-vimrc` — your project root, committed with the project
-3. `user://.godot-vimrc` — per-user, shared by every project you open
+2. `res://.godot-vimrc`, your project root, committed with the project
+3. `user://.godot-vimrc`, per-user, shared by every project you open
 
-There is no layering between files: if `res://.godot-vimrc` exists, `user://.godot-vimrc` is never read. After editing the file by hand, run `:source` — the binding table is rebuilt from scratch and swapped in atomically, so a broken line can never leave a half-built keyset live.
+There is no layering between files: if `res://.godot-vimrc` exists, `user://.godot-vimrc` is never read. After editing the file by hand, run `:source`, the binding table is rebuilt from scratch and swapped in atomically, so a broken line can never leave a half-built keyset live.
 
 ### Seeing what you have
 
 | Command | What it prints |
 |---------|----------------|
-| `:panelmap` | Every live binding, grouped by surface, in the exact syntax you would paste back into a vimrc — plus every line of your config that was **rejected** and the reason |
+| `:panelmap` | Every live binding, grouped by surface, in the exact syntax you would paste back into a vimrc, and every line of your config that was **rejected** and the reason |
 | `:panelmap {keys}` | One key, resolved against whatever has focus right now: the focus chain that was sampled, the surface stack, which rule won and on which surface, which gate stopped it if none did, and whether the key is consumed |
 
-Both print to the **Output** panel, not the status bar — a resolution trace is a dozen lines.
+Both print to the **Output** panel, not the status bar, since a resolution trace is a dozen lines.
 
-Two things to know about `:panelmap {keys}`. It samples **the focus you have while typing the command**, which is the command line — so run it with the panel you care about in mind and read the focus chain it prints back at you, which is the chain it actually used. And it answers for the key **as written**: a real keystroke on a non-QWERTY layout also carries a US-QWERTY position that a written left-hand side cannot reconstruct, so a `<physical>` rule may be reachable in practice without appearing in the trace.
+Two things to know about `:panelmap {keys}`. It samples **the focus you have while typing the command**, which is the command line, so run it with the panel you care about in mind and read the focus chain it prints back at you, which is the chain it actually used. And it answers for the key **as written**: a real keystroke on a non-QWERTY layout also carries a US-QWERTY position that a written left-hand side cannot reconstruct, so a `<physical>` rule may be reachable in practice without appearing in the trace.
 
-A malformed line costs you that line and nothing else — the rest of your config still loads. `:panelmap` is the primary channel for those rejections and needs no setup at all.
+A malformed line costs you that line and nothing else. The rest of your config still loads. `:panelmap` is the primary channel for those rejections and needs no setup at all.
 
-To watch them scroll past as the file loads instead, set **Editor Settings → Plugins → GodotVim → Log Level** to `Debug`. **The default is `Off`**, which is exactly why a rejected binding can otherwise look like a key that simply stopped working: the diagnostic exists, it is just not being printed. `Debug` also reports how many bindings were rebuilt, and — for a project-level config under the `Sandbox` policy — which lines the sandbox stripped.
+To watch them scroll past as the file loads instead, set **Editor Settings → Plugins → GodotVim → Log Level** to `Debug`. **The default is `Off`**, which is exactly why a rejected binding can otherwise look like a key that simply stopped working: the diagnostic exists, it is just not being printed. `Debug` also reports how many bindings were rebuilt, and, for a project-level config under the `Sandbox` policy, which lines the sandbox stripped.
 
 ### Rebinding is `panelunmap` + `panelmap`
 
-There is exactly one binding per (surface, key), and a second `panelmap` on the same surface and key replaces the first. But **adding a key never removes the old one** — there is no implicit "move this verb". To relocate a binding, unmap the old key and map the new one:
+There is exactly one binding per (surface, key), and a second `panelmap` on the same surface and key replaces the first. But **adding a key never removes the old one**: there is no implicit "move this verb". To relocate a binding, unmap the old key and map the new one:
 
 ```vim
 " Dock navigation on Colemak's home row instead of j/k.
@@ -586,7 +634,7 @@ Without the two `panelunmap` lines, `j` and `k` would keep working alongside `n`
 Two more things you can do with `panelunmap`:
 
 ```vim
-" Turn a key off entirely — d in the FileSystem dock no longer deletes.
+" Turn a key off entirely, d in the FileSystem dock no longer deletes.
 panelunmap dock.filesystem d
 
 " Hand a key back to Godot at one surface instead of turning it off.
@@ -598,23 +646,23 @@ panelmap dock.filesystem <C-h> native
 
 ### Surfaces, and why deeper wins
 
-A **surface** is a named place in the editor UI. Surfaces form a tree, and a keystroke is resolved by walking from the surface that has focus **up to the root**, taking the first rule that matches. That is the whole specificity mechanism — there are no priorities to assign.
+A **surface** is a named place in the editor UI. Surfaces form a tree, and a keystroke is resolved by walking from the surface that has focus **up to the root**, taking the first rule that matches. That is the whole specificity mechanism, there are no priorities to assign.
 
 | Surface | Parent | What has focus there |
 |---------|--------|----------------------|
-| `panel` | — (root) | The root of everything below. Reached by the upward walk, never claimed directly — this is where cross-panel keys belong. |
+| `panel` | (root) | The root of everything below. Reached by the upward walk and never claimed directly, this is where cross-panel keys belong. |
 | `dock` | `panel` | Any focusable `Tree`, `ItemList` or `RichTextLabel`: Scene tree, Inspector, Output log, built-in docs. |
 | `dock.filesystem` | `dock` | The FileSystem dock's tree or file list. |
 | `dock.debugger` | `dock` | The Debugger panel's Stack Frames / Breakpoints trees. |
 | `searchbox` | `panel` | A dock's filter `LineEdit` (the box `/` jumps to). |
 | `prompt` | `panel` | GodotVim's own FileSystem create/rename prompt. |
 | `editor.nav` | `panel` | The attached script editor in Normal, Visual or Operator-pending mode. |
-| `editor.insert` | — (root) | The attached script editor in any *other* mode — Insert, Replace, Select. **Takes no bindings.** |
-| `editor.completion` | — (root) | The script editor's autocomplete popup. Reached by the popup itself, not by focus. |
-| `foreign` | — (root) | Somebody else's text input — a Project Settings field, an addon's editor. **Takes no bindings.** |
+| `editor.insert` |, (root) | The attached script editor in any *other* mode, Insert, Replace, Select. **Takes no bindings.** |
+| `editor.completion` |, (root) | The script editor's autocomplete popup. Reached by the popup itself, not by focus. |
+| `foreign` |, (root) | Somebody else's text input, a Project Settings field, an addon's editor. **Takes no bindings.** |
 | `unknown` | `panel` | A focused control none of the above claimed, or no focus owner at all. |
 
-Because `dock.filesystem` is deeper than `dock`, `r` renames a file in the FileSystem dock and moves to the previous item everywhere else — same key, two rules, no conflict:
+Because `dock.filesystem` is deeper than `dock`, `r` renames a file in the FileSystem dock and moves to the previous item everywhere else, same key, two rules, no conflict:
 
 ```vim
 panelmap dock r godotvim.item.prev
@@ -624,7 +672,7 @@ panelmap <physical> dock.filesystem r godotvim.fs.rename
 Four surfaces stop the walk, in two different ways:
 
 - `editor.insert` and `foreign` are **barriers**. Nothing is looked up there and no ancestor is consulted, which is why `Ctrl-H` still backspaces in a Project Settings field and in Insert mode. Any `panelmap` on them is rejected.
-- `searchbox` and `prompt` are **sealed**: bare keys stop there and reach the control's own input handling — so you can type in a filter box — while keys carrying Ctrl, Alt or Meta keep walking up to `panel`, which is how `Ctrl-h/j/k/l` still escapes them.
+- `searchbox` and `prompt` are **sealed**: bare keys stop there and reach the control's own input handling, so you can type in a filter box, while keys carrying Ctrl, Alt or Meta keep walking up to `panel`, which is how `Ctrl-h/j/k/l` still escapes them.
 
 Only the key **as typed** takes part in that walk. The US-QWERTY positional fallback (see `<physical>` below) is offered to every surface only after the typed key has been offered to all of them, so a positional guess on a deep surface can never beat what you actually pressed on a shallow one.
 
@@ -632,10 +680,10 @@ Only the key **as typed** takes part in that walk. The US-QWERTY positional fall
 
 | Target | Meaning |
 |--------|---------|
-| `godotvim.*` | A registered action id — see the table below. A typo is rejected at load, never a silently dead key. |
+| `godotvim.*` | A registered action id, see the table below. A typo is rejected at load, never a silently dead key. |
 | `native` | Give this keystroke back to Godot at this surface and stop walking. |
 
-The target vocabulary is deliberately closed. There is no shell form, no `:` command form, and no way for a binding to expand into another mapping — which is what makes it safe to honour `panelmap` lines from a committed project config (see [Security](#security)).
+The target vocabulary is deliberately closed. There is no shell form, no `:` command form, and no way for a binding to expand into another mapping, which is what makes it safe to honour `panelmap` lines from a committed project config (see [Security](#security)).
 
 ### Flags
 
@@ -646,15 +694,15 @@ Flags come first, in any order, each at most once.
 | `<physical>` | Also match this rule against the key's **US-QWERTY physical position**, when that differs from what was typed. Opt-in per rule. |
 | `<void>` | Consume the keystroke whether or not the action succeeded, and stop the walk. Without it, a declining action lets the key fall through. |
 | `<norepeat>` | Ignore auto-repeat while the key is held. The rule fires once per press. |
-| `<shift>` | Also match this key with Shift held. Only meaningful for named keys (`<CR>`, `<Esc>`, `<Up>`…) — `R` is already the shifted spelling of `r`. |
+| `<shift>` | Also match this key with Shift held. Only meaningful for named keys (`<CR>`, `<Esc>`, `<Up>`…), `R` is already the shifted spelling of `r`. |
 | `<nowait>` | Fire immediately even if this key is also the first key of a longer sequence, instead of waiting `timeoutlen` for the rest. |
 
-**Why the shipped defaults carry the flags they do** — these are not decoration, and dropping one has a specific consequence:
+**Why the shipped defaults carry the flags they do**: these are not decoration, and dropping one has a specific consequence:
 
 - The four `panel` chords are `<physical> <void> <norepeat>`.
   - **Drop `<physical>` and `Ctrl-h/j/k/l` silently stop working on non-QWERTY layouts.** On Dvorak, Colemak or AZERTY, the key in the QWERTY `j` position does not report `j`; the positional probe is the only thing that finds it, and it is offered only to rules that asked for it.
   - **Drop `<void>` and the chords leak to Godot at the edges of your layout.** `godotvim.focus.left` declines when there is no panel to the left; an elastic rule then hands `Ctrl-h` to Godot, which will do something else with it. `<void>` is what makes "no panel that way" a no-op instead of a surprise.
-  - **Drop `<norepeat>` and holding `Ctrl-j` queues a focus-grab storm** — roughly twenty deferred focus changes a second for as long as the key is down.
+  - **Drop `<norepeat>` and holding `Ctrl-j` queues a focus-grab storm**: roughly twenty deferred focus changes a second for as long as the key is down.
 - `dock` and `dock.filesystem` navigation and file-operation keys are `<physical>` for the same layout reason. `<CR>` and `<Esc>` on `dock` are not: named keys have no layout ambiguity.
 - The two `searchbox` rules are `<shift>`, so Shift+Enter and Shift+Esc leave the filter box exactly like the unshifted keys, matching what the filter box did before it was a binding table.
 
@@ -662,7 +710,7 @@ If you rebind one of these, carry the flags across. The `:panelmap` listing prin
 
 ### Parameters
 
-Trailing `key=value` pairs, at most **4** per rule. Values are **decimal integers only** — there is no string or enum form.
+Trailing `key=value` pairs, at most **4** per rule. Values are **decimal integers only**: there is no string or enum form.
 
 | Parameter | Range | Meaning |
 |-----------|-------|---------|
@@ -680,7 +728,7 @@ An out-of-range `count` is rejected at load rather than quietly clamped, because
 
 29 verbs.
 
-**Needs** is what the focused control must be able to *do*, not what class it is. "A vertical cursor" is held by `Tree`, `ItemList` and `RichTextLabel`; "a hierarchy" only by `Tree`; "the FileSystem dock" is granted by the surface rather than the widget, which is what stops `panelmap dock a godotvim.fs.create` from creating files from a focused Scene tree. If the control cannot meet an action's needs, that rule is skipped and the keystroke keeps walking up — it does not die there.
+**Needs** is what the focused control must be able to *do*, not what class it is. "A vertical cursor" is held by `Tree`, `ItemList` and `RichTextLabel`; "a hierarchy" only by `Tree`; "the FileSystem dock" is granted by the surface rather than the widget, which is what stops `panelmap dock a godotvim.fs.create` from creating files from a focused Scene tree. If the control cannot meet an action's needs, that rule is skipped and the keystroke keeps walking up, it does not die there.
 
 The **`:action`** column marks the verbs that also work by name, from `:action {id}` or `<Action>({id})` in a mapping. The rest need a real keystroke on a real surface, because they act on whatever the keystroke was aimed at.
 
@@ -691,14 +739,14 @@ The **`:action`** column marks the verbs that also work by name, from `:action {
 | `godotvim.item.collapse` | `h` on `dock` | Collapse the current item | a hierarchy (`Tree`) | |
 | `godotvim.item.expand` | `l` on `dock` | Expand the current item | a hierarchy (`Tree`) | |
 | `godotvim.item.activate` | `<CR>` on `dock` | Open or activate the current item | activation (`Tree`, `ItemList`) | |
-| `godotvim.dock.search` | `/` on `dock` | Focus the dock's filter box | — | |
-| `godotvim.focus.editor` | `<Esc>` on `dock` | Return focus to the script editor | — | yes |
-| `godotvim.focus.left` | `<C-h>` on `panel` | Move focus to the panel on the left | — | yes |
-| `godotvim.focus.right` | `<C-l>` on `panel` | Move focus to the panel on the right | — | yes |
-| `godotvim.focus.up` | `<C-k>` on `panel` | Move focus to the panel above | — | yes |
-| `godotvim.focus.down` | `<C-j>` on `panel` | Move focus to the panel below | — | yes |
-| `godotvim.focus.cycle_next` | *(unbound — see below)* | Cycle focus to the next panel | — | yes |
-| `godotvim.focus.cycle_prev` | *(unbound — see below)* | Cycle focus to the previous panel | — | yes |
+| `godotvim.dock.search` | `/` on `dock` | Focus the dock's filter box |, | |
+| `godotvim.focus.editor` | `<Esc>` on `dock` | Return focus to the script editor |, | yes |
+| `godotvim.focus.left` | `<C-h>` on `panel` | Move focus to the panel on the left |, | yes |
+| `godotvim.focus.right` | `<C-l>` on `panel` | Move focus to the panel on the right |, | yes |
+| `godotvim.focus.up` | `<C-k>` on `panel` | Move focus to the panel above |, | yes |
+| `godotvim.focus.down` | `<C-j>` on `panel` | Move focus to the panel below |, | yes |
+| `godotvim.focus.cycle_next` | *(unbound, see below)* | Cycle focus to the next panel |, | yes |
+| `godotvim.focus.cycle_prev` | *(unbound, see below)* | Cycle focus to the previous panel |, | yes |
 | `godotvim.search.accept` | `<CR>`, `<Esc>` on `searchbox` | Leave the filter box, keeping the filter | a text field | |
 | `godotvim.fs.create` | `a` on `dock.filesystem` | Create a file or folder | the FileSystem dock | yes |
 | `godotvim.fs.delete` | `d` on `dock.filesystem` | Delete the selected path | the FileSystem dock | yes |
@@ -709,12 +757,12 @@ The **`:action`** column marks the verbs that also work by name, from `:action {
 | `godotvim.debugger.frame_prev` | `K` on `dock.debugger` | Select the previous stack frame or breakpoint | a vertical cursor | |
 | `godotvim.debugger.frame_last` | `G` on `dock.debugger` | Select the deepest stack frame | a vertical cursor | |
 | `godotvim.debugger.yank_frame` | `y` on `dock.debugger` | Copy the selected row to the clipboard | a vertical cursor | |
-| `godotvim.completion.trigger` | `<C-@>` on `editor.completion` | Open the completion popup | — | |
-| `godotvim.completion.next` | `<C-n>` on `editor.completion` | Next candidate, opening the popup if closed | — | |
-| `godotvim.completion.prev` | `<C-p>` on `editor.completion` | Previous candidate, opening the popup if closed | — | |
-| `godotvim.completion.confirm` | `<Tab>`, `<CR>` on `editor.completion` | Accept the selected candidate | — | |
-| `godotvim.completion.dismiss` | `<Esc>` on `editor.completion` | Close the popup, letting the key through | — | |
-| `godotvim.completion.navigate` | `<Up>`, `<Down>` on `editor.completion` | Let the editor's own popup handling move the selection | — | |
+| `godotvim.completion.trigger` | `<C-@>` on `editor.completion` | Open the completion popup |, | |
+| `godotvim.completion.next` | `<C-n>` on `editor.completion` | Next candidate, opening the popup if closed |, | |
+| `godotvim.completion.prev` | `<C-p>` on `editor.completion` | Previous candidate, opening the popup if closed |, | |
+| `godotvim.completion.confirm` | `<Tab>`, `<CR>` on `editor.completion` | Accept the selected candidate |, | |
+| `godotvim.completion.dismiss` | `<Esc>` on `editor.completion` | Close the popup, letting the key through |, | |
+| `godotvim.completion.navigate` | `<Up>`, `<Down>` on `editor.completion` | Let the editor's own popup handling move the selection |, | |
 
 > `<C-@>` is not a typo. Godot reports Ctrl+Space as Ctrl+`@` (the terminal NUL convention), so `<C-@>` is the spelling that actually fires. `<C-Space>` parses to a different key and would never match.
 
@@ -728,7 +776,7 @@ panelmap <physical> <void> <norepeat> panel <M-[> godotvim.focus.cycle_prev
 
 ### Multi-key sequences
 
-A left-hand side may be up to 8 keys long — but **only on surfaces the script editor cannot reach**:
+A left-hand side may be up to 8 keys long, but **only on surfaces the script editor cannot reach**:
 
 ```vim
 " Legal: dock.filesystem is never live while you are editing a script.
@@ -736,7 +784,7 @@ panelunmap dock.filesystem d
 panelmap <physical> dock.filesystem dd godotvim.fs.delete
 ```
 
-`panel` and every `editor.*` surface reject a multi-key binding, and so does any surface that is an ancestor of an `editor.*` surface — `panel` is `editor.nav`'s parent, so `panelmap panel gd …` is live while you are typing in a script and is refused. Reserving a bare key there would break the Vim sequence that starts with it.
+`panel` and every `editor.*` surface reject a multi-key binding, and so does any surface that is an ancestor of an `editor.*` surface, `panel` is `editor.nav`'s parent, so `panelmap panel gd …` is live while you are typing in a script and is refused. Reserving a bare key there would break the Vim sequence that starts with it.
 
 Binding a sequence implicitly reserves its first key on that surface: after the example above, a bare `d` in the FileSystem dock waits `timeoutlen` for the second key. `:panelmap` prints every reservation under the surface that owns it, so this is never invisible. Add `<nowait>` to a shorter rule to opt it out of the wait.
 
@@ -747,15 +795,15 @@ Every rejection is reported by `:panelmap` with the offending token named. The c
 | Line | Rejected because |
 |------|------------------|
 | `panelmap sidebar j godotvim.item.next` | no surface named `sidebar` is declared |
-| `panelmap Dock j godotvim.item.next` | surface ids are lowercase — `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$` |
+| `panelmap Dock j godotvim.item.next` | surface ids are lowercase, `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$` |
 | `panelmap dock j godotvim.item.nxt` | no action named `godotvim.item.nxt` is registered |
 | `panelmap dock j filesystem_dock/rename` | not an action id and not `native` |
 | `panelmap editor.insert <C-h> godotvim.focus.left` | `editor.insert` is a barrier and takes no bindings |
 | `panelmap panel gd godotvim.focus.left` | `panel` is reachable from the script editor, so its bindings must be a single key |
 | `panelmap panel g godotvim.focus.cycle_next` | `g` begins a Vim command sequence; binding it here would destroy the key that follows |
-| `panelmap dock <S-1> godotvim.item.next` | `<S-1>` is `!` on US and `+` on German — write the literal character instead |
+| `panelmap dock <S-1> godotvim.item.next` | `<S-1>` is `!` on US and `+` on German, write the literal character instead |
 | `panelmap dock j godotvim.item.next count=0` | `count` is outside `1..=100` |
-| `panelmap <physicl> dock j godotvim.item.next` | unknown flag — expected one of `<nowait> <physical> <void> <norepeat> <shift>` |
+| `panelmap <physicl> dock j godotvim.item.next` | unknown flag, expected one of `<nowait> <physical> <void> <norepeat> <shift>` |
 | `panelunmap dock j godotvim.item.next` | `panelunmap` takes exactly two operands |
 
 A typo in the **verb** is the one failure `:panelmap` cannot report: `panelmp dock j …` is not a panel line at all, so it is never claimed, never rejected, and never listed. If a rule is missing from `:panelmap` and no rejection mentions it, check the spelling of `panelmap` / `panelunmap` first.
@@ -766,10 +814,10 @@ A typo in the **verb** is the one failure `:panelmap` cannot report: `panelmp do
 
 GodotVim defaults to a locked-down security posture:
 
-- **Shell execution disabled** — `:!` commands are blocked by default. Enable in EditorSettings under `security/shell_execution`.
-- **File access scoped to project** — `:w`, `:r`, `:e` restricted to `res://` and `user://` paths by default.
-- **Sandboxed project vimrc** — Project-level `.godot-vimrc` files have shell-invoking patterns stripped automatically. Three policies: Disabled, Sandbox (default), Trusted.
-- **Panel bindings are honoured from a project vimrc**, but only because their right-hand side is a closed vocabulary. Under the default `Sandbox` policy a committed `res://.godot-vimrc` may use `panelunmap` (it can only *remove* a binding), `native` (it can only *reduce* what the plugin consumes), and any registered `godotvim.*` action id with integer-only parameters. None of those can expand into `:!`, `:source`, or another mapping, and an unregistered action id is refused at load. A `panelmap` line that fails to parse is stripped rather than trusted — "unparseable" and "harmless" are different claims. Stripping means commenting the line out with a reason, never deleting it, so nothing changes silently. `Trusted` honours the file verbatim; `Disabled` skips it entirely. Lines in `user://.godot-vimrc`, or in a file you named yourself under Config File Path, are trusted at every tier. See [Panel Key Bindings](#panel-key-bindings-panelmap).
+- **Shell execution disabled**: `:!` commands are blocked by default. Enable in EditorSettings under `security/shell_execution`.
+- **File access scoped to project**: `:w`, `:r`, `:e` restricted to `res://` and `user://` paths by default.
+- **Sandboxed project vimrc:** Under the default `Sandbox` policy a project-level `.godot-vimrc` is filtered by **whitelist**, not by pattern-stripping: only known-safe constructs survive. Comments and blanks, safe `set` options, `let mapleader`, the non-recursive `noremap` forms with a clean right-hand side, `panelunmap`, and `panelmap` lines targeting a registered `godotvim.*` action all pass. Everything else is stripped, including **every recursive `map` form regardless of its right-hand side** (`map`, `nmap`, `vmap`, `imap`, `omap`, `cmap`), because a recursive expansion can compose safe fragments into a dangerous one at runtime. Stripped means commented out with a `" [sandbox] stripped` comment naming the reason, never deleted, so nothing changes silently. Three policies: Disabled, Sandbox (default), Trusted.
+- **Panel bindings are honoured from a project vimrc**, but only because their right-hand side is a closed vocabulary. Under the default `Sandbox` policy a committed `res://.godot-vimrc` may use `panelunmap` (it can only *remove* a binding), `native` (it can only *reduce* what the plugin consumes), and any registered `godotvim.*` action id with integer-only parameters. None of those can expand into `:!`, `:source`, or another mapping, and an unregistered action id is refused at load. A `panelmap` line that fails to parse is stripped rather than trusted, "unparseable" and "harmless" are different claims. Stripping means commenting the line out with a reason, never deleting it, so nothing changes silently. `Trusted` honours the file verbatim; `Disabled` skips it entirely. Lines in `user://.godot-vimrc`, or in a file you named yourself under Config File Path, are trusted at every tier. See [Panel Key Bindings](#panel-key-bindings-panelmap).
 
 ---
 
@@ -784,20 +832,8 @@ A floating overlay anchored to the bottom-right of the editor:
 - Recording indicator with pulse animation
 - Pending mapping key display
 
-### Status Bar Colors
-
-All configurable in **Editor > Editor Settings > Plugins > GodotVim > Status Bar**:
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| Normal BG | `Color` | `rgb(0.5, 0.6, 0.8)` | Background in Normal mode. |
-| Insert BG | `Color` | `rgb(0.6, 0.8, 0.5)` | Background in Insert mode. |
-| Visual BG | `Color` | `rgb(0.8, 0.5, 0.5)` | Background in Visual mode. |
-| Replace BG | `Color` | `rgb(0.9, 0.6, 0.3)` | Background in Replace mode. |
-| Command BG | `Color` | `rgb(0.157, 0.173, 0.204)` | Background in Command-line mode. |
-| Recording BG | `Color` | `rgb(0.9, 0.2, 0.2)` | Background while recording a macro. |
-| Text FG | `Color` | `#FFFFFF` | Foreground text color. |
-| Error FG | `Color` | `rgb(1.0, 0.3, 0.3)` | Foreground color for error messages. |
+Those colors are all settings; the table lives with the rest of them under
+[Status Bar Colors](#status-bar-colors).
 
 ---
 
@@ -805,10 +841,10 @@ All configurable in **Editor > Editor Settings > Plugins > GodotVim > Status Bar
 
 Four gutter modes selectable via EditorSettings:
 
-- **Hybrid** (default) — Current line shows absolute number, others show relative distance
-- **Relative** — All lines show distance from cursor
-- **Absolute** — Standard line numbers
-- **None** — No line numbers (fold icons still shown)
+- **Hybrid** (default), Current line shows absolute number, others show relative distance
+- **Relative**: All lines show distance from cursor
+- **Absolute**: Standard line numbers
+- **None**: No line numbers (fold icons still shown)
 
 ---
 
@@ -816,9 +852,11 @@ Four gutter modes selectable via EditorSettings:
 
 The cursor overlay renders above Godot's native caret using a GLSL difference-blend shader:
 
-- **Block** cursor in Normal/Visual/Operator-pending mode
+- **Block** cursor in Normal, Visual, Select and Command-line mode
 - **Beam** cursor in Insert mode (configurable width)
 - **Underline** cursor in Replace mode (configurable height)
+- **Half block** while `d`, `c`, `y` or a case operator is pending; block for
+  every other pending operator, with the hue rotated per operator
 - Smooth exponential-decay lerp animation between positions
 - Square-wave blink when stationary
 - Per-mode colors configurable in EditorSettings

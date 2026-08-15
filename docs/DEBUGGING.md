@@ -1,10 +1,10 @@
 # Debugging GodotVim
 
 How to read a GodotVim log. Aimed at anyone diagnosing a problem or filing a
-bug report — you do not need to know the codebase.
+bug report. You do not need to know the codebase.
 
 If you are *writing* a log call rather than reading one, you want
-[LOGGING.md](../LOGGING.md) instead.
+[LOGGING.md](https://github.com/hmdfrds/godot-vim/blob/main/LOGGING.md) instead.
 
 ## Quick Reference
 
@@ -15,13 +15,6 @@ info   =  lifecycle milestone (once per session or user action)
 debug  =  per-operation (one story per discrete user action)
 trace  =  per-keystroke, per-frame, per-effect
 ```
-
-**Formatting rules:**
-- Use `{}` (Display) for Key, KeyEvent, Mode — never `{:?}` on types with Display impls.
-- Use `key=value` pairs for structured data, past tense for completed actions.
-- Every `error!`/`warn!` must answer: what happened, what input, what the code did about it.
-- Never log file contents, clipboard contents, or user text above trace.
-- Never log at debug or higher in per-frame callbacks.
 
 ---
 
@@ -50,14 +43,14 @@ the complete story:
 
 Reading it: `key  mode  cmd=command  cursor=before→after  [flags]  effects=N  latency`.
 
-- **key** — vim notation (`k`, `<C-w>`, `<Esc>`, `ci(`)
-- **mode** — mode at time of keypress (`Normal`, `Insert`, `Visual`, `V-Line`)
-- **cmd** — what the engine interpreted (`Down`, `Change(inner-Paren)`, `Pending`, `InsertExit`)
-- **cursor** — only shown when cursor moved, as `line:col→line:col`
-- **text_mutated** — shown when text was changed
-- **mode→X** — shown when mode changed
-- **effects** — number of effects dispatched
-- **latency** — processing time in microseconds
+- **key**: vim notation (`k`, `<C-w>`, `<Esc>`, `ci(`)
+- **mode**: mode at time of keypress (`Normal`, `Insert`, `Visual`, `V-Line`)
+- **cmd**: what the engine interpreted (`Down`, `Change(inner-Paren)`, `Pending`, `InsertExit`)
+- **cursor**: only shown when cursor moved, as `line:col→line:col`
+- **text_mutated**: shown when text was changed
+- **mode→X**: shown when mode changed
+- **effects**: number of effects dispatched
+- **latency**: processing time in microseconds
 
 The `[key]` log target lets you filter keystroke summaries specifically:
 `grep '\[key\]' output.log`
@@ -113,13 +106,11 @@ Trace is for engine developers narrowing down a specific keystroke.
 
 ---
 
----
-
 ## Filing a bug report
 
 Set **Log Level** to `Debug`, reproduce the problem, and paste the Output
 panel into the issue. If the log is long, the `grep` patterns above will
-usually narrow it faster than trimming by hand — the errors-and-warnings
+usually narrow it faster than trimming by hand: the errors-and-warnings
 pattern is the right first thing to run.
 
 Include the Godot version, your OS, and your keyboard layout. Layout matters
