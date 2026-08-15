@@ -380,7 +380,9 @@ Glide time to settle, in ms (`ln(2 * distance) / speed`):
 | 500 | 7 | 14 | 17 |
 
 The animation is exponential decay, so it is frame-rate independent in wall
-clock: 500 takes the same 17 ms at 60, 144 and 240 Hz.
+clock: 500 takes the same 17 ms at 60, 144 and 240 Hz. Only the cursor's own
+motion is animated. Scrolling, folding and resizing translate it in the same
+frame, so it never trails the text it sits on.
 
 > **Note:** Line highlighting, cursor blink, and beam width are controlled by Godot's native settings under `text_editor/appearance/caret/`.
 
