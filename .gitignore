@@ -6,3 +6,4 @@
 .godot/
 addons/godot_vim/bin/
 .cargo/
+/dist

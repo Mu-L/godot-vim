@@ -21,29 +21,37 @@ cargo build --release --locked
 The library lands in `target/release/`: `libgodot_vim.so` on Linux,
 `godot_vim.dll` on Windows (MSVC), `libgodot_vim.dylib` on macOS.
 
-Then assemble the addon inside your own Godot project. This repository is not a
-Godot project, and `addons/godot_vim/bin/` is gitignored, so it does not exist
-after a clone. Substitute your own library name on Windows or macOS:
+Then assemble the addon. This repository is not a Godot project, and
+`addons/godot_vim/bin/` is gitignored, so the folder you install is produced,
+not checked in:
 
 ```bash
-mkdir -p <your-project>/addons
-cp -r addons/godot_vim <your-project>/addons/
-mkdir -p <your-project>/addons/godot_vim/bin
-cp target/release/libgodot_vim.so <your-project>/addons/godot_vim/bin/
+./scripts/assemble-addon.sh --no-build
 ```
 
-The first `mkdir` matters. If `<your-project>/addons/` does not already exist,
-`cp -r` renames the folder instead of copying into it, and you end up with
-`plugin.cfg` one level too high and a plugin Godot never lists. The result should
-be:
+That writes `dist/addons/godot_vim/`, complete with the library, `plugin.cfg`,
+the `.gdextension`, and the docs. It is the same script the release workflow
+runs to build the published zip, so what you get is what a release contains.
+Copy the `addons` folder into your project:
+
+```bash
+cp -r dist/addons <your-project>/
+```
+
+The result should be:
 
 ```
 <your-project>/addons/godot_vim/
 ├── plugin.cfg
 ├── godot_vim.gd
 ├── godot_vim.gdextension
-└── bin/libgodot_vim.so
+├── bin/libgodot_vim.so
+└── docs/
 ```
+
+Without `--no-build` the script runs `cargo build --release --locked` first, so
+`./scripts/assemble-addon.sh` on its own is the whole procedure. Pass
+`--out DIR` to stage somewhere other than `dist/`.
 
 Enable it in **Project Settings > Plugins** and restart the editor, the same as
 any other install. The `.debug` and `.release` entries in the `.gdextension`
