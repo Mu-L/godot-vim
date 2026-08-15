@@ -118,6 +118,10 @@ impl GodotVimCore {
         let callable = self.base().callable("on_script_changed");
         connect_deferred(&mut script_editor, SIG_EDITOR_SCRIPT_CHANGED, &callable);
 
+        // DEFERRED: focus moves mid-teardown, so immediate delivery would
+        // re-enter the plugin from inside Godot's own signal emission. The
+        // cost is that the focused Control can be freed before the queue
+        // drains, which is why `on_focus_changed` takes a `Variant`.
         if let Some(mut vp) = interface.get_base_control().and_then(|c| c.get_viewport()) {
             let callable = self.base().callable("on_focus_changed");
             connect_deferred(&mut vp, SIG_GUI_FOCUS_CHANGED, &callable);

@@ -300,8 +300,28 @@ impl GodotVimCore {
         );
     }
 
+    /// Focus tracking for `gui_focus_changed`, on the main editor viewport
+    /// (`lifecycle.rs`) and on every floating script window (`floating.rs`).
+    ///
+    /// `focused_node` is a `Variant`, not a `Gd<Control>`, and that is forced.
+    /// Both connections are DEFERRED, so the call sits in Godot's message
+    /// queue until end of frame and the Control that took focus can be freed
+    /// in the gap: closing several script tabs at once moves focus onto a
+    /// `CodeEdit` and frees it in the same frame. gdext converts varcall
+    /// parameters *before* the handler body runs and refuses to build a
+    /// `Gd<T>` from a freed object, so with a typed parameter this function
+    /// could not defend itself at all -- the call died at the ABI boundary and
+    /// the engine printed the failure. `Option<Gd<Control>>` fails identically,
+    /// because gdext reserves `None` for NIL variants rather than dead objects.
+    ///
+    /// The aliveness check is not removed or weakened, it is relocated:
+    /// `try_to` below runs the very same gdext check on the very same variant,
+    /// one frame inside the boundary, where a dead object is an early return
+    /// instead of an abandoned call. gdext documents `try_to::<Gd<...>>()` as
+    /// the way to detect this case. `on_script_changed` and `perform_attach`
+    /// take `Variant` for the same reason.
     #[func]
-    fn on_focus_changed(&mut self, focused_node: Gd<Control>) {
+    fn on_focus_changed(&mut self, focused_node: Variant) {
         if !self.enabled {
             return;
         }
@@ -324,6 +344,19 @@ impl GodotVimCore {
         panic_guard(
             "on_focus_changed",
             || {
+                // `Err` means the control that took focus did not survive to
+                // delivery. Routine, not a fault: there is no subtree left to
+                // search. Kept as a `match` rather than `let ... else` because
+                // the `ConvertError` is the only place a dead object and a
+                // genuinely wrong payload stay distinguishable, now that this
+                // handler makes that call instead of the engine.
+                let focused_node = match focused_node.try_to::<Gd<Control>>() {
+                    Ok(control) => control,
+                    Err(err) => {
+                        log::trace!("on_focus_changed: no live Control to attach to: {err}");
+                        return;
+                    }
+                };
                 if let Some(code_edit) = discovery::find_code_edit_from_control(&focused_node) {
                     self.base_mut()
                         .call_deferred("perform_attach", &[code_edit.to_variant()]);
